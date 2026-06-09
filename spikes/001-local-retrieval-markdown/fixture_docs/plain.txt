@@ -1,0 +1,3 @@
+Plain Text Note
+
+Text parser coverage matters because PKMCP should index simple notes without a Markdown dependency. The SQLite FTS5 BM25 provider should retrieve this local text fixture without keys.
