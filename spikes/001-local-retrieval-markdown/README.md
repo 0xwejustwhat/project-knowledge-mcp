@@ -1,20 +1,18 @@
-# 001: local retrieval over Markdown/frontmatter
+# 001: local retrieval over Markdown/text with SQLite FTS5
 
 ## Question
 
-Given the ops spec requires no-key local retrieval and the kickoff asked for SQLite FTS5/BM25 + Markdown/text parsing, can Step 0 prove both:
+Given the Step 0 direction is local-only/no-key retrieval, can PKMCP prove the default MVP path using:
 
-1. spec-preferred LlamaIndex BM25 retrieval can run with LLM/embeddings disabled; and
-2. SQLite FTS5 can remain a deterministic metadata/traceability/text-search fallback?
+1. deterministic Markdown/frontmatter parsing;
+2. deterministic plain-text parsing; and
+3. SQLite FTS5 with BM25 scoring as the baseline retrieval primitive?
 
 ## Approach
 
-`run_spike.py` creates fixture Markdown documents with YAML frontmatter, parses metadata/headings, indexes them into:
+`run_spike.py` loads Markdown and `.txt` fixtures, parses metadata/headings locally, writes them to a normal SQLite metadata table plus an FTS5 virtual table, and queries with `bm25(docs_fts)` and snippet output.
 
-- LlamaIndex `BM25Retriever` with `Settings.llm = None` and `Settings.embed_model = None`;
-- a local SQLite FTS5 table using `bm25(docs_fts)` and snippet output.
-
-It persists and reloads the LlamaIndex BM25 retriever under `.tmp/llamaindex_bm25`.
+No LlamaIndex, LlamaParse, embeddings, local model, hosted model, or API key is used.
 
 ## Run
 
@@ -27,15 +25,15 @@ poetry run python spikes/001-local-retrieval-markdown/run_spike.py
 ### What worked
 
 - Markdown frontmatter and headings are parsed deterministically.
-- LlamaIndex BM25 can retrieve fixture docs with LLM and embeddings explicitly disabled.
-- BM25 retriever persistence/reload works for a local directory.
-- SQLite FTS5/BM25 works as a fallback exact-text provider and traceable result store.
+- Plain text files are parsed deterministically.
+- SQLite FTS5/BM25 retrieves Markdown and text fixtures without keys.
+- SQLite joins retrieval hits back to metadata, allowing deterministic status/authority filters outside provider scoring.
 
 ### What did not work / limitations
 
-- SQLite FTS5 is not the primary retrieval framework under the current ops spec; it is fallback/bookkeeping unless LlamaIndex fails later.
-- Metadata filtering is adapter-sensitive; the MVP should wrap retrieval and apply deterministic post-filters/ranking even if provider-native filters are limited.
+- FTS5/BM25 is only a baseline retrieval primitive. It is not the product truth layer by itself.
+- Important MVP tools still need typed evidence compilers, authority-aware ranking, supersession handling, stale-index warnings, and retrieval regression tests.
 
 ### Recommendation for the real build
 
-Use LlamaIndex BM25 as the document retrieval provider boundary for MVP Step 1, keep SQLite for metadata, freshness, authority registry, traceability, and fallback text search.
+Use SQLite FTS5/BM25 as the default no-key document retrieval primitive for Step 1. Keep provider boundaries so LlamaIndex or other retrieval providers can be evaluated later, but do not include them in the default MVP dependency path.

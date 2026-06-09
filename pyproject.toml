@@ -12,10 +12,6 @@ packages = [
 [tool.poetry.dependencies]
 python = "^3.12"
 fastmcp = "^3.4.2"
-llama-index-core = "^0.14.22"
-llama-index-readers-file = "^0.6.0"
-llama-index-retrievers-bm25 = "^0.7.1"
-markdown-it-py = "^4.2.0"
 pyyaml = "^6.0.3"
 typer = "^0.26.7"
 codegraphcontext = { version = "^0.4.17", optional = true }
