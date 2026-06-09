@@ -1,0 +1,43 @@
+[tool.poetry]
+name = "project-knowledge-mcp"
+version = "0.1.0"
+description = "Local-first MCP access layer for repo-grounded project knowledge"
+authors = ["Hermes Agent <0xcharles747@users.noreply.github.com>"]
+readme = "README.md"
+packages = [
+  { include = "project_knowledge_mcp", from = "src" },
+  { include = "spikes" },
+]
+
+[tool.poetry.dependencies]
+python = "^3.12"
+fastmcp = "^3.4.2"
+llama-index-core = "^0.14.22"
+llama-index-readers-file = "^0.6.0"
+llama-index-retrievers-bm25 = "^0.7.1"
+markdown-it-py = "^4.2.0"
+pyyaml = "^6.0.3"
+typer = "^0.26.7"
+codegraphcontext = { version = "^0.4.17", optional = true }
+
+[tool.poetry.extras]
+codegraph = ["codegraphcontext"]
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^9.0.0"
+ruff = "^0.14.0"
+
+[tool.poetry.scripts]
+project-knowledge = "project_knowledge_mcp.server:main"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
