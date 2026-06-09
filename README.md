@@ -10,6 +10,7 @@ The Step 0 branch is intentionally a provider-evaluation gate, not the full MVP.
 - FastMCP stdio/http transport smoke spike.
 - CodeGraphContext no-key reliability spike for code repositories.
 - Decision record before main feature implementation.
+- Pinned MVP spec snapshot under `docs/specs/` with provenance back to the canonical ops repo.
 
 ## Quick start
 
