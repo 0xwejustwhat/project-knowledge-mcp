@@ -59,6 +59,23 @@ class RetrievalConfig(BaseModel):
     include_superseded_by_default: bool = False
 
 
+class CodeGraphConfig(BaseModel):
+    enabled: bool = True
+    command: str | None = None
+    url: str | None = None
+    index_dir: Path | None = None
+    vector_resolve_enabled: bool = False
+    embedding_model: str | None = None
+
+
+class CodeContextConfig(BaseModel):
+    provider: Literal["codegraph"] = "codegraph"
+    fallback_provider: Literal["text"] = "text"
+    required_for_code_repos: bool = True
+    fallback_on_unhealthy: bool = True
+    codegraph: CodeGraphConfig = Field(default_factory=CodeGraphConfig)
+
+
 class IndexingConfig(BaseModel):
     provider: str = "local_parser_registry"
     max_file_bytes: int = 1_000_000
@@ -85,6 +102,7 @@ class ProjectKnowledgeConfig(BaseModel):
     repos: list[RepoConfig]
     indexing: IndexingConfig = Field(default_factory=IndexingConfig)
     retrieval: RetrievalConfig = Field(default_factory=RetrievalConfig)
+    code_context: CodeContextConfig = Field(default_factory=CodeContextConfig)
     write_policy: WritePolicyConfig = Field(default_factory=WritePolicyConfig)
     config_path: Path | None = None
 
@@ -347,6 +365,21 @@ def validate_project_config(config_path: Path | str | None = None) -> dict[str, 
                 },
             )
         )
+    if config.code_context.codegraph.vector_resolve_enabled:
+        errors.append(
+            _error(
+                "CONFIG_INVALID",
+                "code_context.codegraph.vector_resolve_enabled must be false for the MVP default path",
+            )
+        )
+    if config.code_context.codegraph.embedding_model is not None:
+        errors.append(
+            _error(
+                "CONFIG_INVALID",
+                "code_context.codegraph.embedding_model must be null for the MVP default path",
+                details={"embedding_model": config.code_context.codegraph.embedding_model},
+            )
+        )
 
     return {
         "valid": not errors,
@@ -380,6 +413,10 @@ def _resolve_paths(config: ProjectKnowledgeConfig, *, base_dir: Path) -> None:
         config.storage.cache_dir = _resolve_path(config.storage.cache_dir, base_dir=project_root)
     if config.storage.lock_dir is not None:
         config.storage.lock_dir = _resolve_path(config.storage.lock_dir, base_dir=project_root)
+    if config.code_context.codegraph.index_dir is not None:
+        config.code_context.codegraph.index_dir = _resolve_path(
+            config.code_context.codegraph.index_dir, base_dir=project_root
+        )
     for repo in config.repos:
         repo.path = _resolve_path(repo.path, base_dir=project_root)
         if repo.host_path is not None:

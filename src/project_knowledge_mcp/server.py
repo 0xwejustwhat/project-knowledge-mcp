@@ -10,8 +10,11 @@ from fastmcp import FastMCP
 from project_knowledge_mcp.index import ProjectIndex, index_repo
 from project_knowledge_mcp.services import (
     check_project_staleness_from_config,
+    get_code_context_from_config,
+    get_code_provider_status_from_config,
     get_current_doctrine_from_config,
     index_project_from_config,
+    search_code_from_config,
     search_decisions_from_config,
     search_open_questions_from_config,
     search_ops_from_config,
@@ -137,6 +140,38 @@ def create_mcp() -> FastMCP:
             filters=filters,
             limit=limit,
         )
+
+    @mcp.tool
+    def search_code(
+        query: str,
+        config_path: str | None = None,
+        repo_id: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Search configured work repo code/test/schema evidence."""
+        return search_code_from_config(
+            query=query, config_path=config_path, repo_id=repo_id, limit=limit
+        )
+
+    @mcp.tool
+    def get_code_context(
+        symbol_or_file: str,
+        config_path: str | None = None,
+        repo_id: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Return symbol or file context via CodeGraph when healthy, else text fallback."""
+        return get_code_context_from_config(
+            symbol_or_file=symbol_or_file,
+            config_path=config_path,
+            repo_id=repo_id,
+            limit=limit,
+        )
+
+    @mcp.tool
+    def get_code_provider_status(config_path: str | None = None) -> dict[str, Any]:
+        """Return CodeGraph/text fallback provider health."""
+        return get_code_provider_status_from_config(config_path=config_path)
 
     @mcp.tool
     def check_project_staleness(config_path: str | None = None) -> dict[str, Any]:
@@ -318,6 +353,48 @@ def search_open_questions_command(
             sort_keys=True,
         )
     )
+
+
+@app.command("search-code")
+def search_code_command(
+    query: str = typer.Argument(..., help="Lexical query for code/test/schema evidence."),
+    config: Path | None = typer.Option(None, "--config", help="Project Knowledge config path."),
+    repo_id: str | None = typer.Option(None, "--repo-id", help="Optional work repo id."),
+    limit: int | None = typer.Option(None, help="Maximum results to return."),
+) -> None:
+    """Search configured work repo code/test/schema evidence."""
+    typer.echo(
+        json.dumps(
+            search_code_from_config(query=query, config_path=config, repo_id=repo_id, limit=limit),
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("get-code-context")
+def get_code_context_command(
+    symbol_or_file: str = typer.Argument(..., help="Symbol name or repo-relative file path."),
+    config: Path | None = typer.Option(None, "--config", help="Project Knowledge config path."),
+    repo_id: str | None = typer.Option(None, "--repo-id", help="Optional work repo id."),
+    limit: int | None = typer.Option(None, help="Maximum results to return."),
+) -> None:
+    """Return symbol/file code context with text fallback when CodeGraph is unhealthy."""
+    typer.echo(
+        json.dumps(
+            get_code_context_from_config(
+                symbol_or_file=symbol_or_file, config_path=config, repo_id=repo_id, limit=limit
+            ),
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("get-code-provider-status")
+def get_code_provider_status_command(
+    config: Path | None = typer.Option(None, "--config", help="Project Knowledge config path."),
+) -> None:
+    """Report CodeGraph/text fallback provider health."""
+    typer.echo(json.dumps(get_code_provider_status_from_config(config_path=config), sort_keys=True))
 
 
 @app.command("check-project-staleness")

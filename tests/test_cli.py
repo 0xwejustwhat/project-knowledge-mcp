@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from textwrap import dedent
 
 from typer.testing import CliRunner
 
@@ -18,6 +19,9 @@ def test_cli_help_lists_step1_index_commands():
     assert "search-decisions" in result.output
     assert "get-current-doctrine" in result.output
     assert "search-open-questions" in result.output
+    assert "search-code" in result.output
+    assert "get-code-context" in result.output
+    assert "get-code-provider-status" in result.output
 
 
 def init_git_repo(path: Path) -> None:
@@ -279,6 +283,107 @@ Context retrieval unresolved question.
     questions = json.loads(question_result.output)
     assert questions["results"][0]["path"] == "docs/open-questions/context.md"
     assert questions["results"][0]["owner"] == "Amin"
+
+
+def test_cli_code_context_commands_from_config(tmp_path: Path):
+    ops_repo = tmp_path / "ops"
+    work_repo = tmp_path / "work"
+    state = tmp_path / ".project-knowledge"
+    init_git_repo(ops_repo)
+    init_git_repo(work_repo)
+    ops_doc = ops_repo / "docs" / "doctrine" / "context.md"
+    ops_doc.parent.mkdir(parents=True, exist_ok=True)
+    ops_doc.write_text("# Context\n\nOps doctrine.\n", encoding="utf-8")
+    code_file = work_repo / "src" / "example.py"
+    code_file.parent.mkdir(parents=True, exist_ok=True)
+    code_file.write_text(
+        """
+class ExampleService:
+    def compile_context(self, topic: str) -> str:
+        return f"compiled evidence for {topic}"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "project.yaml"
+    config_path.write_text(
+        dedent(
+            f"""
+            schema_version: 1
+            project:
+              id: project-knowledge-mcp
+            storage:
+              project_root: {tmp_path.as_posix()}
+              state_dir: {state.as_posix()}
+            repos:
+              - id: ops
+                role: ops
+                path: {ops_repo.as_posix()}
+                writable: true
+                include_globs: ["docs/**/*.md"]
+              - id: app
+                role: work
+                path: {work_repo.as_posix()}
+                writable: false
+                include_globs: ["src/**/*.py"]
+            retrieval:
+              provider: sqlite_fts5
+              default_limit: 5
+              include_superseded_by_default: false
+            code_context:
+              provider: codegraph
+              fallback_provider: text
+              required_for_code_repos: true
+              fallback_on_unhealthy: true
+              codegraph:
+                enabled: true
+                vector_resolve_enabled: false
+            write_policy:
+              default_capture_repo: ops
+              default_capture_dir: docs/notes
+              allow_direct_capture: true
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    index_result = CliRunner().invoke(app, ["index-project", "--config", str(config_path)])
+    assert index_result.exit_code == 0, index_result.output
+
+    status_result = CliRunner().invoke(
+        app, ["get-code-provider-status", "--config", str(config_path)]
+    )
+    assert status_result.exit_code == 0, status_result.output
+    status = json.loads(status_result.output)
+    assert status["configured_provider"] == "codegraph"
+    assert status["active_provider"] == "text"
+    assert status["work_repos"] == ["app"]
+
+    search_result = CliRunner().invoke(
+        app,
+        [
+            "search-code",
+            "compile_context evidence",
+            "--config",
+            str(config_path),
+            "--repo-id",
+            "app",
+        ],
+    )
+    assert search_result.exit_code == 0, search_result.output
+    search = json.loads(search_result.output)
+    assert search["tool"] == "search_code"
+    assert search["results"][0]["path"] == "src/example.py"
+
+    context_result = CliRunner().invoke(
+        app,
+        ["get-code-context", "ExampleService", "--config", str(config_path), "--repo-id", "app"],
+    )
+    assert context_result.exit_code == 0, context_result.output
+    context = json.loads(context_result.output)
+    assert context["tool"] == "get_code_context"
+    assert context["results"][0]["symbol"] == "ExampleService.compile_context"
 
 
 def test_cli_check_project_staleness_from_config(tmp_path: Path):
