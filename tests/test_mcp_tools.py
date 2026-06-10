@@ -590,6 +590,32 @@ def test_mcp_code_context_tools_return_text_fallback_results(tmp_path: Path):
     assert context["results"][0]["path"] == "src/example.py"
     assert context["results"][0]["symbol"] == "ExampleService.compile_context"
 
+    evidence = asyncio.run(
+        call_tool(
+            "retrieve_ops_code_evidence",
+            {"config_path": str(config_path), "topic": "compile_context evidence", "limit": 3},
+        )
+    )
+    assert evidence["tool"] == "retrieve_ops_code_evidence"
+    assert sorted(evidence["sections"]) == ["code", "decisions", "doctrine", "open_questions"]
+    assert evidence["sections"]["code"][0]["path"] == "src/example.py"
+
+    brief = asyncio.run(
+        call_tool(
+            "generate_session_brief",
+            {
+                "config_path": str(config_path),
+                "task": "Implement compile_context evidence",
+                "since": "2026-06-01",
+                "limit": 3,
+            },
+        )
+    )
+    assert brief["tool"] == "generate_session_brief"
+    assert brief["since"] == "2026-06-01"
+    assert brief["sections"]["code"][0]["path"] == "src/example.py"
+    assert "## Session Brief" in brief["markdown"]
+
     widened = asyncio.run(
         call_tool(
             "search_code",

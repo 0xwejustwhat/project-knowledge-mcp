@@ -22,6 +22,8 @@ def test_cli_help_lists_step1_index_commands():
     assert "search-code" in result.output
     assert "get-code-context" in result.output
     assert "get-code-provider-status" in result.output
+    assert "retrieve-ops-code-evidence" in result.output
+    assert "generate-session-brief" in result.output
 
 
 def init_git_repo(path: Path) -> None:
@@ -384,6 +386,43 @@ class ExampleService:
     context = json.loads(context_result.output)
     assert context["tool"] == "get_code_context"
     assert context["results"][0]["symbol"] == "ExampleService.compile_context"
+
+    evidence_result = CliRunner().invoke(
+        app,
+        [
+            "retrieve-ops-code-evidence",
+            "compile_context evidence",
+            "--config",
+            str(config_path),
+            "--limit",
+            "3",
+        ],
+    )
+    assert evidence_result.exit_code == 0, evidence_result.output
+    evidence = json.loads(evidence_result.output)
+    assert evidence["tool"] == "retrieve_ops_code_evidence"
+    assert sorted(evidence["sections"]) == ["code", "decisions", "doctrine", "open_questions"]
+    assert evidence["sections"]["code"][0]["path"] == "src/example.py"
+
+    brief_result = CliRunner().invoke(
+        app,
+        [
+            "generate-session-brief",
+            "Implement compile_context evidence",
+            "--config",
+            str(config_path),
+            "--since",
+            "2026-06-01",
+            "--limit",
+            "3",
+        ],
+    )
+    assert brief_result.exit_code == 0, brief_result.output
+    brief = json.loads(brief_result.output)
+    assert brief["tool"] == "generate_session_brief"
+    assert brief["since"] == "2026-06-01"
+    assert brief["sections"]["code"][0]["path"] == "src/example.py"
+    assert "## Session Brief" in brief["markdown"]
 
 
 def test_cli_check_project_staleness_from_config(tmp_path: Path):

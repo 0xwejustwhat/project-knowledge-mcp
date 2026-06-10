@@ -10,10 +10,12 @@ from fastmcp import FastMCP
 from project_knowledge_mcp.index import ProjectIndex, index_repo
 from project_knowledge_mcp.services import (
     check_project_staleness_from_config,
+    generate_session_brief_from_config,
     get_code_context_from_config,
     get_code_provider_status_from_config,
     get_current_doctrine_from_config,
     index_project_from_config,
+    retrieve_ops_code_evidence_from_config,
     search_code_from_config,
     search_decisions_from_config,
     search_open_questions_from_config,
@@ -172,6 +174,29 @@ def create_mcp() -> FastMCP:
     def get_code_provider_status(config_path: str | None = None) -> dict[str, Any]:
         """Return CodeGraph/text fallback provider health."""
         return get_code_provider_status_from_config(config_path=config_path)
+
+    @mcp.tool
+    def retrieve_ops_code_evidence(
+        topic: str,
+        config_path: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Retrieve grouped ops and code evidence for a task/topic."""
+        return retrieve_ops_code_evidence_from_config(
+            topic=topic, config_path=config_path, limit=limit
+        )
+
+    @mcp.tool
+    def generate_session_brief(
+        task: str,
+        config_path: str | None = None,
+        since: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Compile a deterministic evidence packet for assistant session context."""
+        return generate_session_brief_from_config(
+            task=task, config_path=config_path, since=since, limit=limit
+        )
 
     @mcp.tool
     def check_project_staleness(config_path: str | None = None) -> dict[str, Any]:
@@ -395,6 +420,41 @@ def get_code_provider_status_command(
 ) -> None:
     """Report CodeGraph/text fallback provider health."""
     typer.echo(json.dumps(get_code_provider_status_from_config(config_path=config), sort_keys=True))
+
+
+@app.command("retrieve-ops-code-evidence")
+def retrieve_ops_code_evidence_command(
+    topic: str = typer.Argument(..., help="Topic to retrieve ops and code evidence for."),
+    config: Path | None = typer.Option(None, "--config", help="Project Knowledge config path."),
+    limit: int | None = typer.Option(None, help="Maximum results per section."),
+) -> None:
+    """Retrieve grouped ops and code evidence for a task/topic."""
+    typer.echo(
+        json.dumps(
+            retrieve_ops_code_evidence_from_config(topic=topic, config_path=config, limit=limit),
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("generate-session-brief")
+def generate_session_brief_command(
+    task: str = typer.Argument(..., help="Task to compile deterministic session context for."),
+    config: Path | None = typer.Option(None, "--config", help="Project Knowledge config path."),
+    since: str | None = typer.Option(
+        None, "--since", help="Optional user-provided recency marker."
+    ),
+    limit: int | None = typer.Option(None, help="Maximum results per section."),
+) -> None:
+    """Compile a deterministic evidence packet for assistant session context."""
+    typer.echo(
+        json.dumps(
+            generate_session_brief_from_config(
+                task=task, config_path=config, since=since, limit=limit
+            ),
+            sort_keys=True,
+        )
+    )
 
 
 @app.command("check-project-staleness")
