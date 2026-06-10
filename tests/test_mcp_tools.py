@@ -13,6 +13,20 @@ from project_knowledge_mcp.server import create_mcp
 def init_git_repo(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=path, check=True)
+
+
+def commit_all(path: Path, message: str = "commit") -> str:
+    subprocess.run(["git", "add", "."], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", message], cwd=path, check=True)
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
 
 
 def result_text(result) -> str:
@@ -25,8 +39,21 @@ def write_doc(root: Path, relative_path: str, text: str) -> None:
     path.write_text(dedent(text).strip() + "\n", encoding="utf-8")
 
 
-def write_project_config(root: Path, *, repo: Path, state_dir: Path) -> Path:
+def write_project_config(
+    root: Path,
+    *,
+    repo: Path,
+    state_dir: Path,
+    source_mode: str = "workspace",
+    snapshot_ref: str | None = None,
+    snapshot_commit: str | None = None,
+) -> Path:
     config_path = root / "project.yaml"
+    snapshot_lines = ""
+    if snapshot_ref is not None:
+        snapshot_lines += f"    snapshot_ref: {snapshot_ref}\n"
+    if snapshot_commit is not None:
+        snapshot_lines += f"    snapshot_commit: {snapshot_commit}\n"
     config_path.write_text(
         f"""
 schema_version: 1
@@ -40,9 +67,10 @@ repos:
   - id: ops
     role: ops
     name: Ops Repo
+    source_mode: {source_mode}
     path: {repo.as_posix()}
     writable: true
-    include_globs: ["README.md", "docs/**/*.md", "*.md"]
+{snapshot_lines}    include_globs: ["README.md", "docs/**/*.md", "*.md"]
     exclude_globs: [".git/**", ".project-knowledge/**"]
 retrieval:
   provider: sqlite_fts5
@@ -57,6 +85,112 @@ write_policy:
         encoding="utf-8",
     )
     return config_path
+
+
+def test_mcp_check_project_staleness_reports_dirty_and_index_freshness(tmp_path: Path):
+    repo = tmp_path / "ops"
+    state = tmp_path / ".project-knowledge"
+    init_git_repo(repo)
+    write_doc(repo, "docs/doctrine/context.md", "# Context\n\nBaseline indexed evidence.")
+    indexed_commit = commit_all(repo, "baseline")
+    config_path = write_project_config(tmp_path, repo=repo, state_dir=state)
+
+    import asyncio
+
+    indexed = asyncio.run(call_tool("index_project", {"config_path": str(config_path)}))
+    assert indexed["status"] == "ok"
+
+    write_doc(repo, "docs/doctrine/context.md", "# Context\n\nChanged workspace evidence.")
+    write_doc(repo, "docs/notes/untracked.md", "# Untracked\n\nNew note.")
+    write_doc(repo, "docs/notes/nested/second.md", "# Second\n\nAnother untracked note.")
+
+    status = asyncio.run(call_tool("check_project_staleness", {"config_path": str(config_path)}))
+    assert status["status"] == "ok"
+    assert status["project_id"] == "project-knowledge-mcp"
+    repo_status = status["repos"][0]
+    assert repo_status["repo_id"] == "ops"
+    assert repo_status["role"] == "ops"
+    assert repo_status["source_mode"] == "workspace"
+    assert repo_status["path"] == str(repo.resolve())
+    assert repo_status["branch"] in {"main", "master"}
+    assert repo_status["head_commit"] == indexed_commit
+    assert repo_status["last_indexed_commit"] == indexed_commit
+    assert repo_status["last_indexed_at"] is not None
+    assert repo_status["includes_uncommitted_changes"] is True
+    assert repo_status["dirty"] is True
+    assert repo_status["untracked_count"] == 2
+    assert repo_status["reindex_needed"] is True
+    assert "markdown" in status
+    assert "ops" in status["markdown"]
+
+
+def test_mcp_check_project_staleness_preserves_snapshot_provenance(tmp_path: Path):
+    repo = tmp_path / "ops"
+    state = tmp_path / ".project-knowledge"
+    init_git_repo(repo)
+    write_doc(repo, "docs/doctrine/context.md", "# Context\n\nSnapshot evidence.")
+    commit = commit_all(repo, "snapshot")
+    config_path = write_project_config(
+        tmp_path,
+        repo=repo,
+        state_dir=state,
+        source_mode="snapshot",
+        snapshot_ref="refs/heads/main",
+        snapshot_commit=commit,
+    )
+
+    import asyncio
+
+    indexed = asyncio.run(call_tool("index_project", {"config_path": str(config_path)}))
+    assert indexed["status"] == "ok"
+
+    status = asyncio.run(call_tool("check_project_staleness", {"config_path": str(config_path)}))
+    repo_status = status["repos"][0]
+    assert repo_status["source_mode"] == "snapshot"
+    assert repo_status["snapshot_ref"] == "refs/heads/main"
+    assert repo_status["snapshot_commit"] == commit
+    assert repo_status["includes_uncommitted_changes"] is False
+    assert repo_status["reindex_needed"] is False
+
+
+def test_mcp_check_project_staleness_treats_indexed_dirty_workspace_as_current(tmp_path: Path):
+    repo = tmp_path / "ops"
+    state = tmp_path / ".project-knowledge"
+    init_git_repo(repo)
+    write_doc(repo, "docs/doctrine/context.md", "# Context\n\nCommitted evidence.")
+    commit_all(repo, "baseline")
+    write_doc(repo, "docs/doctrine/context.md", "# Context\n\nDirty indexed evidence.")
+    config_path = write_project_config(tmp_path, repo=repo, state_dir=state)
+
+    import asyncio
+
+    indexed = asyncio.run(call_tool("index_project", {"config_path": str(config_path)}))
+    assert indexed["status"] == "ok"
+
+    status = asyncio.run(call_tool("check_project_staleness", {"config_path": str(config_path)}))
+    repo_status = status["repos"][0]
+    assert repo_status["dirty"] is True
+    assert repo_status["reindex_needed"] is False
+
+
+def test_mcp_check_project_staleness_ignores_state_dir_inside_repo(tmp_path: Path):
+    repo = tmp_path / "ops"
+    state = repo / ".project-knowledge"
+    init_git_repo(repo)
+    write_doc(repo, "docs/doctrine/context.md", "# Context\n\nCommitted evidence.")
+    commit_all(repo, "baseline")
+    config_path = write_project_config(tmp_path, repo=repo, state_dir=state)
+
+    import asyncio
+
+    indexed = asyncio.run(call_tool("index_project", {"config_path": str(config_path)}))
+    assert indexed["status"] == "ok"
+
+    status = asyncio.run(call_tool("check_project_staleness", {"config_path": str(config_path)}))
+    repo_status = status["repos"][0]
+    assert repo_status["dirty"] is False
+    assert repo_status["untracked_count"] == 0
+    assert repo_status["reindex_needed"] is False
 
 
 async def call_tool(tool_name: str, args: dict) -> dict:
