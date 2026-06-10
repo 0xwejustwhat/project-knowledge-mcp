@@ -9,6 +9,7 @@ from fastmcp import FastMCP
 
 from project_knowledge_mcp.index import ProjectIndex, index_repo
 from project_knowledge_mcp.services import (
+    check_project_staleness_from_config,
     index_project_from_config,
     search_ops_from_config,
     validate_config_service,
@@ -88,6 +89,11 @@ def create_mcp() -> FastMCP:
             filters=filters,
             limit=limit,
         )
+
+    @mcp.tool
+    def check_project_staleness(config_path: str | None = None) -> dict[str, Any]:
+        """Report configured repo Git freshness and index staleness."""
+        return check_project_staleness_from_config(config_path=config_path)
 
     return mcp
 
@@ -192,6 +198,14 @@ def search_ops_command(
             sort_keys=True,
         )
     )
+
+
+@app.command("check-project-staleness")
+def check_project_staleness_command(
+    config: Path | None = typer.Option(None, "--config", help="Project Knowledge config path."),
+) -> None:
+    """Report configured repo Git freshness and index staleness."""
+    typer.echo(json.dumps(check_project_staleness_from_config(config_path=config), sort_keys=True))
 
 
 @app.command("search-index")

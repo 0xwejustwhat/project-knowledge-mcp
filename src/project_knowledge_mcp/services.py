@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sqlite3
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -9,7 +11,13 @@ from project_knowledge_mcp.config import (
     load_project_config,
     validate_project_config,
 )
-from project_knowledge_mcp.index import ProjectIndex, SearchResult, index_repo
+from project_knowledge_mcp.index import (
+    INDEX_DB_NAME,
+    ProjectIndex,
+    SearchResult,
+    index_repo,
+    worktree_fingerprint,
+)
 
 
 def validate_config_service(config_path: Path | str | None = None) -> dict[str, Any]:
@@ -186,6 +194,44 @@ def search_ops_from_config(
     }
 
 
+def check_project_staleness_from_config(
+    *,
+    config_path: Path | str | None = None,
+) -> dict[str, Any]:
+    validation = validate_project_config(config_path)
+    if not validation["valid"]:
+        return {
+            "status": "error",
+            "project_id": validation.get("project_id"),
+            "repos": [],
+            "warnings": validation["warnings"],
+            "markdown": "## Project Staleness\n\nConfig is invalid; no staleness check was run.",
+            "error": validation["errors"][0] if validation["errors"] else None,
+            "errors": validation["errors"],
+        }
+
+    config = load_project_config(config_path)
+    assert config.storage.state_dir is not None
+    indexed_metadata = _load_indexed_repo_metadata(config.storage.state_dir)
+    repo_statuses = [
+        _repo_staleness_status(
+            repo, indexed_metadata.get(repo.id), state_dir=config.storage.state_dir
+        )
+        for repo in config.repos
+    ]
+    _persist_repo_statuses(config.storage.state_dir, repo_statuses)
+    warnings = [warning for repo in repo_statuses for warning in repo["warnings"]]
+    return {
+        "status": "ok",
+        "project_id": config.project.id,
+        "checked_at": _now(),
+        "state_dir": str(config.storage.state_dir),
+        "repos": repo_statuses,
+        "warnings": warnings,
+        "markdown": _render_staleness_markdown(config.project.id, repo_statuses),
+    }
+
+
 def _query_invalid(
     query: str,
     message: str,
@@ -289,6 +335,302 @@ def _normalize_tags(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(item) for item in value]
     return [str(value)]
+
+
+def _repo_staleness_status(
+    repo, indexed: dict[str, Any] | None, *, state_dir: Path
+) -> dict[str, Any]:
+    warnings: list[str] = []
+    branch = _git_output(repo.path, "rev-parse", "--abbrev-ref", "HEAD", warnings=warnings)
+    head_commit = _git_output(repo.path, "rev-parse", "HEAD", warnings=warnings)
+    remote_name = None
+    remote_branch = None
+    remote_tracking_branch = None
+    remote_head_commit = None
+    remote_check_status = "not_configured"
+    ahead_count = None
+    behind_count = None
+    if branch:
+        configured_remote = _git_output(
+            repo.path, "config", "--get", f"branch.{branch}.remote", warn_on_failure=False
+        )
+        configured_merge = _git_output(
+            repo.path, "config", "--get", f"branch.{branch}.merge", warn_on_failure=False
+        )
+        if configured_remote and configured_merge:
+            remote_tracking_branch = _git_output(
+                repo.path,
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "@{u}",
+                warnings=warnings,
+                warning_context="remote tracking branch",
+            )
+            remote_check_status = "ok" if remote_tracking_branch else "warning"
+    if remote_tracking_branch:
+        remote_name, _, remote_branch = remote_tracking_branch.partition("/")
+        remote_head_commit = _git_output(
+            repo.path, "rev-parse", "@{u}", warnings=warnings, warning_context="remote HEAD"
+        )
+        ahead_behind = _git_output(
+            repo.path,
+            "rev-list",
+            "--left-right",
+            "--count",
+            "HEAD...@{u}",
+            warnings=warnings,
+            warning_context="ahead/behind counts",
+        )
+        if ahead_behind:
+            parts = ahead_behind.split()
+            if len(parts) == 2:
+                ahead_count = int(parts[0])
+                behind_count = int(parts[1])
+
+    porcelain = _git_status_porcelain(repo.path, state_dir=state_dir, warnings=warnings)
+    status_check_status = "ok" if porcelain is not None else "warning"
+    status_lines = [line for line in (porcelain or "").splitlines() if line]
+    untracked_count = (
+        None if porcelain is None else sum(1 for line in status_lines if line.startswith("??"))
+    )
+    dirty = None if porcelain is None else any(not line.startswith("??") for line in status_lines)
+    current_worktree_fingerprint = (
+        None if porcelain is None else worktree_fingerprint(repo.path, porcelain)
+    )
+
+    indexed = indexed or {}
+    last_indexed_commit = indexed.get("last_indexed_commit")
+    last_indexed_at = indexed.get("last_indexed_at")
+    last_indexed_worktree_fingerprint = indexed.get("last_indexed_worktree_fingerprint")
+    includes_uncommitted_changes = bool(repo.includes_uncommitted_changes)
+    expected_commit = repo.snapshot_commit if repo.source_mode == "snapshot" else head_commit
+    snapshot_mismatch = (
+        repo.source_mode == "snapshot"
+        and repo.snapshot_commit is not None
+        and head_commit is not None
+        and head_commit != repo.snapshot_commit
+    )
+    if snapshot_mismatch:
+        warnings.append(
+            f"Repo {repo.id} snapshot_commit does not match checked-out HEAD; snapshot provenance is stale."
+        )
+    if not includes_uncommitted_changes and ((dirty is True) or (untracked_count or 0) > 0):
+        warnings.append(
+            f"Repo {repo.id} has uncommitted changes but source metadata says they are excluded."
+        )
+    reindex_needed = (
+        last_indexed_commit is None
+        or (expected_commit is not None and last_indexed_commit != expected_commit)
+        or snapshot_mismatch
+        or status_check_status != "ok"
+        or (
+            includes_uncommitted_changes
+            and current_worktree_fingerprint != last_indexed_worktree_fingerprint
+        )
+    )
+    if last_indexed_commit is None:
+        warnings.append(f"Repo {repo.id} has not been indexed yet.")
+
+    return {
+        "repo_id": repo.id,
+        "role": repo.role,
+        "source_mode": repo.source_mode,
+        "host_path": str(repo.host_path) if repo.host_path is not None else None,
+        "container_path": str(repo.path),
+        "path": str(repo.path),
+        "branch": branch,
+        "head_commit": head_commit,
+        "remote_name": remote_name,
+        "remote_branch": remote_branch,
+        "remote_tracking_branch": remote_tracking_branch,
+        "remote_head_commit": remote_head_commit,
+        "remote_check_status": remote_check_status,
+        "ahead_count": ahead_count,
+        "behind_count": behind_count,
+        "dirty": dirty,
+        "untracked_count": untracked_count,
+        "status_check_status": status_check_status,
+        "last_indexed_commit": last_indexed_commit,
+        "last_indexed_at": last_indexed_at,
+        "last_indexed_worktree_fingerprint": last_indexed_worktree_fingerprint,
+        "includes_uncommitted_changes": includes_uncommitted_changes,
+        "snapshot_ref": repo.snapshot_ref,
+        "snapshot_commit": repo.snapshot_commit,
+        "reindex_needed": reindex_needed,
+        "warnings": warnings,
+    }
+
+
+def _load_indexed_repo_metadata(state_dir: Path) -> dict[str, dict[str, Any]]:
+    db_path = state_dir / INDEX_DB_NAME
+    if not db_path.exists():
+        return {}
+    try:
+        ProjectIndex.open(state_dir)
+    except (FileNotFoundError, sqlite3.Error):
+        return {}
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, last_indexed_commit, last_indexed_at, last_indexed_worktree_fingerprint
+            FROM repos
+            """
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+    finally:
+        conn.close()
+    return {
+        row[0]: {
+            "last_indexed_commit": row[1],
+            "last_indexed_at": row[2],
+            "last_indexed_worktree_fingerprint": row[3],
+        }
+        for row in rows
+    }
+
+
+def _persist_repo_statuses(state_dir: Path, repo_statuses: list[dict[str, Any]]) -> None:
+    db_path = state_dir / INDEX_DB_NAME
+    if not db_path.exists():
+        return
+    try:
+        ProjectIndex.open(state_dir)
+    except (FileNotFoundError, sqlite3.Error):
+        return
+    conn = sqlite3.connect(db_path)
+    try:
+        checked_at = _now()
+        for repo in repo_statuses:
+            conn.execute(
+                """
+                UPDATE repos
+                SET current_branch = ?, head_commit = ?, remote_name = ?, remote_branch = ?,
+                    remote_head_commit = ?, ahead_count = ?, behind_count = ?, dirty = ?,
+                    untracked_count = ?, last_status_checked_at = ?
+                WHERE id = ?
+                """,
+                (
+                    repo["branch"],
+                    repo["head_commit"],
+                    repo["remote_name"],
+                    repo["remote_branch"],
+                    repo["remote_head_commit"],
+                    repo["ahead_count"],
+                    repo["behind_count"],
+                    None if repo["dirty"] is None else int(repo["dirty"]),
+                    repo["untracked_count"],
+                    checked_at,
+                    repo["repo_id"],
+                ),
+            )
+        conn.commit()
+    except sqlite3.Error:
+        return
+    finally:
+        conn.close()
+
+
+def _git_output(
+    repo_path: Path,
+    *args: str,
+    warnings: list[str] | None = None,
+    warn_on_failure: bool = True,
+    warning_context: str = "Git command",
+) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_path), *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception as exc:
+        if warnings is not None and warn_on_failure:
+            warnings.append(f"{warning_context} failed for {repo_path}: {exc}")
+        return None
+    if result.returncode != 0:
+        if warnings is not None and warn_on_failure:
+            message = (result.stderr or result.stdout).strip() or "unknown Git error"
+            warnings.append(f"{warning_context} failed for {repo_path}: {message}")
+        return None
+    return result.stdout.strip() or None
+
+
+def _git_status_porcelain(
+    repo_path: Path, *, state_dir: Path | None = None, warnings: list[str] | None = None
+) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_path), "status", "--porcelain=v1", "--untracked-files=all"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception as exc:
+        if warnings is not None:
+            warnings.append(f"worktree status failed for {repo_path}: {exc}")
+        return None
+    if result.returncode != 0:
+        if warnings is not None:
+            message = (result.stderr or result.stdout).strip() or "unknown Git error"
+            warnings.append(f"worktree status failed for {repo_path}: {message}")
+        return None
+    return _filter_state_dir_status(repo_path, result.stdout, state_dir=state_dir)
+
+
+def _filter_state_dir_status(repo_path: Path, porcelain: str, *, state_dir: Path | None) -> str:
+    if state_dir is None:
+        return porcelain
+    try:
+        state_relative = state_dir.resolve().relative_to(repo_path.resolve()).as_posix()
+    except ValueError:
+        return porcelain
+    state_prefix = state_relative.rstrip("/") + "/"
+    kept_lines: list[str] = []
+    for line in porcelain.splitlines():
+        relative = _status_relative_path(line)
+        if relative == state_relative or (relative and relative.startswith(state_prefix)):
+            continue
+        kept_lines.append(line)
+    return "\n".join(kept_lines) + ("\n" if kept_lines else "")
+
+
+def _status_relative_path(line: str) -> str | None:
+    if len(line) < 4:
+        return None
+    relative = line[3:]
+    if " -> " in relative:
+        relative = relative.rsplit(" -> ", 1)[1]
+    return relative.strip('"') or None
+
+
+def _render_staleness_markdown(project_id: str, repos: list[dict[str, Any]]) -> str:
+    lines = ["## Project Staleness", "", f"Project: `{project_id}`", ""]
+    for repo in repos:
+        freshness = "reindex needed" if repo["reindex_needed"] else "current"
+        dirty = "dirty" if repo["dirty"] or repo["untracked_count"] else "clean"
+        lines.extend(
+            [
+                f"### {repo['repo_id']} ({repo['role']})",
+                f"- Source mode: `{repo['source_mode']}`",
+                f"- Path: `{repo['path']}`",
+                f"- Branch: `{repo['branch']}` @ `{repo['head_commit']}`",
+                f"- Workspace: `{dirty}`; untracked files: `{repo['untracked_count']}`",
+                f"- Last indexed commit: `{repo['last_indexed_commit']}`",
+                f"- Status: **{freshness}**",
+                "",
+            ]
+        )
+        for warning in repo["warnings"]:
+            lines.append(f"  - Warning: {warning}")
+        if repo["warnings"]:
+            lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def _now() -> str:

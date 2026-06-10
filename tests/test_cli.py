@@ -20,6 +20,20 @@ def test_cli_help_lists_step1_index_commands():
 def init_git_repo(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=path, check=True)
+
+
+def commit_all(path: Path, message: str = "commit") -> str:
+    subprocess.run(["git", "add", "."], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", message], cwd=path, check=True)
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
 
 
 def write_project_config(root: Path, *, repo: Path, state_dir: Path) -> Path:
@@ -182,3 +196,36 @@ Project Knowledge MCP returns evidence packets before synthesis.
     assert payload["results"][0]["authority"] == "canonical"
     assert "markdown" in payload
     assert "## Search Results" in payload["markdown"]
+
+
+def test_cli_check_project_staleness_from_config(tmp_path: Path):
+    repo = tmp_path / "ops"
+    state = tmp_path / ".project-knowledge"
+    init_git_repo(repo)
+    doc = repo / "docs" / "doctrine" / "context.md"
+    doc.parent.mkdir(parents=True)
+    doc.write_text("# Context\n\nBaseline indexed evidence.\n", encoding="utf-8")
+    indexed_commit = commit_all(repo, "baseline")
+    config_path = write_project_config(tmp_path, repo=repo, state_dir=state)
+
+    index_result = CliRunner().invoke(app, ["index-project", "--config", str(config_path)])
+    assert index_result.exit_code == 0, index_result.output
+
+    doc.write_text("# Context\n\nChanged workspace evidence.\n", encoding="utf-8")
+    (repo / "docs" / "notes").mkdir(parents=True)
+    (repo / "docs" / "notes" / "untracked.md").write_text("# Note\n", encoding="utf-8")
+
+    status_result = CliRunner().invoke(
+        app, ["check-project-staleness", "--config", str(config_path)]
+    )
+    assert status_result.exit_code == 0, status_result.output
+    payload = json.loads(status_result.output)
+    assert payload["status"] == "ok"
+    repo_status = payload["repos"][0]
+    assert repo_status["repo_id"] == "ops"
+    assert repo_status["head_commit"] == indexed_commit
+    assert repo_status["last_indexed_commit"] == indexed_commit
+    assert repo_status["dirty"] is True
+    assert repo_status["untracked_count"] == 1
+    assert repo_status["reindex_needed"] is True
+    assert "## Project Staleness" in payload["markdown"]

@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -294,13 +295,21 @@ def index_repo(
     _clear_repo(conn, repo_id)
 
     now = _now()
+    head_commit = _git_output(repo_path, "rev-parse", "HEAD")
+    worktree_status = _git_status_porcelain(repo_path, state_dir=state_dir)
+    indexed_worktree_fingerprint = worktree_fingerprint(repo_path, worktree_status)
+    status_lines = [line for line in worktree_status.splitlines() if line]
+    untracked_count = sum(1 for line in status_lines if line.startswith("??"))
+    dirty = any(not line.startswith("??") for line in status_lines)
     conn.execute(
         """
         INSERT INTO repos(
           id, role, name, source_mode, host_path, path, writable,
-          includes_uncommitted_changes, snapshot_ref, snapshot_commit, last_indexed_at
+          current_branch, head_commit, dirty, untracked_count, includes_uncommitted_changes,
+          snapshot_ref, snapshot_commit, last_indexed_at, last_indexed_commit,
+          last_indexed_worktree_fingerprint
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           role = excluded.role,
           name = excluded.name,
@@ -308,10 +317,16 @@ def index_repo(
           host_path = excluded.host_path,
           path = excluded.path,
           writable = excluded.writable,
+          current_branch = excluded.current_branch,
+          head_commit = excluded.head_commit,
+          dirty = excluded.dirty,
+          untracked_count = excluded.untracked_count,
           includes_uncommitted_changes = excluded.includes_uncommitted_changes,
           snapshot_ref = excluded.snapshot_ref,
           snapshot_commit = excluded.snapshot_commit,
-          last_indexed_at = excluded.last_indexed_at
+          last_indexed_at = excluded.last_indexed_at,
+          last_indexed_commit = excluded.last_indexed_commit,
+          last_indexed_worktree_fingerprint = excluded.last_indexed_worktree_fingerprint
         """,
         (
             repo_id,
@@ -321,6 +336,10 @@ def index_repo(
             str(host_path) if host_path is not None else None,
             str(repo_path),
             int(writable),
+            _git_output(repo_path, "rev-parse", "--abbrev-ref", "HEAD"),
+            head_commit,
+            int(dirty),
+            untracked_count,
             int(
                 includes_uncommitted_changes
                 if includes_uncommitted_changes is not None
@@ -329,6 +348,8 @@ def index_repo(
             snapshot_ref,
             snapshot_commit,
             now,
+            head_commit,
+            indexed_worktree_fingerprint,
         ),
     )
 
@@ -540,7 +561,8 @@ def _create_schema(conn: sqlite3.Connection) -> None:
           snapshot_commit TEXT,
           last_status_checked_at TEXT,
           last_indexed_at TEXT,
-          last_indexed_commit TEXT
+          last_indexed_commit TEXT,
+          last_indexed_worktree_fingerprint TEXT
         );
 
         CREATE TABLE IF NOT EXISTS documents (
@@ -621,15 +643,105 @@ def _ensure_repo_source_columns(conn: sqlite3.Connection) -> None:
     column_sql = {
         "source_mode": "ALTER TABLE repos ADD COLUMN source_mode TEXT NOT NULL DEFAULT 'workspace'",
         "host_path": "ALTER TABLE repos ADD COLUMN host_path TEXT",
+        "current_branch": "ALTER TABLE repos ADD COLUMN current_branch TEXT",
+        "head_commit": "ALTER TABLE repos ADD COLUMN head_commit TEXT",
+        "remote_name": "ALTER TABLE repos ADD COLUMN remote_name TEXT",
+        "remote_branch": "ALTER TABLE repos ADD COLUMN remote_branch TEXT",
+        "remote_head_commit": "ALTER TABLE repos ADD COLUMN remote_head_commit TEXT",
+        "ahead_count": "ALTER TABLE repos ADD COLUMN ahead_count INTEGER",
+        "behind_count": "ALTER TABLE repos ADD COLUMN behind_count INTEGER",
+        "dirty": "ALTER TABLE repos ADD COLUMN dirty INTEGER",
+        "untracked_count": "ALTER TABLE repos ADD COLUMN untracked_count INTEGER",
         "includes_uncommitted_changes": (
             "ALTER TABLE repos ADD COLUMN includes_uncommitted_changes INTEGER NOT NULL DEFAULT 0"
         ),
         "snapshot_ref": "ALTER TABLE repos ADD COLUMN snapshot_ref TEXT",
         "snapshot_commit": "ALTER TABLE repos ADD COLUMN snapshot_commit TEXT",
+        "last_status_checked_at": "ALTER TABLE repos ADD COLUMN last_status_checked_at TEXT",
+        "last_indexed_at": "ALTER TABLE repos ADD COLUMN last_indexed_at TEXT",
+        "last_indexed_commit": "ALTER TABLE repos ADD COLUMN last_indexed_commit TEXT",
+        "last_indexed_worktree_fingerprint": (
+            "ALTER TABLE repos ADD COLUMN last_indexed_worktree_fingerprint TEXT"
+        ),
     }
     for column, sql in column_sql.items():
         if column not in existing_columns:
             conn.execute(sql)
+
+
+def _git_output(repo_path: Path, *args: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_path), *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def _git_status_porcelain(repo_path: Path, *, state_dir: Path | None = None) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_path), "status", "--porcelain=v1", "--untracked-files=all"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return ""
+    if result.returncode != 0:
+        return ""
+    return _filter_state_dir_status(repo_path, result.stdout, state_dir=state_dir)
+
+
+def worktree_fingerprint(repo_path: Path, porcelain: str) -> str:
+    digest = hashlib.sha256()
+    digest.update(porcelain.encode("utf-8", errors="replace"))
+    for line in porcelain.splitlines():
+        relative = _status_relative_path(line)
+        if not relative:
+            continue
+        path = repo_path / relative
+        digest.update(relative.encode("utf-8", errors="replace"))
+        if path.is_file() and not path.is_symlink():
+            try:
+                digest.update(path.read_bytes())
+            except OSError:
+                digest.update(b"<unreadable>")
+    return digest.hexdigest()
+
+
+def _filter_state_dir_status(repo_path: Path, porcelain: str, *, state_dir: Path | None) -> str:
+    if state_dir is None:
+        return porcelain
+    try:
+        state_relative = state_dir.resolve().relative_to(repo_path.resolve()).as_posix()
+    except ValueError:
+        return porcelain
+    state_prefix = state_relative.rstrip("/") + "/"
+    kept_lines: list[str] = []
+    for line in porcelain.splitlines():
+        relative = _status_relative_path(line)
+        if relative == state_relative or (relative and relative.startswith(state_prefix)):
+            continue
+        kept_lines.append(line)
+    return "\n".join(kept_lines) + ("\n" if kept_lines else "")
+
+
+def _status_relative_path(line: str) -> str | None:
+    if len(line) < 4:
+        return None
+    relative = line[3:]
+    if " -> " in relative:
+        relative = relative.rsplit(" -> ", 1)[1]
+    return relative.strip('"') or None
 
 
 def _clear_repo(conn: sqlite3.Connection, repo_id: str) -> None:

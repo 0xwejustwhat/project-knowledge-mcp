@@ -125,8 +125,10 @@ def load_project_config(config_path: Path | str | None = None) -> ProjectKnowled
     config.config_path = resolved_path
     _resolve_paths(config, base_dir=resolved_path.parent)
     for repo in config.repos:
-        if repo.includes_uncommitted_changes is None:
-            repo.includes_uncommitted_changes = repo.source_mode == "workspace"
+        if repo.source_mode == "snapshot":
+            repo.includes_uncommitted_changes = False
+        elif repo.includes_uncommitted_changes is None:
+            repo.includes_uncommitted_changes = True
     return config
 
 
