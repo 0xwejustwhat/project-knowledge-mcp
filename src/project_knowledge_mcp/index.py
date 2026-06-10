@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import re
@@ -120,11 +121,16 @@ class IndexSummary:
     indexed_documents: int
     indexed_chunks: int
     warning_count: int
+    skipped_documents: int = 0
 
 
 @dataclass(frozen=True)
 class SearchResult:
     repo_id: str
+    source_mode: str
+    includes_uncommitted_changes: bool
+    snapshot_ref: str | None
+    snapshot_commit: str | None
     path: str
     title: str
     doc_type: str
@@ -161,6 +167,10 @@ class ProjectIndex:
         db_path = _db_path(state_dir)
         if not db_path.exists():
             raise FileNotFoundError(f"Project index does not exist: {db_path}")
+        conn = _connect(db_path)
+        _ensure_repo_source_columns(conn)
+        conn.commit()
+        conn.close()
         return cls(db_path)
 
     def search(
@@ -199,6 +209,10 @@ class ProjectIndex:
         rows = conn.execute(
             f"""
             SELECT documents.repo_id,
+                   repos.source_mode,
+                   repos.includes_uncommitted_changes,
+                   repos.snapshot_ref,
+                   repos.snapshot_commit,
                    documents.path,
                    documents.title,
                    documents.doc_type,
@@ -215,6 +229,7 @@ class ProjectIndex:
             FROM chunks_fts
             JOIN chunks ON chunks.rowid = chunks_fts.rowid
             JOIN documents ON documents.id = chunks.document_id
+            JOIN repos ON repos.id = documents.repo_id
             WHERE {where_sql}
             LIMIT ?
             """,
@@ -257,6 +272,14 @@ def index_repo(
     repo_id: str,
     role: str,
     writable: bool = False,
+    source_mode: str = "workspace",
+    host_path: Path | None = None,
+    includes_uncommitted_changes: bool | None = None,
+    snapshot_ref: str | None = None,
+    snapshot_commit: str | None = None,
+    include_globs: list[str] | None = None,
+    exclude_globs: list[str] | None = None,
+    max_file_bytes: int | None = None,
 ) -> IndexSummary:
     repo_path = repo_path.resolve()
     if not repo_path.exists() or not repo_path.is_dir():
@@ -273,26 +296,78 @@ def index_repo(
     now = _now()
     conn.execute(
         """
-        INSERT INTO repos(id, role, name, path, writable, last_indexed_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO repos(
+          id, role, name, source_mode, host_path, path, writable,
+          includes_uncommitted_changes, snapshot_ref, snapshot_commit, last_indexed_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           role = excluded.role,
           name = excluded.name,
+          source_mode = excluded.source_mode,
+          host_path = excluded.host_path,
           path = excluded.path,
           writable = excluded.writable,
+          includes_uncommitted_changes = excluded.includes_uncommitted_changes,
+          snapshot_ref = excluded.snapshot_ref,
+          snapshot_commit = excluded.snapshot_commit,
           last_indexed_at = excluded.last_indexed_at
         """,
-        (repo_id, role, repo_path.name, str(repo_path), int(writable), now),
+        (
+            repo_id,
+            role,
+            repo_path.name,
+            source_mode,
+            str(host_path) if host_path is not None else None,
+            str(repo_path),
+            int(writable),
+            int(
+                includes_uncommitted_changes
+                if includes_uncommitted_changes is not None
+                else source_mode == "workspace"
+            ),
+            snapshot_ref,
+            snapshot_commit,
+            now,
+        ),
     )
 
     indexed_docs = 0
     indexed_chunks = 0
     warning_count = 0
-    for file_path in _iter_indexable_files(repo_path):
+    skipped_docs = 0
+    for file_path in _iter_indexable_files(
+        repo_path,
+        state_dir=state_dir,
+        include_globs=include_globs,
+        exclude_globs=exclude_globs,
+        max_file_bytes=max_file_bytes,
+    ):
         relative_path = file_path.relative_to(repo_path).as_posix()
-        text = file_path.read_text(encoding="utf-8")
+        try:
+            stat = file_path.stat()
+        except OSError:
+            skipped_docs += 1
+            continue
+        if max_file_bytes is not None and stat.st_size > max_file_bytes:
+            skipped_docs += 1
+            warning_count += 1
+            _insert_index_event(
+                conn,
+                event_type="file_skipped",
+                repo_id=repo_id,
+                path=relative_path,
+                status="warning",
+                message=f"Skipped file larger than max_file_bytes ({stat.st_size} > {max_file_bytes})",
+                created_at=now,
+            )
+            continue
+        try:
+            text = file_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            skipped_docs += 1
+            continue
         parsed = parse_document(relative_path, text, repo_id=repo_id, repo_role=role)
-        stat = file_path.stat()
         _insert_document(conn, parsed, mtime=stat.st_mtime)
         indexed_docs += 1
         indexed_chunks += len(parsed.chunks)
@@ -306,6 +381,7 @@ def index_repo(
         indexed_documents=indexed_docs,
         indexed_chunks=indexed_chunks,
         warning_count=warning_count,
+        skipped_documents=skipped_docs,
     )
 
 
@@ -446,6 +522,8 @@ def _create_schema(conn: sqlite3.Connection) -> None:
           id TEXT PRIMARY KEY,
           role TEXT NOT NULL,
           name TEXT NOT NULL,
+          source_mode TEXT NOT NULL DEFAULT 'workspace',
+          host_path TEXT,
           path TEXT NOT NULL,
           writable INTEGER NOT NULL DEFAULT 0,
           current_branch TEXT,
@@ -457,6 +535,9 @@ def _create_schema(conn: sqlite3.Connection) -> None:
           behind_count INTEGER,
           dirty INTEGER,
           untracked_count INTEGER,
+          includes_uncommitted_changes INTEGER NOT NULL DEFAULT 0,
+          snapshot_ref TEXT,
+          snapshot_commit TEXT,
           last_status_checked_at TEXT,
           last_indexed_at TEXT,
           last_indexed_commit TEXT
@@ -532,6 +613,23 @@ def _create_schema(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    _ensure_repo_source_columns(conn)
+
+
+def _ensure_repo_source_columns(conn: sqlite3.Connection) -> None:
+    existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(repos)").fetchall()}
+    column_sql = {
+        "source_mode": "ALTER TABLE repos ADD COLUMN source_mode TEXT NOT NULL DEFAULT 'workspace'",
+        "host_path": "ALTER TABLE repos ADD COLUMN host_path TEXT",
+        "includes_uncommitted_changes": (
+            "ALTER TABLE repos ADD COLUMN includes_uncommitted_changes INTEGER NOT NULL DEFAULT 0"
+        ),
+        "snapshot_ref": "ALTER TABLE repos ADD COLUMN snapshot_ref TEXT",
+        "snapshot_commit": "ALTER TABLE repos ADD COLUMN snapshot_commit TEXT",
+    }
+    for column, sql in column_sql.items():
+        if column not in existing_columns:
+            conn.execute(sql)
 
 
 def _clear_repo(conn: sqlite3.Connection, repo_id: str) -> None:
@@ -542,6 +640,28 @@ def _clear_repo(conn: sqlite3.Connection, repo_id: str) -> None:
         conn.execute("DELETE FROM chunks_fts WHERE rowid = ?", (rowid,))
     conn.execute("DELETE FROM documents WHERE repo_id = ?", (repo_id,))
     conn.execute("DELETE FROM index_events WHERE repo_id = ?", (repo_id,))
+
+
+def _insert_index_event(
+    conn: sqlite3.Connection,
+    *,
+    event_type: str,
+    repo_id: str | None,
+    path: str | None,
+    status: str,
+    message: str,
+    created_at: str,
+) -> None:
+    event_id = hashlib.sha256(
+        f"{repo_id}\n{path}\n{event_type}\n{message}".encode("utf-8")
+    ).hexdigest()[:24]
+    conn.execute(
+        """
+        INSERT INTO index_events(id, event_type, repo_id, path, status, message, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (event_id, event_type, repo_id, path, status, message, created_at),
+    )
 
 
 def _insert_document(conn: sqlite3.Connection, doc: ParsedDocument, *, mtime: float) -> None:
@@ -621,14 +741,80 @@ def _insert_document(conn: sqlite3.Connection, doc: ParsedDocument, *, mtime: fl
         )
 
 
-def _iter_indexable_files(root: Path) -> list[Path]:
+def _iter_indexable_files(
+    root: Path,
+    *,
+    state_dir: Path,
+    include_globs: list[str] | None = None,
+    exclude_globs: list[str] | None = None,
+    max_file_bytes: int | None = None,
+) -> list[Path]:
     return [
         path
         for path in sorted(root.rglob("*"))
-        if path.is_file()
-        and path.suffix.lower() in SUPPORTED_SUFFIXES
-        and STATE_DIR_NAME not in path.parts
+        if _is_indexable_file(
+            root,
+            path,
+            state_dir=state_dir,
+            include_globs=include_globs,
+            exclude_globs=exclude_globs,
+            max_file_bytes=max_file_bytes,
+        )
     ]
+
+
+def _is_indexable_file(
+    root: Path,
+    path: Path,
+    *,
+    state_dir: Path,
+    include_globs: list[str] | None,
+    exclude_globs: list[str] | None,
+    max_file_bytes: int | None,
+) -> bool:
+    if path.is_symlink() or not path.is_file() or path.suffix.lower() not in SUPPORTED_SUFFIXES:
+        return False
+    try:
+        resolved_root = root.resolve()
+        resolved_path = path.resolve()
+        resolved_state_dir = state_dir.resolve()
+        relative_path = resolved_path.relative_to(resolved_root)
+    except (OSError, ValueError):
+        return False
+    try:
+        resolved_path.relative_to(resolved_state_dir)
+    except ValueError:
+        pass
+    else:
+        return False
+    relative = relative_path.as_posix()
+    if ".git" in relative_path.parts or STATE_DIR_NAME in relative_path.parts:
+        return False
+    if _matches_any(relative, [".git/**", f"{STATE_DIR_NAME}/**", ".env", ".env.*"]):
+        return False
+    if any(
+        "secret" in part.casefold() or "token" in part.casefold() for part in Path(relative).parts
+    ):
+        return False
+    if include_globs and not _matches_any(relative, include_globs):
+        return False
+    if exclude_globs and _matches_any(relative, exclude_globs):
+        return False
+    return True
+
+
+def _matches_any(relative_path: str, patterns: list[str]) -> bool:
+    path = Path(relative_path)
+    for pattern in patterns:
+        if fnmatch.fnmatchcase(relative_path, pattern) or path.match(pattern):
+            return True
+        if "/**/" in pattern:
+            direct_child_pattern = pattern.replace("/**/", "/")
+            if fnmatch.fnmatchcase(relative_path, direct_child_pattern) or path.match(
+                direct_child_pattern
+            ):
+                return True
+    return False
 
 
 def _split_frontmatter(path: str, text: str) -> tuple[dict[str, Any], str]:
@@ -689,29 +875,33 @@ def _quote_fts_query(query: str) -> str:
 
 
 def _row_to_search_result(row: sqlite3.Row | tuple[Any, ...], original_query: str) -> SearchResult:
-    bm25_score = float(row[13])
+    bm25_score = float(row[17])
     relevance_score = 1.0 / (1.0 + abs(bm25_score))
-    authority = str(row[5] or "working")
+    authority = str(row[9] or "working")
     final_score = relevance_score + AUTHORITY_BOOST.get(authority, 0.0)
-    if _path_or_title_exact_match(original_query, path=str(row[1]), title=str(row[2])):
+    if _path_or_title_exact_match(original_query, path=str(row[5]), title=str(row[6])):
         final_score += 0.20
     if authority in {"superseded", "rejected"}:
         final_score -= 0.50
 
     return SearchResult(
         repo_id=str(row[0]),
-        path=str(row[1]),
-        title=str(row[2] or row[1]),
-        doc_type=str(row[3] or "text"),
-        status=str(row[4] or "draft"),
+        source_mode=str(row[1] or "workspace"),
+        includes_uncommitted_changes=bool(row[2]),
+        snapshot_ref=str(row[3]) if row[3] is not None else None,
+        snapshot_commit=str(row[4]) if row[4] is not None else None,
+        path=str(row[5]),
+        title=str(row[6] or row[5]),
+        doc_type=str(row[7] or "text"),
+        status=str(row[8] or "draft"),
         authority=authority,
-        tags=json.loads(row[6] or "[]"),
-        superseded_by=json.loads(row[7] or "[]"),
-        chunk_id=str(row[8]),
-        heading_path=json.loads(row[9] or "[]"),
-        line_start=row[10],
-        line_end=row[11],
-        snippet=str(row[12] or ""),
+        tags=json.loads(row[10] or "[]"),
+        superseded_by=json.loads(row[11] or "[]"),
+        chunk_id=str(row[12]),
+        heading_path=json.loads(row[13] or "[]"),
+        line_start=row[14],
+        line_end=row[15],
+        snippet=str(row[16] or ""),
         bm25_score=bm25_score,
         relevance_score=relevance_score,
         final_score=final_score,

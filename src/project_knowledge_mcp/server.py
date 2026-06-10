@@ -8,6 +8,11 @@ import typer
 from fastmcp import FastMCP
 
 from project_knowledge_mcp.index import ProjectIndex, index_repo
+from project_knowledge_mcp.services import (
+    index_project_from_config,
+    search_ops_from_config,
+    validate_config_service,
+)
 
 app = typer.Typer(add_completion=False, help="Project Knowledge MCP local tooling.")
 
@@ -27,25 +32,67 @@ def create_mcp() -> FastMCP:
         """Return server health."""
         return {
             "status": "ok",
-            "phase": "step1_authority_aware_sqlite_index",
+            "phase": "step2_config_backed_mcp_tools",
             "llm_required": False,
             "default_network_exposure": "loopback_or_stdio_only",
         }
 
     @mcp.tool
-    def validate_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Placeholder config validator proving stable MCP tool IO shape."""
-        config = config or {}
-        return {
-            "valid": True,
-            "ops_repo_configured": bool(config.get("ops_repo")),
-            "work_repo_count": len(config.get("work_repos", [])),
-            "warnings": [],
-        }
+    def validate_config(
+        config_path: str | None = None, config: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Validate real project config, with legacy inline smoke compatibility."""
+        if config_path is None and config is not None and "schema_version" not in config:
+            return {
+                "valid": True,
+                "project_id": None,
+                "repos": [],
+                "ops_repo_configured": bool(config.get("ops_repo")),
+                "work_repo_count": len(config.get("work_repos", [])),
+                "warnings": ["legacy inline config shape accepted for transport smoke only"],
+                "errors": [],
+            }
+        return validate_config_service(config_path)
+
+    @mcp.tool
+    def index_project(
+        config_path: str | None = None, repo_id: str | None = None, force: bool = False
+    ) -> dict[str, Any]:
+        """Index configured repos into the authority-aware SQLite store."""
+        try:
+            return index_project_from_config(config_path=config_path, repo_id=repo_id, force=force)
+        except ValueError as exc:
+            return {
+                "status": "error",
+                "error": {
+                    "code": "CONFIG_INVALID",
+                    "message": str(exc),
+                    "details": {"repo_id": repo_id},
+                    "recoverable": True,
+                },
+                "errors": [],
+                "warnings": [],
+            }
+
+    @mcp.tool
+    def search_ops(
+        query: str,
+        config_path: str | None = None,
+        filters: dict[str, Any] | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Search configured ops repo docs with authority-aware ranking."""
+        return search_ops_from_config(
+            query=query,
+            config_path=config_path,
+            filters=filters,
+            limit=limit,
+        )
 
     return mcp
 
 
+@app.command("start")
 @app.command("serve")
 def serve(
     transport: Literal["stdio", "http", "streamable-http", "sse"] = typer.Option(
@@ -62,19 +109,46 @@ def serve(
         mcp.run(transport=transport, host=host, port=port)
 
 
+@app.command("validate-config")
+def validate_config_command(
+    config: Path | None = typer.Option(None, "--config", help="Project Knowledge config path."),
+) -> None:
+    """Validate Project Knowledge config and repo accessibility."""
+    typer.echo(json.dumps(validate_config_service(config), sort_keys=True))
+
+
 @app.command("index-project")
 def index_project_command(
-    repo_path: Path = typer.Option(..., help="Repository path to index."),
-    state_dir: Path = typer.Option(..., help="Project Knowledge state directory."),
-    repo_id: str = typer.Option("ops", help="Stable repository ID."),
+    repo_path: Path | None = typer.Option(None, help="Repository path to index."),
+    state_dir: Path | None = typer.Option(None, help="Project Knowledge state directory."),
+    repo_id: str | None = typer.Option(None, help="Stable repository ID."),
     role: str = typer.Option("ops", help="Repository role: ops, work, or artifact."),
     writable: bool = typer.Option(False, help="Whether the repository is writable by PKMCP."),
+    config: Path | None = typer.Option(None, "--config", help="Project Knowledge config path."),
+    force: bool = typer.Option(
+        False, help="Force configured reindex even if freshness checks later say current."
+    ),
 ) -> None:
     """Index Markdown and text files into the authority-aware SQLite store."""
+    if config is not None:
+        try:
+            typer.echo(
+                json.dumps(
+                    index_project_from_config(config_path=config, repo_id=repo_id, force=force),
+                    sort_keys=True,
+                )
+            )
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        return
+
+    if repo_path is None or state_dir is None:
+        raise typer.BadParameter("Either --config or both --repo-path and --state-dir are required")
+    direct_repo_id = repo_id or "ops"
     summary = index_repo(
         repo_path,
         state_dir=state_dir,
-        repo_id=repo_id,
+        repo_id=direct_repo_id,
         role=role,
         writable=writable,
     )
@@ -87,6 +161,34 @@ def index_project_command(
                 "indexed_chunks": summary.indexed_chunks,
                 "warning_count": summary.warning_count,
             },
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("search-ops")
+def search_ops_command(
+    query: str = typer.Argument(..., help="Lexical query for configured ops docs."),
+    config: Path | None = typer.Option(None, "--config", help="Project Knowledge config path."),
+    limit: int | None = typer.Option(None, min=1, help="Maximum results to return."),
+    include_superseded: bool = typer.Option(
+        False, help="Include superseded/rejected content with visible authority labels."
+    ),
+    doc_type: str | None = typer.Option(None, help="Filter by document type."),
+    authority: str | None = typer.Option(None, help="Filter by authority label."),
+    status: str | None = typer.Option(None, help="Filter by status."),
+) -> None:
+    """Search configured ops docs with MCP-compatible JSON and Markdown."""
+    filters: dict[str, Any] = {"include_superseded": include_superseded}
+    if doc_type is not None:
+        filters["doc_type"] = doc_type
+    if authority is not None:
+        filters["authority"] = authority
+    if status is not None:
+        filters["status"] = status
+    typer.echo(
+        json.dumps(
+            search_ops_from_config(query=query, config_path=config, filters=filters, limit=limit),
             sort_keys=True,
         )
     )
@@ -114,6 +216,10 @@ def search_index_command(
                         "path": result.path,
                         "title": result.title,
                         "repo_id": result.repo_id,
+                        "source_mode": result.source_mode,
+                        "includes_uncommitted_changes": result.includes_uncommitted_changes,
+                        "snapshot_ref": result.snapshot_ref,
+                        "snapshot_commit": result.snapshot_commit,
                         "type": result.doc_type,
                         "status": result.status,
                         "authority": result.authority,
@@ -135,6 +241,11 @@ def search_index_command(
 
 def cli() -> None:
     app()
+
+
+def main() -> None:
+    """Backward-compatible console entrypoint for previously generated scripts."""
+    cli()
 
 
 if __name__ == "__main__":
