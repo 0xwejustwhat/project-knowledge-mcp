@@ -73,6 +73,16 @@ AUTHORITY_BOOST = {
     "superseded": -0.50,
     "rejected": -0.60,
 }
+AUTHORITY_RANK_BASE = {
+    "implementation_truth": 4.0,
+    "canonical": 3.0,
+    "accepted_decision": 2.0,
+    "working": 1.0,
+    "capture": 0.0,
+    "historical": -1.0,
+    "superseded": -2.0,
+    "rejected": -3.0,
+}
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
@@ -139,6 +149,7 @@ class SearchResult:
     authority: str
     tags: list[str]
     superseded_by: list[str]
+    frontmatter: dict[str, Any]
     chunk_id: str
     heading_path: list[str]
     line_start: int | None
@@ -221,6 +232,7 @@ class ProjectIndex:
                    documents.authority,
                    documents.tags_json,
                    documents.superseded_by_json,
+                   documents.frontmatter_json,
                    chunks.id,
                    chunks.heading_path_json,
                    chunks.start_line,
@@ -232,13 +244,18 @@ class ProjectIndex:
             JOIN documents ON documents.id = chunks.document_id
             JOIN repos ON repos.id = documents.repo_id
             WHERE {where_sql}
+            ORDER BY bm25(chunks_fts) ASC, documents.path ASC, chunks.id ASC
             LIMIT ?
             """,
-            [*params, max(limit * 4, limit)],
+            [*params, min(max(limit * 20, 100), 1000)],
         ).fetchall()
         conn.close()
 
-        results = [_row_to_search_result(row, query) for row in rows]
+        relevance_scores = _normalized_relevance_scores([float(row[18]) for row in rows])
+        results = [
+            _row_to_search_result(row, query, relevance_score=relevance_scores[index])
+            for index, row in enumerate(rows)
+        ]
         results.sort(key=lambda result: (-result.final_score, result.path, result.chunk_id))
         return results[:limit]
 
@@ -986,11 +1003,27 @@ def _quote_fts_query(query: str) -> str:
     return " ".join(f'"{term}"' for term in terms)
 
 
-def _row_to_search_result(row: sqlite3.Row | tuple[Any, ...], original_query: str) -> SearchResult:
-    bm25_score = float(row[17])
-    relevance_score = 1.0 / (1.0 + abs(bm25_score))
+def _normalized_relevance_scores(bm25_scores: list[float]) -> list[float]:
+    if not bm25_scores:
+        return []
+    best = min(bm25_scores)
+    weakest = max(bm25_scores)
+    if best == weakest:
+        return [1.0 for _ in bm25_scores]
+    span = weakest - best
+    return [(weakest - score) / span for score in bm25_scores]
+
+
+def _row_to_search_result(
+    row: sqlite3.Row | tuple[Any, ...], original_query: str, *, relevance_score: float
+) -> SearchResult:
+    bm25_score = float(row[18])
     authority = str(row[9] or "working")
-    final_score = relevance_score + AUTHORITY_BOOST.get(authority, 0.0)
+    final_score = (
+        AUTHORITY_RANK_BASE.get(authority, AUTHORITY_RANK_BASE["working"])
+        + (relevance_score * 0.10)
+        + AUTHORITY_BOOST.get(authority, 0.0)
+    )
     if _path_or_title_exact_match(original_query, path=str(row[5]), title=str(row[6])):
         final_score += 0.20
     if authority in {"superseded", "rejected"}:
@@ -1009,11 +1042,12 @@ def _row_to_search_result(row: sqlite3.Row | tuple[Any, ...], original_query: st
         authority=authority,
         tags=json.loads(row[10] or "[]"),
         superseded_by=json.loads(row[11] or "[]"),
-        chunk_id=str(row[12]),
-        heading_path=json.loads(row[13] or "[]"),
-        line_start=row[14],
-        line_end=row[15],
-        snippet=str(row[16] or ""),
+        frontmatter=json.loads(row[12] or "{}"),
+        chunk_id=str(row[13]),
+        heading_path=json.loads(row[14] or "[]"),
+        line_start=row[15],
+        line_end=row[16],
+        snippet=str(row[17] or ""),
         bm25_score=bm25_score,
         relevance_score=relevance_score,
         final_score=final_score,

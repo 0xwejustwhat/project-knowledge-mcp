@@ -10,7 +10,10 @@ from fastmcp import FastMCP
 from project_knowledge_mcp.index import ProjectIndex, index_repo
 from project_knowledge_mcp.services import (
     check_project_staleness_from_config,
+    get_current_doctrine_from_config,
     index_project_from_config,
+    search_decisions_from_config,
+    search_open_questions_from_config,
     search_ops_from_config,
     validate_config_service,
 )
@@ -84,6 +87,51 @@ def create_mcp() -> FastMCP:
     ) -> dict[str, Any]:
         """Search configured ops repo docs with authority-aware ranking."""
         return search_ops_from_config(
+            query=query,
+            config_path=config_path,
+            filters=filters,
+            limit=limit,
+        )
+
+    @mcp.tool
+    def search_decisions(
+        query: str,
+        config_path: str | None = None,
+        filters: dict[str, Any] | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Search accepted and draft decision docs with authority-aware ranking."""
+        return search_decisions_from_config(
+            query=query,
+            config_path=config_path,
+            filters=filters,
+            limit=limit,
+        )
+
+    @mcp.tool
+    def get_current_doctrine(
+        topic: str,
+        config_path: str | None = None,
+        filters: dict[str, Any] | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Return canonical/current doctrine and accepted decisions for a topic."""
+        return get_current_doctrine_from_config(
+            topic=topic,
+            config_path=config_path,
+            filters=filters,
+            limit=limit,
+        )
+
+    @mcp.tool
+    def search_open_questions(
+        query: str,
+        config_path: str | None = None,
+        filters: dict[str, Any] | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Search open questions with source and owner metadata."""
+        return search_open_questions_from_config(
             query=query,
             config_path=config_path,
             filters=filters,
@@ -176,7 +224,7 @@ def index_project_command(
 def search_ops_command(
     query: str = typer.Argument(..., help="Lexical query for configured ops docs."),
     config: Path | None = typer.Option(None, "--config", help="Project Knowledge config path."),
-    limit: int | None = typer.Option(None, min=1, help="Maximum results to return."),
+    limit: int | None = typer.Option(None, help="Maximum results to return."),
     include_superseded: bool = typer.Option(
         False, help="Include superseded/rejected content with visible authority labels."
     ),
@@ -195,6 +243,78 @@ def search_ops_command(
     typer.echo(
         json.dumps(
             search_ops_from_config(query=query, config_path=config, filters=filters, limit=limit),
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("search-decisions")
+def search_decisions_command(
+    query: str = typer.Argument(..., help="Lexical query for decision docs."),
+    config: Path | None = typer.Option(None, "--config", help="Project Knowledge config path."),
+    limit: int | None = typer.Option(None, help="Maximum results to return."),
+    include_superseded: bool = typer.Option(
+        False, help="Include superseded/rejected decisions with visible authority labels."
+    ),
+    status: str | None = typer.Option(None, help="Filter by decision status."),
+    authority: str | None = typer.Option(None, help="Filter by authority label."),
+) -> None:
+    """Search accepted and draft decision docs with MCP-compatible JSON and Markdown."""
+    filters: dict[str, Any] = {"include_superseded": include_superseded}
+    if status is not None:
+        filters["status"] = status
+    if authority is not None:
+        filters["authority"] = authority
+    typer.echo(
+        json.dumps(
+            search_decisions_from_config(
+                query=query, config_path=config, filters=filters, limit=limit
+            ),
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("get-current-doctrine")
+def get_current_doctrine_command(
+    topic: str = typer.Argument(..., help="Topic to retrieve current doctrine for."),
+    config: Path | None = typer.Option(None, "--config", help="Project Knowledge config path."),
+    limit: int | None = typer.Option(None, help="Maximum results per section."),
+    include_superseded: bool = typer.Option(
+        False, help="Include superseded/rejected results with visible authority labels."
+    ),
+) -> None:
+    """Return canonical/current doctrine and accepted decisions for a topic."""
+    filters: dict[str, Any] = {"include_superseded": include_superseded}
+    typer.echo(
+        json.dumps(
+            get_current_doctrine_from_config(
+                topic=topic, config_path=config, filters=filters, limit=limit
+            ),
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("search-open-questions")
+def search_open_questions_command(
+    query: str = typer.Argument(..., help="Lexical query for open questions."),
+    config: Path | None = typer.Option(None, "--config", help="Project Knowledge config path."),
+    limit: int | None = typer.Option(None, help="Maximum results to return."),
+    include_superseded: bool = typer.Option(
+        False, help="Include superseded/rejected results with visible authority labels."
+    ),
+    status: str | None = typer.Option(None, help="Filter by question status."),
+) -> None:
+    """Search open questions with MCP-compatible JSON and Markdown."""
+    filters: dict[str, Any] = {"include_superseded": include_superseded}
+    if status is not None:
+        filters["status"] = status
+    typer.echo(
+        json.dumps(
+            search_open_questions_from_config(
+                query=query, config_path=config, filters=filters, limit=limit
+            ),
             sort_keys=True,
         )
     )
