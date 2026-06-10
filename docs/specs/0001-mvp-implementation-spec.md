@@ -11,14 +11,14 @@ reviewed_after_step0: 2026-06-09
 snapshot_created: 2026-06-10
 canonical_source_repo: 0xwejustwhat/Project-Knowledge-MCP-ops
 canonical_source_path: docs/specs/0001-mvp-implementation-spec.md
-canonical_source_commit: cc9efa73b61f6fe7398b4e0f0f0313b6bf117199
-canonical_source_pr: https://github.com/0xwejustwhat/Project-Knowledge-MCP-ops/pull/5
+canonical_source_commit: 9a3ce45ab320805855e31c3c53d9fb3b06e24a2f
+canonical_source_pr: null
 source_documents:
   - docs/PRD.md
   - docs/amendments/0001-capture-governance-reconciliation.md
   - docs/discussions/2026-06-09-initial-brainstorm-summary.md
   - docs/discussions/2026-06-09-local-parser-sqlite-codegraph-decision.md
-  - docs/decisions/0002-workspace-vs-snapshot-repo-source.md
+  - docs/decisions/0003-step7-capture-and-authority-pr-flow.md
   - project-knowledge-mcp:docs/decisions/0001-step-0-provider-evaluation.md
 ---
 
@@ -88,9 +88,11 @@ The MVP must provide:
 12. CodeGraph-style code context as a first-class architecture component when code repos are configured and the reliability spike passes. It is included in the architecture whether or not a specific project uses code; direct file/text retrieval is fallback, not the preferred path.
 13. Session brief/evidence packet compilation without any LLM dependency.
 14. Safe low-authority note capture via `add_project_note(...)`.
-15. Direct mutation prevention for canonical/high-authority files.
-16. Structured JSON responses plus human-readable Markdown packet fields.
-17. Tests and fixtures proving indexing, retrieval, ranking, staleness, write policy, setup flow, and MCP tool behavior.
+15. Draft/proposal artifact creation via `create_draft_artifact(...)`.
+16. Caller-supplied authority-change PR proposals via `propose_authority_change(...)`, with no direct canonical mutation and no automatic merge.
+17. Direct mutation prevention for canonical/high-authority files.
+18. Structured JSON responses plus human-readable Markdown packet fields.
+19. Tests and fixtures proving indexing, retrieval, ranking, staleness, write policy, setup flow, and MCP tool behavior.
 
 ### 1.2 Non-Goals
 
@@ -119,7 +121,8 @@ The MVP must not:
 - File watching.
 - Scheduled reconciliation jobs.
 - Automatic doctrine drift adjudication.
-- Automatic PR creation.
+- Automatic merge, promotion, or acceptance of authority-changing PRs.
+- MCP-authored authority changes without caller-supplied proposed content and an explicit review path.
 - Hosted multi-tenant service.
 
 ---
@@ -149,7 +152,8 @@ The server may:
 - compile structured context packets;
 - write low-authority capture notes;
 - create draft/proposal artifacts in safe folders;
-- block direct high-authority mutations.
+- prepare caller-supplied authority-change proposals on a Git branch and open a PR when GitHub auth is configured;
+- block direct high-authority mutations and all automatic promotion/merge paths.
 
 ### 2.2 What the MCP Server Does Not Do in MVP
 
@@ -161,6 +165,8 @@ The server must not:
 - silently promote notes into doctrine;
 - mark questions resolved without explicit review;
 - infer accepted decisions from raw discussions;
+- author authority-changing content on its own;
+- merge, approve, or mark authority-change PRs accepted;
 - directly edit canonical doctrine/ADR files through casual tool calls.
 
 ### 2.3 Evidence Packet Definition
@@ -180,7 +186,6 @@ An evidence packet is a deterministic, structured object containing:
 - possible gaps;
 - source paths and line ranges where available;
 - authority/freshness metadata;
-- repository source mode metadata, including whether indexed evidence reflects the active workspace or a pinned snapshot;
 - Markdown rendering for humans/LLMs.
 
 The connected assistant turns the packet into a human answer.
@@ -275,7 +280,7 @@ As a developer, I want explicit repo freshness status before relying on context,
 
 Acceptance criteria:
 
-- `check_project_staleness()` reports source mode, host path when known, container path, branch, local HEAD, remote tracking branch, ahead/behind, dirty state, untracked files count, last indexed commit, whether uncommitted changes are included, and whether reindex is needed.
+- `check_project_staleness()` reports branch, local HEAD, remote tracking branch, ahead/behind, dirty state, untracked files count, last indexed commit, and whether reindex is needed.
 - If remote cannot be checked, response includes a warning rather than failing the whole tool.
 
 #### Story 9: Search Code With CodeGraph-Style Context and Safe Fallback
@@ -387,28 +392,6 @@ Assumptions:
 - A localhost-bound HTTP/StreamableHTTP mode should also be provided for tools that cannot launch stdio Docker commands directly.
 - The server must bind to loopback by default. Public/LAN exposure is out of default MVP behavior and requires explicit user configuration.
 
-### 4.1.1 Repo Source Modes
-
-PKMCP must distinguish the repository being edited from a repository snapshot used for deterministic analysis.
-
-**Workspace mode is the default for local development.** In workspace mode, the canonical repo lives on the host and Docker receives it through a bind mount. Humans and agents edit the host working tree; PKMCP indexes the mounted path inside the container. This ensures uncommitted edits, dirty state, and untracked files are visible to indexing and freshness checks.
-
-**Snapshot mode is opt-in.** In snapshot mode, setup or the container may clone a repo/ref/PR into container-managed storage for CI, demos, PR review, or deterministic remote analysis. Snapshot mode must disclose the pinned ref/commit and must not imply that uncommitted host changes are included.
-
-Required invariant: every repo status, index record, evidence packet, and staleness response must make the source explicit enough to answer: "Did this evidence come from the active workspace I am editing, or from a pinned snapshot?"
-
-At minimum, repo metadata should include:
-
-- `source_mode`: `workspace` or `snapshot`;
-- `host_path` when known/applicable;
-- `container_path` / configured repo path;
-- Git branch/ref and HEAD commit;
-- dirty state and untracked file count;
-- last indexed commit/time;
-- whether the indexed content includes uncommitted changes.
-
-The setup flow may offer clone-from-URL convenience, but for local developer workflows the result should still be a host clone bind-mounted into the container unless the user explicitly selects snapshot mode.
-
 ### 4.2 Example Docker Compose
 
 ```yaml
@@ -491,6 +474,32 @@ project-knowledge start --transport http --host 127.0.0.1 --port 8000
 
 When running HTTP mode inside Docker, the container may bind `0.0.0.0` internally only if Docker publishes the port to host loopback (`127.0.0.1`) by default.
 
+### 4.6 Authorized Remote HTTPS Bridge
+
+Browser-hosted assistants such as ChatGPT may require an MCP endpoint reachable over HTTPS. The MVP should support this without creating a special remote server or weakening the tool policy.
+
+Remote exposure is an explicit opt-in bridge:
+
+- Project Knowledge MCP runs the same FastMCP tool surface over HTTP/StreamableHTTP.
+- Docker keeps the MCP service private to the host or Docker network by default.
+- Caddy terminates HTTPS and proxies to the MCP HTTP service.
+- Caddy enforces a long-lived `Authorization: Bearer <token>` gate before proxying.
+- The Python MCP server still enforces all read/write/authority policies; Caddy is only transport/auth wrapping.
+- No shell tool, arbitrary filesystem write, merge, or canonical direct-write ability is added for remote clients.
+
+Minimal Caddy shape:
+
+```caddyfile
+pkmcp.example.com {
+  @missingAuth not header Authorization "Bearer {$MCP_AUTH_TOKEN}"
+  respond @missingAuth 401
+
+  reverse_proxy project-knowledge-mcp:8000
+}
+```
+
+The production docs may use a stronger Caddy matcher if needed, but the acceptance requirement is simple: no token or a wrong token returns `401`, the correct token reaches the standard MCP HTTP endpoint, and the exposed tools are identical to the local server's policy-enforced tools.
+
 ---
 
 ## 5. Project Configuration
@@ -527,8 +536,6 @@ repos:
   - id: ops
     role: ops
     name: Project Knowledge MCP Ops
-    source_mode: workspace
-    host_path: /root/work/Project-Knowledge-MCP-ops
     path: /workspace
     writable: true
     canonical_priority: high
@@ -544,8 +551,6 @@ repos:
   - id: ghostmesh
     role: work
     name: Ghost Mesh Runtime
-    source_mode: workspace
-    host_path: /root/work/ghostmesh
     path: /repos/ghostmesh
     writable: false
     include_globs:
@@ -639,9 +644,6 @@ On startup or `validate_config()`:
 - `project.id` must be non-empty and URL/path safe.
 - Every repo path must exist.
 - Every repo path must be a Git worktree unless `allow_non_git: true` is explicitly added in future.
-- Every repo must declare `source_mode: workspace` or `source_mode: snapshot`; omitted values may be normalized to `workspace` only for backward-compatible MVP configs, with a warning.
-- Workspace-mode repos should include `host_path` when running under Docker so status output can explain which host working tree is mounted.
-- Snapshot-mode repos must include enough provenance to identify the cloned source/ref/commit and must report `includes_uncommitted_changes: false` unless the snapshot was explicitly built from those changes.
 - Exactly one repo should have `role: ops` for MVP.
 - At least one repo must be configured.
 - If any repo has `writable: true`, the container filesystem must actually allow writes.
@@ -877,8 +879,6 @@ CREATE TABLE repos (
   id TEXT PRIMARY KEY,
   role TEXT NOT NULL,
   name TEXT NOT NULL,
-  source_mode TEXT NOT NULL DEFAULT 'workspace',
-  host_path TEXT,
   path TEXT NOT NULL,
   writable INTEGER NOT NULL DEFAULT 0,
   current_branch TEXT,
@@ -890,9 +890,6 @@ CREATE TABLE repos (
   behind_count INTEGER,
   dirty INTEGER,
   untracked_count INTEGER,
-  includes_uncommitted_changes INTEGER NOT NULL DEFAULT 0,
-  snapshot_ref TEXT,
-  snapshot_commit TEXT,
   last_status_checked_at TEXT,
   last_indexed_at TEXT,
   last_indexed_commit TEXT
@@ -1484,18 +1481,106 @@ Rules:
 - If target matches blocked high-authority globs, reject and suggest a proposal path.
 - If `auto_reindex_after_note_write` is true, index only the newly written document before returning; never perform a full repo rescan inside this tool call.
 
-### 10.14 `create_draft_artifact(kind, title, body, source?, tags?)`
+### 10.14 `create_draft_artifact(kind, title, body, source?, tags?, target?)`
 
-Optional but recommended for MVP if time permits. Creates proposal/draft artifacts only.
+Creates proposal/draft artifacts only. This is required in Phase 7 because blocked canonical writes must have a usable non-canonical destination rather than ending in a dead end.
 
 Supported `kind`:
 
 - `open_question`
 - `doctrine_delta`
 - `adr_draft`
+- `decision_proposal`
 - `review_packet`
+- `handover`
 
-No accepted/canonical writes.
+Output:
+
+```json
+{
+  "status": "written",
+  "repo_id": "ops",
+  "path": "docs/proposals/doctrine-deltas/2026-06-10-example.md",
+  "authority": "proposal",
+  "indexed": true,
+  "warnings": []
+}
+```
+
+Rules:
+
+- No accepted/canonical writes.
+- `target` must resolve inside configured proposal/draft directories.
+- Frontmatter must preserve `authority: proposal` or another non-canonical working authority.
+- The response should name `propose_authority_change` when the caller needs a reviewable canonical mutation path.
+
+### 10.15 `propose_authority_change(title, rationale, changes, source?, tags?, branch_name?)`
+
+Creates a reviewable Git PR for caller-supplied authority-changing additions or mutations. This tool does not decide truth and does not merge. It is Git plumbing for reviewable proposals.
+
+Input:
+
+```json
+{
+  "title": "Clarify Step 7 authority proposal flow",
+  "rationale": "Hosted MCP clients need both low-friction capture and a non-circumventable review path for authority changes.",
+  "changes": [
+    {
+      "operation": "replace_file",
+      "path": "docs/specs/0001-mvp-implementation-spec.md",
+      "content": "...complete file content..."
+    },
+    {
+      "operation": "add_file",
+      "path": "docs/decisions/0004-example.md",
+      "content": "..."
+    }
+  ],
+  "source": "chatgpt discussion 2026-06-10",
+  "tags": ["step7", "authority"]
+}
+```
+
+Output when GitHub PR creation succeeds:
+
+```json
+{
+  "status": "pr_opened",
+  "repo_id": "ops",
+  "branch": "pkmcp/authority-proposal/2026-06-10-clarify-step-7",
+  "commit": "abc123",
+  "pr_url": "https://github.com/0xwejustwhat/Project-Knowledge-MCP-ops/pull/123",
+  "changed_paths": ["docs/specs/0001-mvp-implementation-spec.md"],
+  "authority_boundary": "review_required_before_promotion",
+  "warnings": []
+}
+```
+
+Output when branch/commit can be prepared but GitHub auth is unavailable:
+
+```json
+{
+  "status": "branch_prepared_pr_not_opened",
+  "repo_id": "ops",
+  "branch": "pkmcp/authority-proposal/2026-06-10-clarify-step-7",
+  "commit": "abc123",
+  "changed_paths": ["docs/specs/0001-mvp-implementation-spec.md"],
+  "next_action": "push branch and open PR manually",
+  "authority_boundary": "review_required_before_promotion",
+  "warnings": ["GitHub authentication unavailable; no PR was opened."]
+}
+```
+
+Rules:
+
+- This tool accepts caller-supplied changes only; it must not synthesize authority-changing content internally.
+- `changes[*].path` must stay under the configured repo root after normalization.
+- No arbitrary shell execution, no merge, no force push, no PR approval, and no accepted-status mutation after PR creation.
+- The implementation should prefer a clean temporary worktree or branch isolation so the active workspace is not corrupted.
+- If the active workspace is dirty and no safe worktree isolation is available, fail closed with structured instructions.
+- Branch names are generated/sanitized unless an allowed `branch_name` is supplied.
+- Commit and PR body must include the rationale, source, changed paths, and the authority boundary.
+- Direct high-authority mutation requests through `add_project_note` or `create_draft_artifact` should point to this tool rather than encouraging manual bypass.
 
 ---
 
@@ -1574,24 +1659,40 @@ Direct writes are blocked for:
 
 ### 12.3 Blocked Write Response
 
-When blocked:
-
+When blocked, the response must provide a usable proposal path rather than a dead end:
 ```json
 {
   "status": "blocked",
   "reason": "Target path is canonical/high-authority. Direct MCP writes are not allowed.",
   "target": "docs/doctrine/current.md",
-  "suggested_action": "create_draft_artifact",
-  "suggested_target": "docs/proposals/doctrine-deltas/2026-06-09-example.md"
+  "suggested_actions": ["create_draft_artifact", "propose_authority_change"],
+  "suggested_draft_target": "docs/proposals/doctrine-deltas/2026-06-10-example.md",
+  "authority_boundary": "review_required_before_promotion"
 }
 ```
 
-### 12.4 Promotion
+### 12.4 Reviewable Authority-Change PRs
 
-Promotion from capture/working to canonical is not done by the MCP server in MVP. It happens via:
+Phase 7 includes a reviewable PR path because capture-only writes are insufficient for hosted assistants and other MCP clients that need to help maintain project memory. Without a mechanical proposal path, users will either bypass the MCP write policy or leave important decisions trapped in chat.
 
-- human editing;
-- PR workflow;
+Allowed in MVP:
+
+- prepare caller-supplied authority-changing additions/mutations on an isolated branch;
+- commit those changes with rationale/source metadata;
+- open a GitHub PR when credentials are configured;
+- return branch/commit/manual next-action details when PR creation is unavailable.
+
+Still blocked in MVP:
+
+- direct canonical mutation on the active branch;
+- server-authored doctrine/decision content without caller-supplied changes;
+- merge, approval, accepted-status promotion, or governance bypass.
+
+### 12.5 Promotion
+
+Promotion from capture/working/proposal to canonical is not done by the MCP server in MVP. It happens via:
+
+- human review and merge of the generated PR;
 - external governance process;
 - future explicit promotion tool requiring approval.
 
@@ -1634,15 +1735,16 @@ Search/brief tools should degrade where possible. A stale/remote failure warning
 Required MVP protections:
 
 1. No network exposure by default.
-2. No cloud model/API calls by default.
-3. No secret environment variables required.
-4. Work repos mounted read-only by default.
-5. Ops repo write access limited by write policy.
-6. Path traversal prevention on all write targets.
-7. All target paths normalized and verified under configured repo root.
-8. Binary files skipped.
-9. `.git` internals never indexed as content.
-10. Generated Markdown must include source paths but not secret redaction guarantees beyond skipped files/globs.
+2. Any browser/mobile remote bridge must be explicit, HTTPS-terminated by Caddy, and bearer-token gated before proxying to MCP.
+3. No cloud model/API calls by default.
+4. No secret environment variables required for local-only use; remote bridge mode requires an operator-provided `MCP_AUTH_TOKEN`.
+5. Work repos mounted read-only by default.
+6. Ops repo write access limited by write policy.
+7. Path traversal prevention on all write targets.
+8. All target paths normalized and verified under configured repo root.
+9. Binary files skipped.
+10. `.git` internals never indexed as content.
+11. Generated Markdown must include source paths but not secret redaction guarantees beyond skipped files/globs.
 
 Recommended default excludes:
 
@@ -1922,35 +2024,47 @@ Acceptance:
 poetry run pytest tests/test_brief_packet.py -q
 ```
 
-### Phase 7: Safe Capture Writes
+### Phase 7: Safe Writes and Authority Change Proposals
 
 Deliver:
 
-- `add_project_note`.
-- Optional `create_draft_artifact`.
-- Write policy enforcement.
-- Immediate indexing of written note.
+- `add_project_note` for low-authority capture writes.
+- `create_draft_artifact` for proposal/draft artifacts.
+- `propose_authority_change` for caller-supplied canonical additions/mutations via isolated branch + PR or structured manual next action.
+- Write policy enforcement that blocks direct canonical writes and points to draft/PR proposal paths.
+- Immediate single-document indexing of written notes and drafts.
+- Tests proving no direct high-authority mutation, no merge/promotion, and no path traversal.
 
 Acceptance:
 
 ```bash
-poetry run pytest tests/test_write_policy.py -q
+poetry run pytest tests/test_write_policy.py tests/test_authority_proposals.py -q
 ```
 
-### Phase 8: End-to-End MCP Verification
+### Phase 8: End-to-End MCP, Docker, and HTTPS/Caddy Verification
 
 Deliver:
 
-- MCP server tool registration.
+- MCP server tool registration for the complete Phase 7 tool surface.
 - Tool calls exercised through an MCP client test or integration harness.
-- Docker run verified.
+- Docker build and run verified with mounted workspace repos.
+- HTTP/StreamableHTTP mode verified locally.
+- Caddy HTTPS reverse-proxy example/config for authorized remote clients such as ChatGPT.
+- Bearer-token gate verified: missing/wrong token fails before MCP, correct token reaches MCP.
+- Documentation proving the HTTPS endpoint exposes the same policy-enforced server/tools as local mode, not a special remote variant.
 
 Acceptance:
 
 ```bash
-poetry run pytest tests/test_mcp_tools.py -q
+poetry run pytest tests/test_mcp_tools.py tests/test_remote_https_bridge.py -q
 docker build -t project-knowledge-mcp:test .
 docker run --rm -i -v "$PWD:/workspace:rw" -e PROJECT_KNOWLEDGE_CONFIG=/workspace/project.example.yaml project-knowledge-mcp:test --help
+caddy validate --config deploy/Caddyfile.example
+# Integration harness must prove:
+# - no Authorization header => 401
+# - wrong bearer token => 401
+# - correct bearer token => MCP HTTP endpoint reachable
+# - remotely visible tools match the local policy-enforced tool registry
 ```
 
 ---
@@ -2007,22 +2121,26 @@ MVP is complete when:
 1. Docker image builds.
 2. Container runs on a generic Docker-capable host, not only a Hermes instance.
 3. MCP stdio server starts from Docker.
-4. Localhost-bound HTTP/StreamableHTTP mode starts or is explicitly deferred with a documented connector limitation.
-5. Setup script/UI can generate config, mount definitions, and client snippets without manual Docker/YAML assembly.
-6. Config validation works for mounted repos.
-7. Local parser + SQLite FTS5/BM25 retrieval-quality spike is recorded before implementation and the selected retrieval decision is documented.
-8. Code repo contains a pinned implementation snapshot of this spec with provenance fields pointing back to the ops repo source path and commit.
-9. Indexing works without network, model keys, embedding keys, or cloud parser keys.
-10. SQLite FTS5/BM25 candidate retrieval works for ops docs with metadata preserved and authority ranking tested.
-11. Code search works through text fallback when no code graph provider is healthy.
-12. CodeGraphContext is spiked and either integrated as the preferred code context path or rejected with recorded evidence and replacement criteria; fallback works with status reporting in either case.
-13. Staleness checks report Git state.
-14. Session brief returns structured evidence packet plus Markdown.
-15. `add_project_note` writes low-authority capture docs and indexes only the newly written document synchronously.
-16. Direct writes to canonical paths are blocked.
-17. All tests pass locally.
-18. README documents setup, config, Docker, generic MCP clients, Hermes MCP connection, and browser/mobile connector boundaries.
-19. No test requires an LLM key, embedding key, GPU, or network access.
+4. Localhost-bound HTTP/StreamableHTTP mode starts.
+5. Authorized remote mode is verified through Caddy HTTPS + bearer-token gate, with no-token/wrong-token rejection and correct-token MCP reachability.
+6. Setup script/UI can generate config, mount definitions, local client snippets, and remote-bridge instructions without manual Docker/YAML assembly.
+7. Config validation works for mounted repos.
+8. Local parser + SQLite FTS5/BM25 retrieval-quality spike is recorded before implementation and the selected retrieval decision is documented.
+9. Code repo contains a pinned implementation snapshot of this spec with provenance fields pointing back to the ops repo source path and commit.
+10. Indexing works without network, model keys, embedding keys, or cloud parser keys.
+11. SQLite FTS5/BM25 candidate retrieval works for ops docs with metadata preserved and authority ranking tested.
+12. Code search works through text fallback when no code graph provider is healthy.
+13. CodeGraphContext is spiked and either integrated as the preferred code context path or rejected with recorded evidence and replacement criteria; fallback works with status reporting in either case.
+14. Staleness checks report Git state.
+15. Session brief returns structured evidence packet plus Markdown.
+16. `add_project_note` writes low-authority capture docs and indexes only the newly written document synchronously.
+17. `create_draft_artifact` writes non-canonical proposal/draft docs and indexes only the newly written document synchronously.
+18. `propose_authority_change` can create a branch/commit/PR, or return structured manual PR instructions when GitHub auth is unavailable.
+19. Direct writes to canonical paths are blocked and return draft/PR proposal guidance.
+20. The MCP server cannot merge, approve, or mark authority-change proposals accepted.
+21. All tests pass locally.
+22. README documents setup, config, Docker, generic MCP clients, Hermes MCP connection, Caddy HTTPS remote bridge, and browser/mobile connector boundaries.
+23. No test requires an LLM key, embedding key, GPU, or network access.
 
 ---
 
@@ -2033,20 +2151,19 @@ These are explicitly non-blocking for the MVP draft unless reviewers decide othe
 1. Is SQLite FTS5/BM25 plus typed evidence compilation sufficient after the retrieval-quality spike, or must the implementation move to the next named retrieval candidate?
 2. Is `CodeGraphContext` reliable enough on Python 3.12 after the spike, or must the implementation move to the next named CodeGraph-style candidate?
 3. Should the default capture directory be `docs/notes/` or `inbox/`?
-4. Should `create_draft_artifact` be MVP or immediate post-MVP?
-5. Should project config support multiple ops repos in v1, or exactly one ops repo?
-6. Should MCP expose `generate_session_brief` or rename it to `compile_session_context` while preserving an alias?
-7. Should line ranges be best-effort in MVP or strict for Markdown docs?
-8. Should a Git remote fetch be attempted during staleness checks, or should remote comparison use existing refs only by default?
-9. Which browser/mobile connector path should be documented first for ChatGPT/Gemini/iPad workflows, given local-only exposure by default?
+4. Should project config support multiple ops repos in v1, or exactly one ops repo?
+5. Should MCP expose `generate_session_brief` or rename it to `compile_session_context` while preserving an alias?
+6. Should line ranges be best-effort in MVP or strict for Markdown docs?
+7. Should a Git remote fetch be attempted during staleness checks, or should remote comparison use existing refs only by default?
 
 Recommended defaults for MVP:
 
 - Local parser registry + SQLite FTS5/BM25 is the default document retrieval/indexing path; if retrieval-quality tests fail, evaluate the next named local/no-key candidate behind the same provider boundary.
 - FastMCP is the default MCP framework on top of the official MCP Python SDK; expose shared service functions through stdio and localhost HTTP/StreamableHTTP entrypoints.
+- Caddy HTTPS + bearer token is the first documented browser/mobile connector bridge for hosted assistants that require a reachable HTTPS MCP endpoint; it exposes the same server/tool surface as local mode.
 - CodeGraphContext is the first code context candidate; if reliable on Python 3.12, it is the preferred code context provider behind the adapter boundary; text fallback required for no-code/unhealthy cases.
 - Default capture directory: `docs/notes/`.
-- Include `create_draft_artifact` only if it does not delay core tools.
+- `create_draft_artifact` and `propose_authority_change` are required in Phase 7 so blocked canonical writes have usable proposal paths.
 - Exactly one ops repo in MVP.
 - Keep `generate_session_brief` as the friendly tool name.
 - Line ranges best-effort.
