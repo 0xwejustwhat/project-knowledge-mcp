@@ -4,6 +4,7 @@ import sqlite3
 import subprocess
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 
@@ -501,6 +502,416 @@ def get_code_context_from_config(
         "warnings": list(status.get("warnings", [])),
         "markdown": _render_code_markdown("Code Context", symbol_or_file, payload_results),
     }
+
+
+def retrieve_ops_code_evidence_from_config(
+    *,
+    topic: str,
+    config_path: Path | str | None = None,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    result_limit = _brief_result_limit(config_path=config_path, limit=limit)
+    doctrine_packet = get_current_doctrine_from_config(
+        topic=topic, config_path=config_path, limit=result_limit
+    )
+    open_questions_packet = search_open_questions_from_config(
+        query=topic, config_path=config_path, limit=result_limit
+    )
+    code_packet = search_code_from_config(query=topic, config_path=config_path, limit=result_limit)
+    staleness_packet = check_project_staleness_from_config(config_path=config_path)
+
+    doctrine_results = list(doctrine_packet.get("doctrine", []))
+    decision_results = list(doctrine_packet.get("decisions", []))
+    open_question_results = (
+        [] if open_questions_packet.get("error") else list(open_questions_packet.get("results", []))
+    )
+    code_results = [] if code_packet.get("error") else list(code_packet.get("results", []))
+    sections = {
+        "doctrine": doctrine_results,
+        "decisions": decision_results,
+        "open_questions": open_question_results,
+        "code": code_results,
+    }
+    gaps = _packet_gaps(code_results, code_packet=code_packet)
+    errors = _packet_errors(
+        ("doctrine", doctrine_packet),
+        ("open_questions", open_questions_packet),
+        ("code", code_packet),
+        ("staleness", staleness_packet),
+    )
+    warnings = _merge_unique_warnings(
+        doctrine_packet.get("warnings", []),
+        open_questions_packet.get("warnings", []),
+        code_packet.get("warnings", []),
+        staleness_packet.get("warnings", []),
+        _packet_staleness_warnings(staleness_packet.get("repos", [])),
+        _packet_error_warnings(
+            doctrine_packet, open_questions_packet, code_packet, staleness_packet
+        ),
+    )
+    project_id = (
+        doctrine_packet.get("project_id")
+        or open_questions_packet.get("project_id")
+        or code_packet.get("project_id")
+        or staleness_packet.get("project_id")
+    )
+    packet = {
+        "tool": "retrieve_ops_code_evidence",
+        "topic": topic,
+        "project_id": project_id,
+        "generated_at": _now(),
+        "sections": sections,
+        "staleness": staleness_packet.get("repos", []),
+        "warnings": warnings,
+        "gaps": gaps,
+        "errors": errors,
+    }
+    packet["markdown"] = _render_ops_code_evidence_markdown(packet)
+    return packet
+
+
+def generate_session_brief_from_config(
+    *,
+    task: str,
+    config_path: Path | str | None = None,
+    since: str | None = None,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    topic = _topic_from_task(task)
+    result_limit = _brief_result_limit(config_path=config_path, limit=limit)
+    evidence = retrieve_ops_code_evidence_from_config(
+        topic=topic, config_path=config_path, limit=result_limit
+    )
+    recent_changes = _recent_indexed_changes_from_config(
+        config_path=config_path, since=since, limit=result_limit
+    )
+    repo_staleness = list(evidence.get("staleness", []))
+    sections = dict(evidence.get("sections", {}))
+    sections["recent_changes"] = recent_changes.get("results", [])
+    warnings = _merge_unique_warnings(
+        evidence.get("warnings", []), recent_changes.get("warnings", [])
+    )
+    errors = [*list(evidence.get("errors", [])), *list(recent_changes.get("errors", []))]
+    brief = {
+        "tool": "generate_session_brief",
+        "task": task,
+        "evidence_topic": topic,
+        "since": since,
+        "project_id": evidence.get("project_id"),
+        "generated_at": _now(),
+        "repo_staleness": repo_staleness,
+        "sections": sections,
+        "warnings": warnings,
+        "gaps": list(evidence.get("gaps", [])),
+        "errors": errors,
+    }
+    brief["markdown"] = _render_session_brief_markdown(brief)
+    return brief
+
+
+def _brief_result_limit(*, config_path: Path | str | None, limit: Any) -> Any:
+    if limit is not None:
+        return limit
+    validation = validate_project_config(config_path)
+    if not validation["valid"]:
+        return limit
+    config = load_project_config(config_path)
+    return config.retrieval.brief_max_results_per_section
+
+
+def _packet_gaps(
+    code_results: list[dict[str, Any]], *, code_packet: dict[str, Any]
+) -> list[dict[str, Any]]:
+    if code_results:
+        return []
+    if code_packet.get("error"):
+        return [
+            {
+                "code": "CODE_EVIDENCE_UNAVAILABLE",
+                "message": "Code evidence search could not run for this topic.",
+                "recoverable": True,
+            }
+        ]
+    return [
+        {
+            "code": "CODE_EVIDENCE_MISSING",
+            "message": "No code evidence was found for this topic.",
+            "recoverable": True,
+        }
+    ]
+
+
+def _topic_from_task(task: str) -> str:
+    words = task.strip().split()
+    if len(words) > 1 and words[0].lower().rstrip(":") in {
+        "add",
+        "build",
+        "create",
+        "implement",
+        "plan",
+        "ship",
+    }:
+        return " ".join(words[1:])
+    return task
+
+
+def _packet_errors(*named_packets: tuple[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for source, packet in named_packets:
+        packet_errors = list(packet.get("errors", []))
+        if packet.get("error") and packet.get("error") not in packet_errors:
+            packet_errors.append(packet["error"])
+        for error in packet_errors:
+            if isinstance(error, dict):
+                normalized = {"source": source, **error}
+            else:
+                normalized = {"source": source, "message": str(error)}
+            key = (
+                source,
+                str(normalized.get("code", "")),
+                str(normalized.get("message", "")),
+            )
+            if key not in seen:
+                seen.add(key)
+                errors.append(normalized)
+    return errors
+
+
+def _recent_indexed_changes_from_config(
+    *, config_path: Path | str | None, since: str | None, limit: Any
+) -> dict[str, Any]:
+    if not since:
+        return {"results": [], "warnings": [], "errors": []}
+    validation = validate_project_config(config_path)
+    if not validation["valid"]:
+        return {
+            "results": [],
+            "warnings": validation["warnings"],
+            "errors": _packet_errors(("recent_changes", {"errors": validation["errors"]})),
+        }
+    config = load_project_config(config_path)
+    result_limit, limit_error = _normalize_limit(
+        since, limit, default_limit=config.retrieval.brief_max_results_per_section
+    )
+    if limit_error is not None:
+        return {
+            "results": [],
+            "warnings": limit_error.get("warnings", []),
+            "errors": _packet_errors(("recent_changes", limit_error)),
+        }
+
+    results: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    for repo in config.repos:
+        output = _git_output(
+            repo.path,
+            "log",
+            f"--since={since}",
+            "--name-status",
+            "--pretty=format:__PKMCP_COMMIT__%x09%H%x09%cI%x09%s",
+            warnings=warnings,
+            warning_context="recent change lookup",
+        )
+        current_commit: dict[str, str] | None = None
+        for line in (output or "").splitlines():
+            if not line:
+                continue
+            if line.startswith("__PKMCP_COMMIT__\t"):
+                parts = line.split("\t", 3)
+                if len(parts) == 4:
+                    current_commit = {
+                        "commit": parts[1],
+                        "committed_at": parts[2],
+                        "subject": parts[3],
+                    }
+                continue
+            if current_commit is None or "\t" not in line:
+                continue
+            status, path = _parse_git_name_status(line)
+            if not _repo_path_in_scope(
+                path, include_globs=repo.include_globs, exclude_globs=repo.exclude_globs
+            ):
+                continue
+            results.append(
+                {
+                    "repo_id": repo.id,
+                    "role": repo.role,
+                    "path": path,
+                    "status": status,
+                    "commit": current_commit["commit"],
+                    "committed_at": current_commit["committed_at"],
+                    "title": current_commit["subject"],
+                    "excerpt": f"{status} {path}",
+                    "source_mode": repo.source_mode,
+                }
+            )
+            if len(results) >= result_limit:
+                return {"results": results, "warnings": warnings, "errors": []}
+    return {"results": results, "warnings": warnings, "errors": []}
+
+
+def _parse_git_name_status(line: str) -> tuple[str, str]:
+    parts = line.split("\t")
+    if len(parts) >= 3 and parts[0].startswith(("R", "C")):
+        return parts[0], parts[2]
+    if len(parts) >= 2:
+        return parts[0], parts[1]
+    return "changed", line
+
+
+def _repo_path_in_scope(path: str, *, include_globs: list[str], exclude_globs: list[str]) -> bool:
+    included = not include_globs or _packet_path_matches_any(path, include_globs)
+    excluded = _packet_path_matches_any(path, exclude_globs)
+    return included and not excluded
+
+
+def _packet_path_matches_any(relative_path: str, patterns: list[str]) -> bool:
+    path = Path(relative_path)
+    for pattern in patterns:
+        if fnmatch(relative_path, pattern) or path.match(pattern):
+            return True
+        if "/**/" in pattern:
+            direct_child_pattern = pattern.replace("/**/", "/")
+            if fnmatch(relative_path, direct_child_pattern) or path.match(direct_child_pattern):
+                return True
+    return False
+
+
+def _packet_error_warnings(*packets: dict[str, Any]) -> list[str]:
+    warnings: list[str] = []
+    for packet in packets:
+        error = packet.get("error")
+        if isinstance(error, dict):
+            message = error.get("message")
+            if message:
+                warnings.append(str(message))
+    return warnings
+
+
+def _packet_staleness_warnings(repos: list[dict[str, Any]]) -> list[str]:
+    warnings: list[str] = []
+    for repo in repos:
+        if repo.get("reindex_needed"):
+            warnings.append(
+                f"Repo {repo.get('repo_id')} may need reindex before relying on evidence."
+            )
+    return warnings
+
+
+def _merge_unique_warnings(*warning_groups: Any) -> list[str]:
+    merged: list[str] = []
+    for group in warning_groups:
+        if not group:
+            continue
+        for warning in group:
+            text = str(warning)
+            if text and text not in merged:
+                merged.append(text)
+    return merged
+
+
+def _render_ops_code_evidence_markdown(packet: dict[str, Any]) -> str:
+    lines = ["## Ops + Code Evidence", "", f"Topic: `{packet['topic']}`", ""]
+    _append_packet_section(lines, "Doctrine", packet["sections"].get("doctrine", []))
+    _append_packet_section(lines, "Accepted Decisions", packet["sections"].get("decisions", []))
+    _append_packet_section(lines, "Open Questions", packet["sections"].get("open_questions", []))
+    _append_packet_section(lines, "Code Evidence", packet["sections"].get("code", []))
+    _append_packet_gaps(lines, packet.get("gaps", []))
+    _append_packet_warnings(lines, packet.get("warnings", []))
+    lines.extend(
+        [
+            "### Boundary",
+            "",
+            "Connected assistant should synthesize from these cited evidence items; the MCP server does not generate final claims.",
+        ]
+    )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_session_brief_markdown(brief: dict[str, Any]) -> str:
+    lines = ["## Session Brief", "", f"Task: `{brief['task']}`"]
+    if brief.get("since"):
+        lines.append(f"Since: `{brief['since']}`")
+    lines.append("")
+    if brief.get("repo_staleness"):
+        lines.extend(["### Repo Freshness", ""])
+        for repo in brief["repo_staleness"]:
+            freshness = "reindex needed" if repo.get("reindex_needed") else "current"
+            lines.append(
+                f"- `{repo.get('repo_id')}`: **{freshness}** @ `{repo.get('head_commit')}`"
+            )
+        lines.append("")
+    _append_packet_section(lines, "Doctrine", brief["sections"].get("doctrine", []))
+    _append_packet_section(lines, "Accepted Decisions", brief["sections"].get("decisions", []))
+    _append_packet_section(lines, "Open Questions", brief["sections"].get("open_questions", []))
+    _append_packet_section(lines, "Code Evidence", brief["sections"].get("code", []))
+    if brief.get("since"):
+        _append_packet_section(
+            lines, "Recent Indexed Changes", brief["sections"].get("recent_changes", [])
+        )
+    _append_packet_gaps(lines, brief.get("gaps", []))
+    _append_packet_warnings(lines, brief.get("warnings", []))
+    lines.extend(
+        [
+            "### Boundary",
+            "",
+            "Connected assistant should synthesize the user-facing answer from this packet and cite sources where making project claims.",
+        ]
+    )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _append_packet_section(lines: list[str], heading: str, results: list[dict[str, Any]]) -> None:
+    lines.extend([f"### {heading}", ""])
+    if not results:
+        lines.extend(["No evidence found.", ""])
+        return
+    for index, result in enumerate(results, start=1):
+        source = _packet_source_label(result)
+        title = result.get("title") or result.get("symbol") or result.get("path") or "Untitled"
+        label_parts = [
+            str(part) for part in (result.get("authority"), result.get("status")) if part
+        ]
+        label = f" — `{' / '.join(label_parts)}`" if label_parts else ""
+        excerpt = result.get("excerpt") or result.get("snippet") or ""
+        lines.extend(
+            [
+                f"{index}. **{title}**{label}",
+                f"   Source: `{source}`",
+                f"   Excerpt: {excerpt}",
+                "",
+            ]
+        )
+
+
+def _append_packet_gaps(lines: list[str], gaps: list[dict[str, Any]]) -> None:
+    if not gaps:
+        return
+    lines.extend(["### Gaps", ""])
+    for gap in gaps:
+        lines.append(f"- `{gap.get('code')}`: {gap.get('message')}")
+    lines.append("")
+
+
+def _append_packet_warnings(lines: list[str], warnings: list[str]) -> None:
+    if not warnings:
+        return
+    lines.extend(["### Warnings", ""])
+    for warning in warnings:
+        lines.append(f"- {warning}")
+    lines.append("")
+
+
+def _packet_source_label(result: dict[str, Any]) -> str:
+    path = result.get("path", "unknown")
+    if result.get("commit"):
+        return f"{result.get('commit')}:{path}"
+    start = result.get("start_line")
+    end = result.get("end_line")
+    if start is not None and end is not None:
+        return f"{path}:{start}-{end}"
+    return str(path)
 
 
 def _code_context_preflight(
