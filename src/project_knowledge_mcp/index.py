@@ -15,7 +15,7 @@ import yaml
 
 STATE_DIR_NAME = ".project-knowledge"
 INDEX_DB_NAME = "index.sqlite3"
-SUPPORTED_SUFFIXES = {".md", ".mdx", ".txt"}
+SUPPORTED_SUFFIXES = {".md", ".mdx", ".txt", ".py", ".json"}
 
 VALID_TYPES = {
     "doctrine",
@@ -259,6 +259,145 @@ class ProjectIndex:
         results.sort(key=lambda result: (-result.final_score, result.path, result.chunk_id))
         return results[:limit]
 
+    def repo_metadata(self, repo_id: str) -> dict[str, Any] | None:
+        conn = _connect(self.db_path)
+        row = conn.execute(
+            """
+            SELECT path, role, source_mode, host_path, includes_uncommitted_changes,
+                   snapshot_ref, snapshot_commit, head_commit, dirty, untracked_count,
+                   last_indexed_commit, last_indexed_worktree_fingerprint,
+                   index_scope_fingerprint
+            FROM repos
+            WHERE id = ?
+            """,
+            (repo_id,),
+        ).fetchone()
+        conn.close()
+        if row is None:
+            return None
+        return {
+            "path": row[0],
+            "role": row[1],
+            "source_mode": row[2],
+            "host_path": row[3],
+            "includes_uncommitted_changes": bool(row[4]),
+            "snapshot_ref": row[5],
+            "snapshot_commit": row[6],
+            "head_commit": row[7],
+            "dirty": bool(row[8]),
+            "untracked_count": int(row[9] or 0),
+            "last_indexed_commit": row[10],
+            "last_indexed_worktree_fingerprint": row[11],
+            "index_scope_fingerprint": row[12],
+        }
+
+    def repo_path(self, repo_id: str) -> Path | None:
+        metadata = self.repo_metadata(repo_id)
+        if metadata is None or metadata["path"] is None:
+            return None
+        return Path(str(metadata["path"]))
+
+    def repo_matches_provenance(
+        self,
+        *,
+        repo_id: str,
+        role: str,
+        path: Path,
+        source_mode: str,
+        host_path: Path | None,
+        includes_uncommitted_changes: bool | None,
+        snapshot_ref: str | None,
+        snapshot_commit: str | None,
+        include_globs: list[str] | None,
+        exclude_globs: list[str] | None,
+        max_file_bytes: int | None,
+    ) -> bool:
+        metadata = self.repo_metadata(repo_id)
+        if metadata is None or metadata["path"] is None:
+            return False
+        try:
+            path_matches = Path(str(metadata["path"])).resolve() == path.resolve()
+        except OSError:
+            return False
+        if not path_matches:
+            return False
+        indexed_host_path = metadata["host_path"]
+        try:
+            host_path_matches = (
+                indexed_host_path is None
+                if host_path is None
+                else indexed_host_path is not None
+                and Path(str(indexed_host_path)).resolve() == host_path.resolve()
+            )
+        except OSError:
+            return False
+        metadata_matches = (
+            host_path_matches
+            and metadata["role"] == role
+            and metadata["source_mode"] == source_mode
+            and metadata["includes_uncommitted_changes"] == bool(includes_uncommitted_changes)
+            and metadata["snapshot_ref"] == snapshot_ref
+            and metadata["snapshot_commit"] == snapshot_commit
+            and metadata["index_scope_fingerprint"]
+            == index_scope_fingerprint(
+                role=role,
+                include_globs=include_globs,
+                exclude_globs=exclude_globs,
+                max_file_bytes=max_file_bytes,
+            )
+        )
+        if not metadata_matches:
+            return False
+        if source_mode == "snapshot":
+            return (
+                metadata["head_commit"] == snapshot_commit
+                and not metadata["dirty"]
+                and metadata["untracked_count"] == 0
+            )
+        return True
+
+    def repo_matches_path(self, *, repo_id: str, path: Path) -> bool:
+        indexed_path = self.repo_path(repo_id)
+        if indexed_path is None:
+            return False
+        try:
+            return indexed_path.resolve() == path.resolve()
+        except OSError:
+            return False
+
+    def document_chunks(self, *, repo_id: str, path: str) -> list[dict[str, Any]]:
+        conn = _connect(self.db_path)
+        rows = conn.execute(
+            """
+            SELECT documents.doc_type,
+                   documents.status,
+                   documents.authority,
+                   chunks.start_line,
+                   chunks.end_line,
+                   chunks.text
+            FROM documents
+            JOIN chunks ON chunks.document_id = documents.id
+            WHERE documents.repo_id = ?
+              AND documents.path = ?
+              AND documents.authority NOT IN ('superseded', 'rejected')
+              AND documents.status NOT IN ('superseded', 'rejected')
+            ORDER BY chunks.chunk_index ASC
+            """,
+            (repo_id, path),
+        ).fetchall()
+        conn.close()
+        return [
+            {
+                "doc_type": row[0],
+                "status": row[1],
+                "authority": row[2],
+                "start_line": row[3],
+                "end_line": row[4],
+                "text": row[5],
+            }
+            for row in rows
+        ]
+
     def index_events(self, *, event_type: str | None = None) -> list[StoredIndexEvent]:
         conn = _connect(self.db_path)
         if event_type is None:
@@ -313,20 +452,51 @@ def index_repo(
 
     now = _now()
     head_commit = _git_output(repo_path, "rev-parse", "HEAD")
-    worktree_status = _git_status_porcelain(repo_path, state_dir=state_dir)
+    worktree_status = (
+        _git_status_porcelain_strict(repo_path, state_dir=state_dir)
+        if source_mode == "snapshot"
+        else _git_status_porcelain(repo_path, state_dir=state_dir)
+    )
     indexed_worktree_fingerprint = worktree_fingerprint(repo_path, worktree_status)
+    scope_fingerprint = index_scope_fingerprint(
+        role=role,
+        include_globs=include_globs,
+        exclude_globs=exclude_globs,
+        max_file_bytes=max_file_bytes,
+    )
     status_lines = [line for line in worktree_status.splitlines() if line]
     untracked_count = sum(1 for line in status_lines if line.startswith("??"))
     dirty = any(not line.startswith("??") for line in status_lines)
+    effective_includes_uncommitted_changes = bool(
+        includes_uncommitted_changes
+        if includes_uncommitted_changes is not None
+        else source_mode == "workspace"
+    )
+    if (
+        source_mode != "snapshot"
+        and not effective_includes_uncommitted_changes
+        and (dirty or untracked_count)
+    ):
+        raise ValueError(
+            f"repo {repo_id} has uncommitted changes but includes_uncommitted_changes is false"
+        )
+    if source_mode == "snapshot":
+        if snapshot_commit and head_commit != snapshot_commit:
+            raise ValueError(
+                f"snapshot repo {repo_id} HEAD does not match snapshot_commit "
+                f"({head_commit} != {snapshot_commit})"
+            )
+        if dirty or untracked_count:
+            raise ValueError(f"snapshot repo {repo_id} must have a clean worktree before indexing")
     conn.execute(
         """
         INSERT INTO repos(
           id, role, name, source_mode, host_path, path, writable,
           current_branch, head_commit, dirty, untracked_count, includes_uncommitted_changes,
           snapshot_ref, snapshot_commit, last_indexed_at, last_indexed_commit,
-          last_indexed_worktree_fingerprint
+          last_indexed_worktree_fingerprint, index_scope_fingerprint
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           role = excluded.role,
           name = excluded.name,
@@ -343,7 +513,8 @@ def index_repo(
           snapshot_commit = excluded.snapshot_commit,
           last_indexed_at = excluded.last_indexed_at,
           last_indexed_commit = excluded.last_indexed_commit,
-          last_indexed_worktree_fingerprint = excluded.last_indexed_worktree_fingerprint
+          last_indexed_worktree_fingerprint = excluded.last_indexed_worktree_fingerprint,
+          index_scope_fingerprint = excluded.index_scope_fingerprint
         """,
         (
             repo_id,
@@ -357,16 +528,13 @@ def index_repo(
             head_commit,
             int(dirty),
             untracked_count,
-            int(
-                includes_uncommitted_changes
-                if includes_uncommitted_changes is not None
-                else source_mode == "workspace"
-            ),
+            int(effective_includes_uncommitted_changes),
             snapshot_ref,
             snapshot_commit,
             now,
             head_commit,
             indexed_worktree_fingerprint,
+            scope_fingerprint,
         ),
     )
 
@@ -379,7 +547,10 @@ def index_repo(
         state_dir=state_dir,
         include_globs=include_globs,
         exclude_globs=exclude_globs,
-        max_file_bytes=max_file_bytes,
+        # Keep oversized candidates in the indexing loop so they produce skip
+        # counters and warning events; direct file context passes max_file_bytes
+        # to _is_indexable_file as a hard leak-prevention gate.
+        max_file_bytes=None,
     ):
         relative_path = file_path.relative_to(repo_path).as_posix()
         try:
@@ -438,6 +609,12 @@ def parse_document(path: str, text: str, *, repo_id: str, repo_role: str) -> Par
         title = next((line.strip() for line in text.splitlines() if line.strip()), Path(path).name)[
             :120
         ]
+    elif suffix in {".py", ".json"}:
+        parser = "code" if suffix == ".py" else "json"
+        raw_frontmatter = {}
+        body = text
+        headings = []
+        title = Path(path).name
     else:
         raise ValueError(f"unsupported file type for indexing: {path}")
 
@@ -579,8 +756,9 @@ def _create_schema(conn: sqlite3.Connection) -> None:
           last_status_checked_at TEXT,
           last_indexed_at TEXT,
           last_indexed_commit TEXT,
-          last_indexed_worktree_fingerprint TEXT
-        );
+          last_indexed_worktree_fingerprint TEXT,
+          index_scope_fingerprint TEXT);
+
 
         CREATE TABLE IF NOT EXISTS documents (
           id TEXT PRIMARY KEY,
@@ -680,6 +858,7 @@ def _ensure_repo_source_columns(conn: sqlite3.Connection) -> None:
         "last_indexed_worktree_fingerprint": (
             "ALTER TABLE repos ADD COLUMN last_indexed_worktree_fingerprint TEXT"
         ),
+        "index_scope_fingerprint": "ALTER TABLE repos ADD COLUMN index_scope_fingerprint TEXT",
     }
     for column, sql in column_sql.items():
         if column not in existing_columns:
@@ -702,6 +881,23 @@ def _git_output(repo_path: Path, *args: str) -> str | None:
     return result.stdout.strip() or None
 
 
+def _git_status_porcelain_strict(repo_path: Path, *, state_dir: Path | None = None) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_path), "status", "--porcelain=v1", "--untracked-files=all"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception as exc:
+        raise ValueError(f"git status failed for snapshot repo {repo_path}: {exc}") from exc
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+        raise ValueError(f"git status failed for snapshot repo {repo_path}: {message}")
+    return _filter_state_dir_status(repo_path, result.stdout, state_dir=state_dir)
+
+
 def _git_status_porcelain(repo_path: Path, *, state_dir: Path | None = None) -> str:
     try:
         result = subprocess.run(
@@ -716,6 +912,23 @@ def _git_status_porcelain(repo_path: Path, *, state_dir: Path | None = None) -> 
     if result.returncode != 0:
         return ""
     return _filter_state_dir_status(repo_path, result.stdout, state_dir=state_dir)
+
+
+def index_scope_fingerprint(
+    *,
+    role: str,
+    include_globs: list[str] | None,
+    exclude_globs: list[str] | None,
+    max_file_bytes: int | None,
+) -> str:
+    payload = {
+        "role": role,
+        "include_globs": sorted(include_globs or []),
+        "exclude_globs": sorted(exclude_globs or []),
+        "max_file_bytes": max_file_bytes,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def worktree_fingerprint(repo_path: Path, porcelain: str) -> str:
@@ -929,6 +1142,12 @@ def _is_indexable_file(
         return False
     if exclude_globs and _matches_any(relative, exclude_globs):
         return False
+    if max_file_bytes is not None:
+        try:
+            if path.stat().st_size > max_file_bytes:
+                return False
+        except OSError:
+            return False
     return True
 
 

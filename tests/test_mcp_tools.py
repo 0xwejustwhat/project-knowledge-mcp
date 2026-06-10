@@ -482,6 +482,124 @@ def test_mcp_phase4_search_tools_return_typed_results(tmp_path: Path):
     assert questions["results"][0]["owner"] == "Amin"
 
 
+def test_mcp_code_context_tools_return_text_fallback_results(tmp_path: Path):
+    ops_repo = tmp_path / "ops"
+    work_repo = tmp_path / "work"
+    state = tmp_path / ".project-knowledge"
+    init_git_repo(ops_repo)
+    init_git_repo(work_repo)
+    write_doc(ops_repo, "docs/doctrine/context.md", "# Ops\n\nOps-only evidence.")
+    write_doc(
+        work_repo,
+        "src/example.py",
+        """
+        class ExampleService:
+            def compile_context(self, topic: str) -> str:
+                return f"compiled evidence for {topic}"
+        """,
+    )
+    write_doc(
+        work_repo,
+        "tests/test_example.py",
+        """
+        from src.example import ExampleService
+
+        def test_compile_context_returns_evidence():
+            assert ExampleService().compile_context("brief") == "compiled evidence for brief"
+        """,
+    )
+    config_path = tmp_path / "project.yaml"
+    config_path.write_text(
+        dedent(
+            f"""
+            schema_version: 1
+            project:
+              id: project-knowledge-mcp
+            storage:
+              project_root: {tmp_path.as_posix()}
+              state_dir: {state.as_posix()}
+            repos:
+              - id: ops
+                role: ops
+                path: {ops_repo.as_posix()}
+                writable: true
+                include_globs: ["docs/**/*.md"]
+              - id: app
+                role: work
+                path: {work_repo.as_posix()}
+                writable: false
+                include_globs: ["src/**/*.py", "tests/**/*.py"]
+            retrieval:
+              provider: sqlite_fts5
+              default_limit: 5
+              include_superseded_by_default: false
+            code_context:
+              provider: codegraph
+              fallback_provider: text
+              required_for_code_repos: true
+              fallback_on_unhealthy: true
+              codegraph:
+                enabled: true
+                vector_resolve_enabled: false
+            write_policy:
+              default_capture_repo: ops
+              default_capture_dir: docs/notes
+              allow_direct_capture: true
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    import asyncio
+
+    indexed = asyncio.run(call_tool("index_project", {"config_path": str(config_path)}))
+    assert indexed["status"] == "ok"
+
+    status = asyncio.run(call_tool("get_code_provider_status", {"config_path": str(config_path)}))
+    assert status["status"] == "ok"
+    assert status["configured_provider"] == "codegraph"
+    assert status["active_provider"] == "text"
+    assert status["fallback_available"] is True
+    assert status["work_repos"] == ["app"]
+
+    search = asyncio.run(
+        call_tool(
+            "search_code",
+            {
+                "config_path": str(config_path),
+                "query": "compile_context evidence",
+                "repo_id": "app",
+            },
+        )
+    )
+    assert search["tool"] == "search_code"
+    assert search["active_provider"] == "text"
+    assert search["results"][0]["path"] == "src/example.py"
+    assert search["results"][0]["kind"] == "code"
+    assert search["results"][0]["provider"] == "text"
+    assert search["warnings"]
+
+    context = asyncio.run(
+        call_tool(
+            "get_code_context",
+            {"config_path": str(config_path), "symbol_or_file": "ExampleService", "repo_id": "app"},
+        )
+    )
+    assert context["tool"] == "get_code_context"
+    assert context["results"][0]["path"] == "src/example.py"
+    assert context["results"][0]["symbol"] == "ExampleService.compile_context"
+
+    widened = asyncio.run(
+        call_tool(
+            "search_code",
+            {"config_path": str(config_path), "query": "Ops-only evidence", "repo_id": "ops"},
+        )
+    )
+    assert widened["results"] == []
+    assert widened["error"]["code"] == "QUERY_INVALID"
+
+
 def test_tag_filter_overfetches_until_matching_results_are_returned(tmp_path: Path):
     repo = tmp_path / "ops"
     state = tmp_path / ".project-knowledge"

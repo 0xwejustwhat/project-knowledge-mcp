@@ -7,6 +7,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from project_knowledge_mcp.code_context import (
+    CodeGraphContextProvider,
+    TextFallbackCodeContextProvider,
+)
 from project_knowledge_mcp.config import (
     ProjectKnowledgeConfig,
     load_project_config,
@@ -17,6 +21,7 @@ from project_knowledge_mcp.index import (
     ProjectIndex,
     SearchResult,
     index_repo,
+    index_scope_fingerprint,
     worktree_fingerprint,
 )
 
@@ -179,7 +184,7 @@ def search_ops_from_config(
             include_superseded=include_superseded,
             limit=search_limit,
         )
-    except FileNotFoundError:
+    except (FileNotFoundError, sqlite3.Error, OSError):
         return {
             "query": query,
             "results": [],
@@ -333,7 +338,10 @@ def check_project_staleness_from_config(
     indexed_metadata = _load_indexed_repo_metadata(config.storage.state_dir)
     repo_statuses = [
         _repo_staleness_status(
-            repo, indexed_metadata.get(repo.id), state_dir=config.storage.state_dir
+            repo,
+            indexed_metadata.get(repo.id),
+            state_dir=config.storage.state_dir,
+            max_file_bytes=config.indexing.max_file_bytes,
         )
         for repo in config.repos
     ]
@@ -347,6 +355,260 @@ def check_project_staleness_from_config(
         "repos": repo_statuses,
         "warnings": warnings,
         "markdown": _render_staleness_markdown(config.project.id, repo_statuses),
+    }
+
+
+def get_code_provider_status_from_config(
+    *,
+    config_path: Path | str | None = None,
+) -> dict[str, Any]:
+    validation = validate_project_config(config_path)
+    if not validation["valid"]:
+        return {
+            "status": "error",
+            "project_id": validation.get("project_id"),
+            "configured_provider": None,
+            "active_provider": None,
+            "codegraph_enabled": False,
+            "codegraph_healthy": False,
+            "fallback_available": False,
+            "work_repo_count": 0,
+            "work_repos": [],
+            "warnings": validation["warnings"],
+            "error": validation["errors"][0] if validation["errors"] else None,
+            "errors": validation["errors"],
+        }
+    config = load_project_config(config_path)
+    work_repos = [repo for repo in config.repos if repo.role == "work"]
+    codegraph_health = CodeGraphContextProvider(config).health()
+    active_provider = "text" if config.code_context.fallback_on_unhealthy else "unavailable"
+    warnings = list(codegraph_health.warnings)
+    if not work_repos:
+        warnings.append("No work repos are configured for code context.")
+    return {
+        "status": "ok",
+        "project_id": config.project.id,
+        "configured_provider": config.code_context.provider,
+        "active_provider": active_provider,
+        "codegraph_enabled": config.code_context.codegraph.enabled,
+        "codegraph_healthy": codegraph_health.codegraph_healthy,
+        "fallback_available": config.code_context.fallback_on_unhealthy and bool(work_repos),
+        "work_repo_count": len(work_repos),
+        "work_repos": [repo.id for repo in work_repos],
+        "warnings": warnings,
+        "details": codegraph_health.details,
+    }
+
+
+def search_code_from_config(
+    *,
+    query: str,
+    config_path: Path | str | None = None,
+    repo_id: str | None = None,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    config, result_limit, preflight_error = _code_context_preflight(
+        query=query, config_path=config_path, repo_id=repo_id, limit=limit
+    )
+    if preflight_error is not None:
+        return preflight_error
+    assert config is not None
+    try:
+        provider = TextFallbackCodeContextProvider(config)
+        results = provider.search_code(query, repo_id=repo_id, limit=result_limit)
+    except (FileNotFoundError, sqlite3.Error, OSError):
+        return {
+            "tool": "search_code",
+            "query": query,
+            "results": [],
+            "warnings": ["Index is not ready; run index_project first."],
+            "markdown": "## Code Search Results\n\nIndex is not ready; run `index_project` first.",
+            "error": {
+                "code": "INDEX_NOT_READY",
+                "message": "Index is not ready; run index_project first.",
+                "details": {"state_dir": str(config.storage.state_dir)},
+                "recoverable": True,
+            },
+        }
+    except ValueError as exc:
+        return _query_invalid(
+            query,
+            str(exc),
+            details={"repo_id": repo_id, "limit": result_limit},
+        )
+    payload_results = [result.to_payload() for result in results]
+    status = get_code_provider_status_from_config(config_path=config_path)
+    warnings = list(status.get("warnings", []))
+    return {
+        "tool": "search_code",
+        "query": query,
+        "project_id": config.project.id,
+        "configured_provider": status.get("configured_provider"),
+        "active_provider": status.get("active_provider"),
+        "results": payload_results,
+        "warnings": warnings,
+        "markdown": _render_code_markdown("Code Search Results", query, payload_results),
+    }
+
+
+def get_code_context_from_config(
+    *,
+    symbol_or_file: str,
+    config_path: Path | str | None = None,
+    repo_id: str | None = None,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    config, result_limit, preflight_error = _code_context_preflight(
+        query=symbol_or_file, config_path=config_path, repo_id=repo_id, limit=limit
+    )
+    if preflight_error is not None:
+        return preflight_error
+    assert config is not None
+    try:
+        provider = TextFallbackCodeContextProvider(config)
+        results = provider.get_code_context(symbol_or_file, repo_id=repo_id, limit=result_limit)
+    except (FileNotFoundError, sqlite3.Error, OSError):
+        return {
+            "tool": "get_code_context",
+            "query": symbol_or_file,
+            "symbol_or_file": symbol_or_file,
+            "results": [],
+            "warnings": ["Index is not ready; run index_project first."],
+            "markdown": "## Code Context\n\nIndex is not ready; run `index_project` first.",
+            "error": {
+                "code": "INDEX_NOT_READY",
+                "message": "Index is not ready; run index_project first.",
+                "details": {"state_dir": str(config.storage.state_dir)},
+                "recoverable": True,
+            },
+        }
+    except ValueError as exc:
+        return _query_invalid(
+            symbol_or_file,
+            str(exc),
+            details={"repo_id": repo_id, "limit": result_limit},
+        )
+    payload_results = [result.to_payload() for result in results]
+    status = get_code_provider_status_from_config(config_path=config_path)
+    return {
+        "tool": "get_code_context",
+        "query": symbol_or_file,
+        "symbol_or_file": symbol_or_file,
+        "project_id": config.project.id,
+        "configured_provider": status.get("configured_provider"),
+        "active_provider": status.get("active_provider"),
+        "results": payload_results,
+        "warnings": list(status.get("warnings", [])),
+        "markdown": _render_code_markdown("Code Context", symbol_or_file, payload_results),
+    }
+
+
+def _code_context_preflight(
+    *,
+    query: str,
+    config_path: Path | str | None,
+    repo_id: str | None,
+    limit: Any,
+) -> tuple[ProjectKnowledgeConfig | None, int, dict[str, Any] | None]:
+    validation = validate_project_config(config_path)
+    if not validation["valid"]:
+        return (
+            None,
+            0,
+            {
+                "query": query,
+                "results": [],
+                "warnings": validation["warnings"],
+                "markdown": "## Code Search Results\n\nConfig is invalid; no code search was run.",
+                "error": validation["errors"][0] if validation["errors"] else None,
+                "errors": validation["errors"],
+            },
+        )
+    config = load_project_config(config_path)
+    work_repos = [repo for repo in config.repos if repo.role == "work"]
+    if not work_repos:
+        return (
+            config,
+            0,
+            _query_invalid(
+                query,
+                "No work repos are configured for code context",
+                details={"repo_id": repo_id},
+            ),
+        )
+    if repo_id is not None and not any(repo.id == repo_id for repo in work_repos):
+        return (
+            config,
+            0,
+            _query_invalid(
+                query,
+                f"repo_id must name a configured work repo: {repo_id}",
+                details={"repo_id": repo_id, "work_repos": [repo.id for repo in work_repos]},
+            ),
+        )
+    codegraph_health = CodeGraphContextProvider(config).health()
+    if not codegraph_health.codegraph_healthy and not config.code_context.fallback_on_unhealthy:
+        return (
+            config,
+            0,
+            _provider_unavailable(
+                query,
+                "CodeGraphContext is unhealthy and text fallback is disabled",
+                details={
+                    "configured_provider": config.code_context.provider,
+                    "active_provider": "unavailable",
+                    "codegraph_enabled": config.code_context.codegraph.enabled,
+                },
+                warnings=codegraph_health.warnings,
+            ),
+        )
+    result_limit, limit_error = _normalize_limit(
+        query, limit, default_limit=config.retrieval.default_limit
+    )
+    if limit_error is not None:
+        return config, 0, limit_error
+    return config, result_limit, None
+
+
+def _render_code_markdown(title: str, query: str, results: list[dict[str, Any]]) -> str:
+    lines = [f"## {title}", "", f"Query: `{query}`", ""]
+    if not results:
+        lines.append("No results.")
+        return "\n".join(lines)
+    for index, result in enumerate(results, start=1):
+        location = f"{result['path']}:{result['start_line']}-{result['end_line']}"
+        symbol = f" — `{result['symbol']}`" if result.get("symbol") else ""
+        lines.extend(
+            [
+                f"{index}. **{result['kind']}** `{location}`{symbol}",
+                f"   - repo: `{result['repo_id']}` provider: `{result['provider']}` score: `{result['score']:.3f}`",
+                f"   - {result['snippet']}",
+                "",
+            ]
+        )
+    return "\n".join(lines).rstrip()
+
+
+def _provider_unavailable(
+    query: str,
+    message: str,
+    *,
+    details: dict[str, Any] | None = None,
+    warnings: list[str] | None = None,
+) -> dict[str, Any]:
+    error = {
+        "code": "PROVIDER_UNAVAILABLE",
+        "message": message,
+        "details": details or {},
+        "recoverable": True,
+    }
+    return {
+        "query": query,
+        "results": [],
+        "warnings": warnings or [],
+        "markdown": "## Code Search Results\n\nProvider unavailable; no code search was run.",
+        "error": error,
+        "errors": [error],
     }
 
 
@@ -617,7 +879,7 @@ def _normalize_limit(
 
 
 def _repo_staleness_status(
-    repo, indexed: dict[str, Any] | None, *, state_dir: Path
+    repo, indexed: dict[str, Any] | None, *, state_dir: Path, max_file_bytes: int | None
 ) -> dict[str, Any]:
     warnings: list[str] = []
     branch = _git_output(repo.path, "rev-parse", "--abbrev-ref", "HEAD", warnings=warnings)
@@ -682,6 +944,15 @@ def _repo_staleness_status(
     last_indexed_commit = indexed.get("last_indexed_commit")
     last_indexed_at = indexed.get("last_indexed_at")
     last_indexed_worktree_fingerprint = indexed.get("last_indexed_worktree_fingerprint")
+    expected_scope_fingerprint = index_scope_fingerprint(
+        role=repo.role,
+        include_globs=repo.include_globs,
+        exclude_globs=repo.exclude_globs,
+        max_file_bytes=max_file_bytes,
+    )
+    indexed_scope_fingerprint = indexed.get("index_scope_fingerprint")
+    scope_mismatch = indexed_scope_fingerprint != expected_scope_fingerprint
+    metadata_mismatch = _repo_metadata_mismatch(repo, indexed)
     includes_uncommitted_changes = bool(repo.includes_uncommitted_changes)
     expected_commit = repo.snapshot_commit if repo.source_mode == "snapshot" else head_commit
     snapshot_mismatch = (
@@ -694,12 +965,20 @@ def _repo_staleness_status(
         warnings.append(
             f"Repo {repo.id} snapshot_commit does not match checked-out HEAD; snapshot provenance is stale."
         )
+    if metadata_mismatch:
+        warnings.append(f"Repo {repo.id} indexed metadata no longer matches config.")
+    if scope_mismatch:
+        warnings.append(
+            f"Repo {repo.id} index scope settings changed; reindex before serving code context."
+        )
     if not includes_uncommitted_changes and ((dirty is True) or (untracked_count or 0) > 0):
         warnings.append(
             f"Repo {repo.id} has uncommitted changes but source metadata says they are excluded."
         )
     reindex_needed = (
         last_indexed_commit is None
+        or metadata_mismatch
+        or scope_mismatch
         or (expected_commit is not None and last_indexed_commit != expected_commit)
         or snapshot_mismatch
         or status_check_status != "ok"
@@ -733,12 +1012,49 @@ def _repo_staleness_status(
         "last_indexed_commit": last_indexed_commit,
         "last_indexed_at": last_indexed_at,
         "last_indexed_worktree_fingerprint": last_indexed_worktree_fingerprint,
+        "index_scope_fingerprint": indexed_scope_fingerprint,
+        "expected_index_scope_fingerprint": expected_scope_fingerprint,
+        "metadata_mismatch": metadata_mismatch,
+        "scope_mismatch": scope_mismatch,
         "includes_uncommitted_changes": includes_uncommitted_changes,
         "snapshot_ref": repo.snapshot_ref,
         "snapshot_commit": repo.snapshot_commit,
         "reindex_needed": reindex_needed,
         "warnings": warnings,
     }
+
+
+def _repo_metadata_mismatch(repo, indexed: dict[str, Any]) -> bool:
+    if not indexed:
+        return False
+    try:
+        path_mismatch = Path(str(indexed.get("path"))).resolve() != repo.path.resolve()
+    except OSError:
+        return True
+    indexed_host_path = indexed.get("host_path")
+    try:
+        host_path_mismatch = (
+            indexed_host_path is None
+            if repo.host_path is not None
+            else indexed_host_path is not None
+        )
+        if repo.host_path is not None:
+            host_path_mismatch = (
+                indexed_host_path is None
+                or Path(str(indexed_host_path)).resolve() != repo.host_path.resolve()
+            )
+    except OSError:
+        return True
+    return (
+        path_mismatch
+        or host_path_mismatch
+        or indexed.get("role") != repo.role
+        or indexed.get("source_mode") != repo.source_mode
+        or bool(indexed.get("includes_uncommitted_changes"))
+        != bool(repo.includes_uncommitted_changes)
+        or indexed.get("snapshot_ref") != repo.snapshot_ref
+        or indexed.get("snapshot_commit") != repo.snapshot_commit
+    )
 
 
 def _load_indexed_repo_metadata(state_dir: Path) -> dict[str, dict[str, Any]]:
@@ -753,7 +1069,9 @@ def _load_indexed_repo_metadata(state_dir: Path) -> dict[str, dict[str, Any]]:
     try:
         rows = conn.execute(
             """
-            SELECT id, last_indexed_commit, last_indexed_at, last_indexed_worktree_fingerprint
+            SELECT id, path, role, source_mode, host_path, includes_uncommitted_changes,
+                   snapshot_ref, snapshot_commit, last_indexed_commit, last_indexed_at,
+                   last_indexed_worktree_fingerprint, index_scope_fingerprint
             FROM repos
             """
         ).fetchall()
@@ -763,9 +1081,17 @@ def _load_indexed_repo_metadata(state_dir: Path) -> dict[str, dict[str, Any]]:
         conn.close()
     return {
         row[0]: {
-            "last_indexed_commit": row[1],
-            "last_indexed_at": row[2],
-            "last_indexed_worktree_fingerprint": row[3],
+            "path": row[1],
+            "role": row[2],
+            "source_mode": row[3],
+            "host_path": row[4],
+            "includes_uncommitted_changes": bool(row[5]),
+            "snapshot_ref": row[6],
+            "snapshot_commit": row[7],
+            "last_indexed_commit": row[8],
+            "last_indexed_at": row[9],
+            "last_indexed_worktree_fingerprint": row[10],
+            "index_scope_fingerprint": row[11],
         }
         for row in rows
     }
