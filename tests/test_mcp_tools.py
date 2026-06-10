@@ -400,6 +400,88 @@ def test_index_project_skips_binary_and_excludes_state_dir_and_symlink_escape(tm
         assert search["results"] == []
 
 
+def test_mcp_phase4_search_tools_return_typed_results(tmp_path: Path):
+    repo = tmp_path / "ops"
+    state = tmp_path / ".project-knowledge"
+    init_git_repo(repo)
+    write_doc(
+        repo,
+        "docs/doctrine/context.md",
+        """
+        ---
+        title: Context Doctrine
+        type: doctrine
+        status: current
+        authority: canonical
+        ---
+        # Context Doctrine
+
+        Context retrieval doctrine is current truth.
+        """,
+    )
+    write_doc(
+        repo,
+        "docs/decisions/accepted/0001-context.md",
+        """
+        ---
+        title: Accepted Context Decision
+        type: decision
+        status: accepted
+        authority: accepted_decision
+        ---
+        # Accepted Context Decision
+
+        Accepted context retrieval decision.
+        """,
+    )
+    write_doc(
+        repo,
+        "docs/open-questions/context.md",
+        """
+        ---
+        title: Context Open Question
+        type: open_question
+        status: open
+        authority: working
+        owner: Amin
+        related_docs: [docs/doctrine/context.md]
+        ---
+        # Context Open Question
+
+        Context retrieval unresolved question.
+        """,
+    )
+    config_path = write_project_config(tmp_path, repo=repo, state_dir=state)
+
+    import asyncio
+
+    indexed = asyncio.run(call_tool("index_project", {"config_path": str(config_path)}))
+    assert indexed["status"] == "ok"
+
+    decisions = asyncio.run(
+        call_tool(
+            "search_decisions", {"config_path": str(config_path), "query": "context retrieval"}
+        )
+    )
+    assert decisions["results"][0]["path"] == "docs/decisions/accepted/0001-context.md"
+
+    doctrine = asyncio.run(
+        call_tool(
+            "get_current_doctrine", {"config_path": str(config_path), "topic": "context retrieval"}
+        )
+    )
+    assert doctrine["doctrine"][0]["path"] == "docs/doctrine/context.md"
+    assert doctrine["decisions"][0]["path"] == "docs/decisions/accepted/0001-context.md"
+
+    questions = asyncio.run(
+        call_tool(
+            "search_open_questions", {"config_path": str(config_path), "query": "context retrieval"}
+        )
+    )
+    assert questions["results"][0]["path"] == "docs/open-questions/context.md"
+    assert questions["results"][0]["owner"] == "Amin"
+
+
 def test_tag_filter_overfetches_until_matching_results_are_returned(tmp_path: Path):
     repo = tmp_path / "ops"
     state = tmp_path / ".project-knowledge"

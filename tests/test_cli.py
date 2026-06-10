@@ -15,6 +15,9 @@ def test_cli_help_lists_step1_index_commands():
     assert result.exit_code == 0
     assert "index-project" in result.output
     assert "search-index" in result.output
+    assert "search-decisions" in result.output
+    assert "get-current-doctrine" in result.output
+    assert "search-open-questions" in result.output
 
 
 def init_git_repo(path: Path) -> None:
@@ -196,6 +199,86 @@ Project Knowledge MCP returns evidence packets before synthesis.
     assert payload["results"][0]["authority"] == "canonical"
     assert "markdown" in payload
     assert "## Search Results" in payload["markdown"]
+
+
+def test_cli_phase4_search_commands_from_config(tmp_path: Path):
+    repo = tmp_path / "ops"
+    state = tmp_path / ".project-knowledge"
+    init_git_repo(repo)
+    docs = {
+        "docs/doctrine/context.md": """---
+title: Context Doctrine
+type: doctrine
+status: current
+authority: canonical
+---
+# Context Doctrine
+
+Context retrieval doctrine is current truth.
+""",
+        "docs/decisions/accepted/0001-context.md": """---
+title: Accepted Context Decision
+type: decision
+status: accepted
+authority: accepted_decision
+---
+# Accepted Context Decision
+
+Accepted context retrieval decision.
+""",
+        "docs/open-questions/context.md": """---
+title: Context Open Question
+type: open_question
+status: open
+authority: working
+owner: Amin
+related_docs: [docs/doctrine/context.md]
+---
+# Context Open Question
+
+Context retrieval unresolved question.
+""",
+    }
+    for relative_path, text in docs.items():
+        path = repo / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    config_path = write_project_config(tmp_path, repo=repo, state_dir=state)
+
+    index_result = CliRunner().invoke(app, ["index-project", "--config", str(config_path)])
+    assert index_result.exit_code == 0, index_result.output
+
+    decision_result = CliRunner().invoke(
+        app, ["search-decisions", "context retrieval", "--config", str(config_path), "--limit", "3"]
+    )
+    assert decision_result.exit_code == 0, decision_result.output
+    decisions = json.loads(decision_result.output)
+    assert decisions["results"][0]["path"] == "docs/decisions/accepted/0001-context.md"
+    assert "markdown" in decisions
+
+    doctrine_result = CliRunner().invoke(
+        app, ["get-current-doctrine", "context retrieval", "--config", str(config_path)]
+    )
+    assert doctrine_result.exit_code == 0, doctrine_result.output
+    doctrine = json.loads(doctrine_result.output)
+    assert doctrine["doctrine"][0]["path"] == "docs/doctrine/context.md"
+    assert doctrine["decisions"][0]["path"] == "docs/decisions/accepted/0001-context.md"
+
+    question_result = CliRunner().invoke(
+        app,
+        [
+            "search-open-questions",
+            "context retrieval",
+            "--config",
+            str(config_path),
+            "--limit",
+            "3",
+        ],
+    )
+    assert question_result.exit_code == 0, question_result.output
+    questions = json.loads(question_result.output)
+    assert questions["results"][0]["path"] == "docs/open-questions/context.md"
+    assert questions["results"][0]["owner"] == "Amin"
 
 
 def test_cli_check_project_staleness_from_config(tmp_path: Path):

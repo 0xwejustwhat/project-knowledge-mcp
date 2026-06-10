@@ -117,9 +117,16 @@ def search_ops_from_config(
     assert config.storage.state_dir is not None
     ops_repo = config.ops_repo
     effective_filters = dict(filters or {})
-    include_superseded = bool(
-        effective_filters.pop("include_superseded", config.retrieval.include_superseded_by_default)
+    include_superseded_value = effective_filters.pop(
+        "include_superseded", config.retrieval.include_superseded_by_default
     )
+    if not isinstance(include_superseded_value, bool):
+        return _query_invalid(
+            query,
+            "include_superseded must be a boolean value",
+            details={"include_superseded": include_superseded_value},
+        )
+    include_superseded = include_superseded_value
     tag_filters = _normalize_tags(effective_filters.pop("tags", None))
     requested_repo_id = effective_filters.pop("repo_id", None)
     if requested_repo_id is not None and requested_repo_id != ops_repo.id:
@@ -194,6 +201,96 @@ def search_ops_from_config(
     }
 
 
+def search_decisions_from_config(
+    *,
+    query: str,
+    config_path: Path | str | None = None,
+    filters: dict[str, Any] | None = None,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    scoped_filters, error = _filters_with_required_doc_type(
+        query, filters, required_doc_type="decision"
+    )
+    if error is not None:
+        return error
+    result = search_ops_from_config(
+        query=query, config_path=config_path, filters=scoped_filters, limit=limit
+    )
+    result["tool"] = "search_decisions"
+    return result
+
+
+def search_open_questions_from_config(
+    *,
+    query: str,
+    config_path: Path | str | None = None,
+    filters: dict[str, Any] | None = None,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    scoped_filters, error = _filters_with_required_doc_type(
+        query, filters, required_doc_type="open_question"
+    )
+    if error is not None:
+        return error
+    result = search_ops_from_config(
+        query=query, config_path=config_path, filters=scoped_filters, limit=limit
+    )
+    result["tool"] = "search_open_questions"
+    for search_result in result.get("results", []):
+        frontmatter = search_result.get("frontmatter", {})
+        search_result["owner"] = frontmatter.get("owner")
+        search_result["related_docs"] = _normalize_metadata_list(
+            frontmatter.get("related_docs", frontmatter.get("related"))
+        )
+    return result
+
+
+def get_current_doctrine_from_config(
+    *,
+    topic: str,
+    config_path: Path | str | None = None,
+    filters: dict[str, Any] | None = None,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    doctrine_filters, error = _filters_with_required_doc_type(
+        topic, filters, required_doc_type="doctrine", default_status="current"
+    )
+    if error is not None:
+        return error
+    decision_filters, error = _filters_with_required_doc_type(
+        topic, filters, required_doc_type="decision", default_status="accepted"
+    )
+    if error is not None:
+        return error
+
+    doctrine = search_ops_from_config(
+        query=topic, config_path=config_path, filters=doctrine_filters, limit=limit
+    )
+    if doctrine.get("error"):
+        doctrine["topic"] = topic
+        return doctrine
+    decisions = search_ops_from_config(
+        query=topic, config_path=config_path, filters=decision_filters, limit=limit
+    )
+    if decisions.get("error"):
+        decisions["topic"] = topic
+        return decisions
+
+    doctrine_results = doctrine.get("results", [])
+    decision_results = decisions.get("results", [])
+    warnings = [*doctrine.get("warnings", []), *decisions.get("warnings", [])]
+    return {
+        "tool": "get_current_doctrine",
+        "topic": topic,
+        "project_id": doctrine.get("project_id") or decisions.get("project_id"),
+        "doctrine": doctrine_results,
+        "decisions": decision_results,
+        "results": [*doctrine_results, *decision_results],
+        "warnings": warnings,
+        "markdown": _render_current_doctrine_markdown(topic, doctrine_results, decision_results),
+    }
+
+
 def check_project_staleness_from_config(
     *,
     config_path: Path | str | None = None,
@@ -260,6 +357,47 @@ def _query_invalid(
     }
 
 
+def _filters_with_required_doc_type(
+    query: str,
+    filters: dict[str, Any] | None,
+    *,
+    required_doc_type: str,
+    default_status: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    scoped_filters = dict(filters or {})
+    requested_type = scoped_filters.pop("type", None)
+    requested_doc_type = scoped_filters.get("doc_type")
+    conflicting = next(
+        (
+            value
+            for value in (requested_type, requested_doc_type)
+            if value is not None and value != required_doc_type
+        ),
+        None,
+    )
+    if conflicting is not None:
+        return {}, _query_invalid(
+            query,
+            f"doc_type filter cannot widen this tool beyond {required_doc_type}: {conflicting}",
+            details={"requested_doc_type": conflicting, "required_doc_type": required_doc_type},
+        )
+    scoped_filters["doc_type"] = required_doc_type
+    requested_status = scoped_filters.get("status")
+    if (
+        default_status is not None
+        and requested_status is not None
+        and requested_status != default_status
+    ):
+        return {}, _query_invalid(
+            query,
+            f"status filter cannot widen this tool beyond {default_status}: {requested_status}",
+            details={"requested_status": requested_status, "required_status": default_status},
+        )
+    if default_status is not None:
+        scoped_filters["status"] = default_status
+    return scoped_filters, None
+
+
 def _select_repos(config: ProjectKnowledgeConfig, *, repo_id: str | None) -> list:
     if repo_id is None:
         return list(config.repos)
@@ -284,6 +422,7 @@ def _search_result_payload(result: SearchResult) -> dict[str, Any]:
         "authority": result.authority,
         "tags": result.tags,
         "superseded_by": result.superseded_by,
+        "frontmatter": result.frontmatter,
         "chunk_id": result.chunk_id,
         "heading_path": result.heading_path,
         "start_line": result.line_start,
@@ -325,6 +464,39 @@ def _render_search_markdown(query: str, results: list[dict[str, Any]]) -> str:
             lines.append(f"Warnings: {'; '.join(result['warnings'])}")
         lines.extend(["", f"> {result['excerpt']}", ""])
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_current_doctrine_markdown(
+    topic: str, doctrine: list[dict[str, Any]], decisions: list[dict[str, Any]]
+) -> str:
+    lines = ["## Current Doctrine", "", f"Topic: `{topic}`", ""]
+    sections = [("Doctrine", doctrine), ("Accepted Decisions", decisions)]
+    for heading, results in sections:
+        lines.extend([f"### {heading}", ""])
+        if not results:
+            lines.extend(["No results.", ""])
+            continue
+        for index, result in enumerate(results, start=1):
+            source = f"{result['path']}:{result['start_line']}-{result['end_line']}"
+            lines.extend(
+                [
+                    f"{index}. **{result['title']}** — `{result['authority']}` / `{result['status']}`",
+                    f"   Source: `{source}`",
+                    f"   Excerpt: {result['excerpt']}",
+                    "",
+                ]
+            )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _normalize_metadata_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    return [str(value)]
 
 
 def _normalize_tags(value: Any) -> list[str]:
