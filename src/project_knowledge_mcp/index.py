@@ -25,6 +25,10 @@ VALID_TYPES = {
     "open_question",
     "handover",
     "proposal",
+    "doctrine_delta",
+    "adr_draft",
+    "decision_proposal",
+    "review_packet",
     "evidence",
     "code_doc",
     "project_brief",
@@ -47,6 +51,7 @@ VALID_AUTHORITIES = {
     "implementation_truth",
     "canonical",
     "accepted_decision",
+    "proposal",
     "working",
     "capture",
     "historical",
@@ -67,6 +72,7 @@ AUTHORITY_BOOST = {
     "implementation_truth": 0.35,
     "canonical": 0.30,
     "accepted_decision": 0.25,
+    "proposal": 0.10,
     "working": 0.10,
     "capture": 0.00,
     "historical": -0.10,
@@ -77,6 +83,7 @@ AUTHORITY_RANK_BASE = {
     "implementation_truth": 4.0,
     "canonical": 3.0,
     "accepted_decision": 2.0,
+    "proposal": 1.0,
     "working": 1.0,
     "capture": 0.0,
     "historical": -1.0,
@@ -594,6 +601,128 @@ def index_repo(
     )
 
 
+def index_document(
+    repo_path: Path,
+    relative_path: str | Path,
+    *,
+    state_dir: Path,
+    repo_id: str,
+    role: str,
+    max_file_bytes: int | None = None,
+    include_globs: list[str] | None = None,
+    exclude_globs: list[str] | None = None,
+) -> IndexSummary:
+    """Upsert one safe, indexable file into the SQLite index without clearing the repo."""
+    repo_path = repo_path.resolve()
+    if not repo_path.exists() or not repo_path.is_dir():
+        raise FileNotFoundError(f"repo path does not exist or is not a directory: {repo_path}")
+    relative = Path(relative_path)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError(f"relative_path must stay under repo root: {relative_path}")
+    candidate = repo_path / relative
+    if candidate.is_symlink():
+        raise ValueError(f"cannot index symlink: {relative_path}")
+    if not candidate.exists() or not candidate.is_file():
+        raise FileNotFoundError(f"document path does not exist or is not a file: {relative_path}")
+
+    state_dir = state_dir.resolve()
+    relative_posix = relative.as_posix().strip("/")
+    if not _is_indexable_file(
+        repo_path,
+        candidate,
+        state_dir=state_dir,
+        include_globs=include_globs,
+        exclude_globs=exclude_globs,
+        max_file_bytes=max_file_bytes,
+    ):
+        raise ValueError(f"document is not safe or supported for indexing: {relative_posix}")
+
+    stat = candidate.stat()
+    if max_file_bytes is not None and stat.st_size > max_file_bytes:
+        raise ValueError(
+            f"document exceeds max_file_bytes ({stat.st_size} > {max_file_bytes}): {relative_posix}"
+        )
+    try:
+        text = candidate.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"document is not valid UTF-8 text: {relative_posix}") from exc
+    except OSError as exc:
+        raise ValueError(f"document is not readable: {relative_posix}") from exc
+
+    db_path = _db_path(state_dir)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    conn = _connect(db_path)
+    _create_schema(conn)
+
+    now = _now()
+    head_commit = _git_output(repo_path, "rev-parse", "HEAD")
+    worktree_status = _git_status_porcelain(repo_path, state_dir=state_dir)
+    status_lines = [line for line in worktree_status.splitlines() if line]
+    untracked_count = sum(1 for line in status_lines if line.startswith("??"))
+    dirty = any(not line.startswith("??") for line in status_lines)
+    conn.execute(
+        """
+        INSERT INTO repos(
+          id, role, name, source_mode, path, writable,
+          current_branch, head_commit, dirty, untracked_count,
+          includes_uncommitted_changes, last_indexed_at, last_indexed_commit,
+          last_indexed_worktree_fingerprint, index_scope_fingerprint
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          role = excluded.role,
+          name = excluded.name,
+          source_mode = excluded.source_mode,
+          path = excluded.path,
+          writable = excluded.writable,
+          current_branch = excluded.current_branch,
+          head_commit = excluded.head_commit,
+          dirty = excluded.dirty,
+          untracked_count = excluded.untracked_count,
+          includes_uncommitted_changes = excluded.includes_uncommitted_changes,
+          last_indexed_at = excluded.last_indexed_at,
+          last_indexed_commit = excluded.last_indexed_commit,
+          last_indexed_worktree_fingerprint = excluded.last_indexed_worktree_fingerprint,
+          index_scope_fingerprint = excluded.index_scope_fingerprint
+        """,
+        (
+            repo_id,
+            role,
+            repo_path.name,
+            "workspace",
+            str(repo_path),
+            1,
+            _git_output(repo_path, "rev-parse", "--abbrev-ref", "HEAD"),
+            head_commit,
+            int(dirty),
+            untracked_count,
+            1,
+            now,
+            head_commit,
+            worktree_fingerprint(repo_path, worktree_status),
+            index_scope_fingerprint(
+                role=role,
+                include_globs=include_globs,
+                exclude_globs=exclude_globs,
+                max_file_bytes=max_file_bytes,
+            ),
+        ),
+    )
+    _delete_document(conn, repo_id=repo_id, path=relative_posix)
+    parsed = parse_document(relative_posix, text, repo_id=repo_id, repo_role=role)
+    _insert_document(conn, parsed, mtime=stat.st_mtime)
+    conn.commit()
+    conn.close()
+    return IndexSummary(
+        db_path=db_path,
+        repo_id=repo_id,
+        indexed_documents=1,
+        indexed_chunks=len(parsed.chunks),
+        warning_count=len(parsed.warnings),
+        skipped_documents=0,
+    )
+
+
 def parse_document(path: str, text: str, *, repo_id: str, repo_role: str) -> ParsedDocument:
     suffix = Path(path).suffix.lower()
     if suffix in {".md", ".mdx"}:
@@ -982,6 +1111,19 @@ def _clear_repo(conn: sqlite3.Connection, repo_id: str) -> None:
         conn.execute("DELETE FROM chunks_fts WHERE rowid = ?", (rowid,))
     conn.execute("DELETE FROM documents WHERE repo_id = ?", (repo_id,))
     conn.execute("DELETE FROM index_events WHERE repo_id = ?", (repo_id,))
+
+
+def _delete_document(conn: sqlite3.Connection, *, repo_id: str, path: str) -> None:
+    rowids = [
+        row[0]
+        for row in conn.execute(
+            "SELECT rowid FROM chunks WHERE repo_id = ? AND path = ?", (repo_id, path)
+        )
+    ]
+    for rowid in rowids:
+        conn.execute("DELETE FROM chunks_fts WHERE rowid = ?", (rowid,))
+    conn.execute("DELETE FROM documents WHERE repo_id = ? AND path = ?", (repo_id, path))
+    conn.execute("DELETE FROM index_events WHERE repo_id = ? AND path = ?", (repo_id, path))
 
 
 def _insert_index_event(
