@@ -166,7 +166,9 @@ def add_project_note_from_config(
     blocked = _blocked_direct_write_response(config, relative_target, title=title)
     if blocked is not None:
         return blocked
-    normalized, error = _safe_repo_write_path(repo.path, relative_target, state_dir=config.storage.state_dir)
+    normalized, error = _safe_repo_write_path(
+        repo.path, relative_target, state_dir=config.storage.state_dir
+    )
     if error is not None:
         return error
 
@@ -224,7 +226,9 @@ def create_draft_artifact_from_config(
 
     default_dir = config.write_policy.proposal_dirs.get(kind, DEFAULT_PROPOSAL_DIRS[kind])
     relative_target = _target_file_or_generated(target=target, default_dir=default_dir, title=title)
-    allowed_dirs = set(DEFAULT_PROPOSAL_DIRS.values()) | set(config.write_policy.proposal_dirs.values())
+    allowed_dirs = set(DEFAULT_PROPOSAL_DIRS.values()) | set(
+        config.write_policy.proposal_dirs.values()
+    )
     if not _path_is_inside_any(relative_target, sorted(allowed_dirs)):
         return _write_error(
             "WRITE_POLICY_DENIED",
@@ -239,7 +243,9 @@ def create_draft_artifact_from_config(
     blocked = _blocked_direct_write_response(config, relative_target, title=title)
     if blocked is not None:
         return blocked
-    normalized, error = _safe_repo_write_path(repo.path, relative_target, state_dir=config.storage.state_dir)
+    normalized, error = _safe_repo_write_path(
+        repo.path, relative_target, state_dir=config.storage.state_dir
+    )
     if error is not None:
         return error
 
@@ -307,7 +313,9 @@ def propose_authority_change_from_config(
     seen_paths: set[str] = set()
     for index, change in enumerate(changes):
         if not isinstance(change, Mapping):
-            return _write_error("INVALID_CHANGES", "each change must be an object", details={"index": index})
+            return _write_error(
+                "INVALID_CHANGES", "each change must be an object", details={"index": index}
+            )
         operation = change.get("operation")
         if operation not in {"add_file", "replace_file"}:
             return _write_error(
@@ -318,7 +326,9 @@ def propose_authority_change_from_config(
         content = change.get("content")
         if not isinstance(content, str):
             return _write_error(
-                "INVALID_CHANGES", "change content must be caller-supplied text", details={"index": index}
+                "INVALID_CHANGES",
+                "change content must be caller-supplied text",
+                details={"index": index},
             )
         normalized, error = _safe_repo_write_path(
             repo.path,
@@ -342,7 +352,9 @@ def propose_authority_change_from_config(
                 details={"path": normalized},
             )
         if normalized in seen_paths:
-            return _write_error("INVALID_CHANGES", "duplicate changed path", details={"path": normalized})
+            return _write_error(
+                "INVALID_CHANGES", "duplicate changed path", details={"path": normalized}
+            )
         seen_paths.add(normalized)
         normalized_changes.append({"operation": operation, "path": normalized, "content": content})
 
@@ -350,7 +362,9 @@ def propose_authority_change_from_config(
     if branch is None:
         return _write_error("INVALID_BRANCH", "branch_name contains unsafe characters")
     if _git_run(repo.path, "rev-parse", "--verify", branch, check=False).returncode == 0:
-        return _write_error("BRANCH_EXISTS", "Authority proposal branch already exists", details={"branch": branch})
+        return _write_error(
+            "BRANCH_EXISTS", "Authority proposal branch already exists", details={"branch": branch}
+        )
     original_branch = _git_output(repo.path, "branch", "--show-current")
     original_head = _git_output(repo.path, "rev-parse", "HEAD")
     created = _git_run(repo.path, "switch", "-c", branch, check=False)
@@ -362,7 +376,9 @@ def propose_authority_change_from_config(
         )
 
     changed_paths = [change["path"] for change in normalized_changes]
-    created_paths = [change["path"] for change in normalized_changes if change["operation"] == "add_file"]
+    created_paths = [
+        change["path"] for change in normalized_changes if change["operation"] == "add_file"
+    ]
     try:
         for change in normalized_changes:
             path = repo.path / change["path"]
@@ -400,16 +416,22 @@ def propose_authority_change_from_config(
     commit = _git_output(repo.path, "rev-parse", "HEAD")
     pr_url: str | None = None
     warnings: list[str] = []
-    gh_auth = subprocess.run(
-        ["gh", "auth", "status"],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=10,
-        env={**os.environ, "GH_PROMPT_DISABLED": "1"},
-    ) if _command_exists("gh") else None
+    gh_auth = (
+        subprocess.run(
+            ["gh", "auth", "status"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env={**os.environ, "GH_PROMPT_DISABLED": "1"},
+        )
+        if _command_exists("gh")
+        else None
+    )
     if gh_auth is not None and gh_auth.returncode == 0:
-        pushed = _git_run(repo.path, "push", "--no-verify", "--set-upstream", "origin", branch, check=False)
+        pushed = _git_run(
+            repo.path, "push", "--no-verify", "--set-upstream", "origin", branch, check=False
+        )
         if pushed.returncode == 0:
             pr_body = _authority_pr_body(rationale, source, tags, changed_paths)
             pr = subprocess.run(
@@ -1457,7 +1479,9 @@ def _safe_repo_write_path(
     if not relative_posix or relative_posix.endswith("/"):
         return "", _write_error("INVALID_TARGET", "Target path must name a file.")
     if any("secret" in part.casefold() or "token" in part.casefold() for part in relative.parts):
-        return "", _write_error("INVALID_TARGET", "Target path may not contain secret/token components.")
+        return "", _write_error(
+            "INVALID_TARGET", "Target path may not contain secret/token components."
+        )
 
     repo_root = repo_path.resolve()
     target_path = repo_root / relative
@@ -1491,7 +1515,9 @@ def _safe_repo_write_path(
         else:
             return "", _write_error("INVALID_TARGET", "Target path may not be in state dir.")
     if not allow_existing and target_path.exists():
-        return "", _write_error("TARGET_EXISTS", "Target file already exists.", details={"path": relative_posix})
+        return "", _write_error(
+            "TARGET_EXISTS", "Target file already exists.", details={"path": relative_posix}
+        )
     return relative_posix, None
 
 
@@ -1504,7 +1530,9 @@ def _path_is_inside_any(path: str, directories: list[str]) -> bool:
     return False
 
 
-def _write_markdown_file(path: Path, *, frontmatter: dict[str, Any], body: str) -> dict[str, Any] | None:
+def _write_markdown_file(
+    path: Path, *, frontmatter: dict[str, Any], body: str
+) -> dict[str, Any] | None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.parent.is_symlink() or path.is_symlink():
@@ -1567,7 +1595,9 @@ def _write_error(
     payload = {
         "status": "error",
         "error": {"code": code, "message": message, "details": details or {}, "recoverable": True},
-        "errors": [{"code": code, "message": message, "details": details or {}, "recoverable": True}],
+        "errors": [
+            {"code": code, "message": message, "details": details or {}, "recoverable": True}
+        ],
         "warnings": [],
     }
     if extra:
@@ -1579,7 +1609,9 @@ def _authority_branch_name(title: str, branch_name: str | None) -> str | None:
     if branch_name:
         branch = branch_name.strip().strip("/")
     else:
-        branch = f"pkmcp/authority-proposal/{datetime.now(UTC).date().isoformat()}-{_slugify(title)}"
+        branch = (
+            f"pkmcp/authority-proposal/{datetime.now(UTC).date().isoformat()}-{_slugify(title)}"
+        )
     if (
         not branch
         or branch.startswith("-")

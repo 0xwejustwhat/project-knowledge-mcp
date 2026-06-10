@@ -52,7 +52,9 @@ write_policy:
     return config_path
 
 
-def test_propose_authority_change_commits_caller_supplied_changes_without_pr(monkeypatch, tmp_path: Path):
+def test_propose_authority_change_commits_caller_supplied_changes_without_pr(
+    monkeypatch, tmp_path: Path
+):
     repo = tmp_path / "ops"
     state = tmp_path / ".project-knowledge"
     init_git_repo(repo)
@@ -88,11 +90,24 @@ def test_propose_authority_change_commits_caller_supplied_changes_without_pr(mon
     assert result["changed_paths"] == ["docs/specs/current.md", "docs/decisions/0004-proposed.md"]
     assert result["next_action"] == "push branch and open PR manually"
     assert "GitHub authentication unavailable" in result["warnings"][0]
-    assert (repo / "docs" / "specs" / "current.md").read_text(encoding="utf-8") == "new caller supplied spec\n"
-    assert (repo / "docs" / "decisions" / "0004-proposed.md").read_text(encoding="utf-8").startswith("# Proposed")
-    assert subprocess.run(
-        ["git", "branch", "--show-current"], cwd=repo, check=True, capture_output=True, text=True
-    ).stdout.strip() == "pkmcp/authority-proposal/test-clarify"
+    assert (repo / "docs" / "specs" / "current.md").read_text(
+        encoding="utf-8"
+    ) == "new caller supplied spec\n"
+    assert (
+        (repo / "docs" / "decisions" / "0004-proposed.md")
+        .read_text(encoding="utf-8")
+        .startswith("# Proposed")
+    )
+    assert (
+        subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == "pkmcp/authority-proposal/test-clarify"
+    )
     log = subprocess.run(
         ["git", "log", "-1", "--pretty=%B"], cwd=repo, check=True, capture_output=True, text=True
     ).stdout
@@ -176,7 +191,9 @@ def test_propose_authority_change_cleans_up_failed_commit(monkeypatch, tmp_path:
 
     def fake_git_run(repo_path: Path, *args: str, check: bool = False):
         if args and args[0] == "commit":
-            return subprocess.CompletedProcess(["git", *args], 1, stdout="", stderr="simulated commit failure")
+            return subprocess.CompletedProcess(
+                ["git", *args], 1, stdout="", stderr="simulated commit failure"
+            )
         return original_git_run(repo_path, *args, check=check)
 
     monkeypatch.setattr(services, "_git_run", fake_git_run)
@@ -221,7 +238,9 @@ def test_propose_authority_change_cleans_up_failed_add(monkeypatch, tmp_path: Pa
 
     def fake_git_run(repo_path: Path, *args: str, check: bool = False):
         if args and args[0] == "add":
-            return subprocess.CompletedProcess(["git", *args], 1, stdout="", stderr="simulated add failure")
+            return subprocess.CompletedProcess(
+                ["git", *args], 1, stdout="", stderr="simulated add failure"
+            )
         return original_git_run(repo_path, *args, check=check)
 
     monkeypatch.setattr(services, "_git_run", fake_git_run)
@@ -265,7 +284,9 @@ def test_propose_authority_change_rejects_dirty_workspace(tmp_path: Path):
 
     assert result["status"] == "blocked"
     assert result["authority_boundary"] == "review_required_before_promotion"
-    assert result["next_action"] == "commit/stash current changes or use a clean worktree, then retry"
+    assert (
+        result["next_action"] == "commit/stash current changes or use a clean worktree, then retry"
+    )
 
 
 def test_propose_authority_change_rejects_traversal_duplicate_and_missing_replace(tmp_path: Path):
@@ -310,7 +331,11 @@ def test_propose_authority_change_rejects_traversal_duplicate_and_missing_replac
         title="Bad hardlink",
         rationale="should reject",
         changes=[
-            {"operation": "replace_file", "path": "docs/specs/hardlinked.md", "content": "changed\n"}
+            {
+                "operation": "replace_file",
+                "path": "docs/specs/hardlinked.md",
+                "content": "changed\n",
+            }
         ],
         config_path=config_path,
     )
