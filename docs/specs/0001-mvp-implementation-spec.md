@@ -8,11 +8,11 @@ author: Hermes Agent
 created: 2026-06-09
 version: 0.5
 reviewed_after_step0: 2026-06-09
-snapshot_created: 2026-06-09
+snapshot_created: 2026-06-10
 canonical_source_repo: 0xwejustwhat/Project-Knowledge-MCP-ops
 canonical_source_path: docs/specs/0001-mvp-implementation-spec.md
-canonical_source_commit: 26e1e1aa0c3a909a7fc4ec5ec85c38af2efeef7d
-canonical_source_pr: https://github.com/0xwejustwhat/Project-Knowledge-MCP-ops/pull/4
+canonical_source_commit: cc9efa73b61f6fe7398b4e0f0f0313b6bf117199
+canonical_source_pr: https://github.com/0xwejustwhat/Project-Knowledge-MCP-ops/pull/5
 source_documents:
   - docs/PRD.md
   - docs/amendments/0001-capture-governance-reconciliation.md
