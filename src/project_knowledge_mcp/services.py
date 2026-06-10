@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import re
+import shutil
 import sqlite3
 import subprocess
 from collections.abc import Mapping
@@ -7,6 +10,8 @@ from datetime import UTC, datetime
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 from project_knowledge_mcp.code_context import (
     CodeGraphContextProvider,
@@ -21,6 +26,7 @@ from project_knowledge_mcp.index import (
     INDEX_DB_NAME,
     ProjectIndex,
     SearchResult,
+    index_document,
     index_repo,
     index_scope_fingerprint,
     worktree_fingerprint,
@@ -100,6 +106,345 @@ def index_project_from_config(
         "repos": repo_summaries,
         "warnings": warnings,
     }
+
+
+SUPPORTED_DRAFT_KINDS = {
+    "open_question",
+    "doctrine_delta",
+    "adr_draft",
+    "decision_proposal",
+    "review_packet",
+    "handover",
+}
+
+DEFAULT_PROPOSAL_DIRS = {
+    "open_question": "docs/open-questions",
+    "doctrine_delta": "docs/proposals/doctrine-deltas",
+    "adr_draft": "docs/proposals/adr-drafts",
+    "decision_proposal": "docs/proposals/decision-proposals",
+    "review_packet": "docs/proposals/review-packets",
+    "handover": "docs/handovers",
+}
+
+BUILTIN_BLOCKED_DIRECT_WRITE_GLOBS = [
+    "docs/doctrine/**",
+    "doctrine/**",
+    "docs/decisions/**",
+    "decisions/**",
+    "docs/decisions/accepted/**",
+    "decisions/accepted/**",
+    "docs/PRD.md",
+    "project-brief.md",
+    "docs/terminology/**",
+    "docs/acceptance-criteria/**",
+]
+
+
+def add_project_note_from_config(
+    title: str,
+    body: str,
+    type: str = "note",
+    tags: list[str] | None = None,
+    source: str | None = None,
+    target: str | None = None,
+    config_path: Path | str | None = None,
+) -> dict[str, Any]:
+    validation, config = _load_validated_config_for_write(config_path)
+    if config is None:
+        return validation
+    repo = _writable_capture_repo(config)
+    if repo is None:
+        return _write_error("WRITE_POLICY_DENIED", "Configured capture repo is not writable.")
+    if not config.write_policy.allow_direct_capture:
+        return _write_error("WRITE_POLICY_DENIED", "Direct capture writes are disabled.")
+
+    relative_target = _target_file_or_generated(
+        target=target,
+        default_dir=config.write_policy.default_capture_dir,
+        title=title,
+    )
+    blocked = _blocked_direct_write_response(config, relative_target, title=title)
+    if blocked is not None:
+        return blocked
+    normalized, error = _safe_repo_write_path(repo.path, relative_target, state_dir=config.storage.state_dir)
+    if error is not None:
+        return error
+
+    now = _now()
+    note_type = type or "note"
+    status = "open" if note_type == "open_question" else "captured"
+    authority = "working" if note_type == "open_question" else "capture"
+    frontmatter = {
+        "title": title,
+        "type": note_type,
+        "status": status,
+        "authority": authority,
+        "tags": tags or [],
+        "source": source,
+        "created_at": now,
+        "updated_at": now,
+    }
+    write_error = _write_markdown_file(repo.path / normalized, frontmatter=frontmatter, body=body)
+    if write_error is not None:
+        return write_error
+    indexed, index_warnings = _index_written_document(config, repo, normalized)
+    return {
+        "status": "written",
+        "repo_id": repo.id,
+        "path": normalized,
+        "authority": authority,
+        "indexed": indexed,
+        "index_scope": "single_document" if indexed else None,
+        "full_reindex_required": not indexed,
+        "warnings": index_warnings,
+    }
+
+
+def create_draft_artifact_from_config(
+    kind: str,
+    title: str,
+    body: str,
+    source: str | None = None,
+    tags: list[str] | None = None,
+    target: str | None = None,
+    config_path: Path | str | None = None,
+) -> dict[str, Any]:
+    validation, config = _load_validated_config_for_write(config_path)
+    if config is None:
+        return validation
+    repo = _writable_capture_repo(config)
+    if repo is None:
+        return _write_error("WRITE_POLICY_DENIED", "Configured capture repo is not writable.")
+    if kind not in SUPPORTED_DRAFT_KINDS:
+        return _write_error(
+            "UNSUPPORTED_DRAFT_KIND",
+            f"Unsupported draft kind: {kind}",
+            details={"supported_kinds": sorted(SUPPORTED_DRAFT_KINDS)},
+        )
+
+    default_dir = config.write_policy.proposal_dirs.get(kind, DEFAULT_PROPOSAL_DIRS[kind])
+    relative_target = _target_file_or_generated(target=target, default_dir=default_dir, title=title)
+    allowed_dirs = set(DEFAULT_PROPOSAL_DIRS.values()) | set(config.write_policy.proposal_dirs.values())
+    if not _path_is_inside_any(relative_target, sorted(allowed_dirs)):
+        return _write_error(
+            "WRITE_POLICY_DENIED",
+            "Draft artifacts must be written inside configured proposal/draft directories.",
+            details={"target": relative_target, "allowed_dirs": sorted(allowed_dirs)},
+            extra={
+                "status": "blocked",
+                "suggested_actions": ["create_draft_artifact", "propose_authority_change"],
+                "authority_boundary": "review_required_before_promotion",
+            },
+        )
+    blocked = _blocked_direct_write_response(config, relative_target, title=title)
+    if blocked is not None:
+        return blocked
+    normalized, error = _safe_repo_write_path(repo.path, relative_target, state_dir=config.storage.state_dir)
+    if error is not None:
+        return error
+
+    now = _now()
+    frontmatter = {
+        "title": title,
+        "type": kind,
+        "status": "open" if kind == "open_question" else "draft",
+        "authority": "proposal",
+        "tags": tags or [],
+        "source": source,
+        "created_at": now,
+        "updated_at": now,
+    }
+    write_error = _write_markdown_file(repo.path / normalized, frontmatter=frontmatter, body=body)
+    if write_error is not None:
+        return write_error
+    indexed, index_warnings = _index_written_document(config, repo, normalized)
+    return {
+        "status": "written",
+        "repo_id": repo.id,
+        "path": normalized,
+        "authority": "proposal",
+        "indexed": indexed,
+        "index_scope": "single_document" if indexed else None,
+        "full_reindex_required": not indexed,
+        "suggested_actions": ["propose_authority_change"],
+        "authority_boundary": "review_required_before_promotion",
+        "warnings": index_warnings,
+    }
+
+
+def propose_authority_change_from_config(
+    title: str,
+    rationale: str,
+    changes: list[dict[str, Any]],
+    source: str | None = None,
+    tags: list[str] | None = None,
+    branch_name: str | None = None,
+    config_path: Path | str | None = None,
+) -> dict[str, Any]:
+    validation, config = _load_validated_config_for_write(config_path)
+    if config is None:
+        return validation
+    repo = _writable_capture_repo(config)
+    if repo is None:
+        return _write_error("WRITE_POLICY_DENIED", "Configured capture repo is not writable.")
+    if not isinstance(changes, list) or not changes:
+        return _write_error("INVALID_CHANGES", "changes must be a non-empty array")
+
+    porcelain = _git_status_porcelain(repo.path, state_dir=config.storage.state_dir)
+    if porcelain is None:
+        return _write_error("GIT_STATUS_FAILED", "Could not determine Git workspace status.")
+    if porcelain.strip():
+        return {
+            "status": "blocked",
+            "repo_id": repo.id,
+            "reason": "Workspace has uncommitted changes; authority proposals require a clean workspace.",
+            "authority_boundary": "review_required_before_promotion",
+            "next_action": "commit/stash current changes or use a clean worktree, then retry",
+            "warnings": [],
+        }
+
+    normalized_changes: list[dict[str, str]] = []
+    seen_paths: set[str] = set()
+    for index, change in enumerate(changes):
+        if not isinstance(change, Mapping):
+            return _write_error("INVALID_CHANGES", "each change must be an object", details={"index": index})
+        operation = change.get("operation")
+        if operation not in {"add_file", "replace_file"}:
+            return _write_error(
+                "INVALID_CHANGES",
+                "change operation must be add_file or replace_file",
+                details={"index": index, "operation": operation},
+            )
+        content = change.get("content")
+        if not isinstance(content, str):
+            return _write_error(
+                "INVALID_CHANGES", "change content must be caller-supplied text", details={"index": index}
+            )
+        normalized, error = _safe_repo_write_path(
+            repo.path,
+            str(change.get("path") or ""),
+            state_dir=config.storage.state_dir,
+            allow_existing=True,
+        )
+        if error is not None:
+            return error
+        target_path = repo.path / normalized
+        if operation == "add_file" and target_path.exists():
+            return _write_error(
+                "INVALID_CHANGES",
+                "add_file target already exists",
+                details={"path": normalized},
+            )
+        if operation == "replace_file" and (not target_path.exists() or not target_path.is_file()):
+            return _write_error(
+                "INVALID_CHANGES",
+                "replace_file target must be an existing file",
+                details={"path": normalized},
+            )
+        if normalized in seen_paths:
+            return _write_error("INVALID_CHANGES", "duplicate changed path", details={"path": normalized})
+        seen_paths.add(normalized)
+        normalized_changes.append({"operation": operation, "path": normalized, "content": content})
+
+    branch = _authority_branch_name(title, branch_name)
+    if branch is None:
+        return _write_error("INVALID_BRANCH", "branch_name contains unsafe characters")
+    if _git_run(repo.path, "rev-parse", "--verify", branch, check=False).returncode == 0:
+        return _write_error("BRANCH_EXISTS", "Authority proposal branch already exists", details={"branch": branch})
+    original_branch = _git_output(repo.path, "branch", "--show-current")
+    original_head = _git_output(repo.path, "rev-parse", "HEAD")
+    created = _git_run(repo.path, "switch", "-c", branch, check=False)
+    if created.returncode != 0:
+        return _write_error(
+            "GIT_BRANCH_FAILED",
+            "Could not create authority proposal branch",
+            details={"branch": branch, "stderr": created.stderr.strip()},
+        )
+
+    changed_paths = [change["path"] for change in normalized_changes]
+    created_paths = [change["path"] for change in normalized_changes if change["operation"] == "add_file"]
+    try:
+        for change in normalized_changes:
+            path = repo.path / change["path"]
+            write_error = _write_text_file_no_symlink(path, change["content"])
+            if write_error is not None:
+                _cleanup_failed_authority_branch(
+                    repo.path, branch, original_branch, original_head, created_paths=created_paths
+                )
+                return write_error
+        add_result = _git_run(repo.path, "add", "--", *changed_paths, check=False)
+        if add_result.returncode != 0:
+            _cleanup_failed_authority_branch(
+                repo.path, branch, original_branch, original_head, created_paths=created_paths
+            )
+            return _write_error("GIT_ADD_FAILED", "Could not stage authority proposal changes")
+        commit_message = _authority_commit_message(title, rationale, source, tags, changed_paths)
+        commit_result = _git_run(
+            repo.path, "commit", "--no-verify", "-m", title, "-m", commit_message, check=False
+        )
+        if commit_result.returncode != 0:
+            _cleanup_failed_authority_branch(
+                repo.path, branch, original_branch, original_head, created_paths=created_paths
+            )
+            return _write_error(
+                "GIT_COMMIT_FAILED",
+                "Could not commit authority proposal changes",
+                details={"stderr": commit_result.stderr.strip()},
+            )
+    except OSError as exc:
+        _cleanup_failed_authority_branch(
+            repo.path, branch, original_branch, original_head, created_paths=created_paths
+        )
+        return _write_error("WRITE_FAILED", str(exc))
+
+    commit = _git_output(repo.path, "rev-parse", "HEAD")
+    pr_url: str | None = None
+    warnings: list[str] = []
+    gh_auth = subprocess.run(
+        ["gh", "auth", "status"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env={**os.environ, "GH_PROMPT_DISABLED": "1"},
+    ) if _command_exists("gh") else None
+    if gh_auth is not None and gh_auth.returncode == 0:
+        pushed = _git_run(repo.path, "push", "--no-verify", "--set-upstream", "origin", branch, check=False)
+        if pushed.returncode == 0:
+            pr_body = _authority_pr_body(rationale, source, tags, changed_paths)
+            pr = subprocess.run(
+                ["gh", "pr", "create", "--title", title, "--body", pr_body, "--head", branch],
+                cwd=repo.path,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env={**os.environ, "GH_PROMPT_DISABLED": "1"},
+            )
+            if pr.returncode == 0:
+                pr_url = pr.stdout.strip().splitlines()[-1] if pr.stdout.strip() else None
+            else:
+                warnings.append("GitHub PR creation failed; branch and commit were prepared.")
+        else:
+            warnings.append("Git push failed; branch and commit were prepared locally.")
+    else:
+        warnings.append("GitHub authentication unavailable; no PR was opened.")
+
+    status = "pr_opened" if pr_url else "branch_prepared_pr_not_opened"
+    result = {
+        "status": status,
+        "repo_id": repo.id,
+        "branch": branch,
+        "commit": commit,
+        "changed_paths": changed_paths,
+        "authority_boundary": "review_required_before_promotion",
+        "warnings": warnings,
+    }
+    if pr_url:
+        result["pr_url"] = pr_url
+    else:
+        result["next_action"] = "push branch and open PR manually"
+    return result
 
 
 def search_ops_from_config(
@@ -1021,6 +1366,323 @@ def _provider_unavailable(
         "error": error,
         "errors": [error],
     }
+
+
+def _load_validated_config_for_write(
+    config_path: Path | str | None,
+) -> tuple[dict[str, Any], ProjectKnowledgeConfig | None]:
+    validation = validate_project_config(config_path)
+    if not validation["valid"]:
+        return (
+            {
+                "status": "error",
+                "error": validation["errors"][0] if validation["errors"] else None,
+                "errors": validation["errors"],
+                "warnings": validation["warnings"],
+            },
+            None,
+        )
+    config = load_project_config(config_path)
+    assert config.storage.state_dir is not None
+    return validation, config
+
+
+def _writable_capture_repo(config: ProjectKnowledgeConfig):
+    repo = config.repo_by_id(config.write_policy.default_capture_repo)
+    if repo is None or repo.role != "ops" or not repo.writable:
+        return None
+    return repo
+
+
+def _slugify(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", value.casefold()).strip("-")
+    return slug[:80].strip("-") or "untitled"
+
+
+def _target_file_or_generated(*, target: str | None, default_dir: str, title: str) -> str:
+    if target is None or not target.strip():
+        directory = default_dir.strip("/")
+        return f"{directory}/{datetime.now(UTC).date().isoformat()}-{_slugify(title)}.md"
+    cleaned = target.strip().replace("\\", "/").strip("/")
+    if Path(cleaned).suffix.lower() in {".md", ".mdx", ".txt"}:
+        return cleaned
+    return f"{cleaned}/{datetime.now(UTC).date().isoformat()}-{_slugify(title)}.md"
+
+
+def _all_blocked_globs(config: ProjectKnowledgeConfig) -> list[str]:
+    return [*BUILTIN_BLOCKED_DIRECT_WRITE_GLOBS, *config.write_policy.blocked_direct_write_globs]
+
+
+def _blocked_direct_write_response(
+    config: ProjectKnowledgeConfig, target: str, *, title: str
+) -> dict[str, Any] | None:
+    normalized = target.strip("/")
+    if not _matches_any(normalized, _all_blocked_globs(config)):
+        return None
+    return {
+        "status": "blocked",
+        "reason": "Target path is canonical/high-authority. Direct MCP writes are not allowed.",
+        "target": normalized,
+        "suggested_actions": ["create_draft_artifact", "propose_authority_change"],
+        "suggested_draft_target": (
+            f"{DEFAULT_PROPOSAL_DIRS['doctrine_delta']}/"
+            f"{datetime.now(UTC).date().isoformat()}-{_slugify(title)}.md"
+        ),
+        "authority_boundary": "review_required_before_promotion",
+        "warnings": [],
+    }
+
+
+def _safe_repo_write_path(
+    repo_path: Path,
+    relative_path: str,
+    *,
+    state_dir: Path | None,
+    allow_existing: bool = False,
+) -> tuple[str, dict[str, Any] | None]:
+    try:
+        relative = Path(relative_path.replace("\\", "/"))
+    except Exception:
+        return "", _write_error("INVALID_TARGET", "Target path is invalid.")
+    if (
+        not str(relative_path).strip()
+        or relative.is_absolute()
+        or ".." in relative.parts
+        or ".git" in relative.parts
+    ):
+        return "", _write_error(
+            "INVALID_TARGET", "Target path must stay under repo root and avoid .git."
+        )
+    relative_posix = relative.as_posix().strip("/")
+    if not relative_posix or relative_posix.endswith("/"):
+        return "", _write_error("INVALID_TARGET", "Target path must name a file.")
+    if any("secret" in part.casefold() or "token" in part.casefold() for part in relative.parts):
+        return "", _write_error("INVALID_TARGET", "Target path may not contain secret/token components.")
+
+    repo_root = repo_path.resolve()
+    target_path = repo_root / relative
+    if target_path.is_symlink():
+        return "", _write_error("INVALID_TARGET", "Target path is a symlink.")
+    if target_path.exists() and target_path.is_dir():
+        return "", _write_error("INVALID_TARGET", "Target path is a directory.")
+    if target_path.exists() and target_path.is_file() and target_path.stat().st_nlink > 1:
+        return "", _write_error("INVALID_TARGET", "Target path has multiple hardlinks.")
+    current = repo_root
+    for part in relative.parts[:-1]:
+        current = current / part
+        if current.is_symlink():
+            return "", _write_error("INVALID_TARGET", "Target parent is a symlink.")
+    parent = target_path.parent
+    existing_parent = parent
+    while not existing_parent.exists() and existing_parent != repo_root:
+        existing_parent = existing_parent.parent
+    if existing_parent.exists() and existing_parent.is_symlink():
+        return "", _write_error("INVALID_TARGET", "Target parent is a symlink.")
+    try:
+        resolved_existing_parent = existing_parent.resolve()
+        resolved_existing_parent.relative_to(repo_root)
+    except (OSError, ValueError):
+        return "", _write_error("INVALID_TARGET", "Target path escapes repo root.")
+    if state_dir is not None:
+        try:
+            target_path.resolve(strict=False).relative_to(state_dir.resolve())
+        except ValueError:
+            pass
+        else:
+            return "", _write_error("INVALID_TARGET", "Target path may not be in state dir.")
+    if not allow_existing and target_path.exists():
+        return "", _write_error("TARGET_EXISTS", "Target file already exists.", details={"path": relative_posix})
+    return relative_posix, None
+
+
+def _path_is_inside_any(path: str, directories: list[str]) -> bool:
+    clean = path.strip("/")
+    for directory in directories:
+        prefix = directory.strip("/")
+        if clean == prefix or clean.startswith(prefix + "/"):
+            return True
+    return False
+
+
+def _write_markdown_file(path: Path, *, frontmatter: dict[str, Any], body: str) -> dict[str, Any] | None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.parent.is_symlink() or path.is_symlink():
+            return _write_error("INVALID_TARGET", "Refusing to write through symlink.")
+        frontmatter_text = yaml.safe_dump(
+            {key: value for key, value in frontmatter.items() if value is not None},
+            sort_keys=False,
+            allow_unicode=True,
+        )
+        path.write_text(f"---\n{frontmatter_text}---\n\n{body.rstrip()}\n", encoding="utf-8")
+    except OSError as exc:
+        return _write_error("WRITE_FAILED", str(exc))
+    return None
+
+
+def _write_text_file_no_symlink(path: Path, content: str) -> dict[str, Any] | None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.parent.is_symlink() or path.is_symlink():
+            return _write_error("INVALID_TARGET", "Refusing to write through symlink.")
+        if path.exists() and path.is_file() and path.stat().st_nlink > 1:
+            return _write_error("INVALID_TARGET", "Refusing to write through hardlink.")
+        path.write_text(content, encoding="utf-8")
+    except OSError as exc:
+        return _write_error("WRITE_FAILED", str(exc))
+    return None
+
+
+def _index_written_document(
+    config: ProjectKnowledgeConfig, repo, relative_path: str
+) -> tuple[bool, list[str]]:
+    if not config.indexing.auto_reindex_after_note_write:
+        return False, ["auto_reindex_after_note_write is disabled; run index_project."]
+    try:
+        summary = index_document(
+            repo.path,
+            relative_path,
+            state_dir=config.storage.state_dir,
+            repo_id=repo.id,
+            role=repo.role,
+            max_file_bytes=config.indexing.max_file_bytes,
+            include_globs=repo.include_globs,
+            exclude_globs=repo.exclude_globs,
+        )
+    except (OSError, ValueError) as exc:
+        return False, [f"single-document indexing failed: {exc}"]
+    warnings = []
+    if summary.warning_count:
+        warnings.append(f"{summary.warning_count} index warning(s) recorded")
+    return True, warnings
+
+
+def _write_error(
+    code: str,
+    message: str,
+    *,
+    details: dict[str, Any] | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = {
+        "status": "error",
+        "error": {"code": code, "message": message, "details": details or {}, "recoverable": True},
+        "errors": [{"code": code, "message": message, "details": details or {}, "recoverable": True}],
+        "warnings": [],
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def _authority_branch_name(title: str, branch_name: str | None) -> str | None:
+    if branch_name:
+        branch = branch_name.strip().strip("/")
+    else:
+        branch = f"pkmcp/authority-proposal/{datetime.now(UTC).date().isoformat()}-{_slugify(title)}"
+    if (
+        not branch
+        or branch.startswith("-")
+        or ".." in branch
+        or branch.endswith(".")
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", branch)
+    ):
+        return None
+    return branch
+
+
+def _authority_commit_message(
+    title: str, rationale: str, source: str | None, tags: list[str] | None, changed_paths: list[str]
+) -> str:
+    return _authority_pr_body(rationale, source, tags, changed_paths, title=title)
+
+
+def _authority_pr_body(
+    rationale: str,
+    source: str | None,
+    tags: list[str] | None,
+    changed_paths: list[str],
+    *,
+    title: str | None = None,
+) -> str:
+    lines = []
+    if title:
+        lines.extend([f"Title: {title}", ""])
+    lines.extend(
+        [
+            "Authority boundary: review_required_before_promotion",
+            "",
+            "Rationale:",
+            rationale,
+            "",
+            f"Source: {source or 'unspecified'}",
+            f"Tags: {', '.join(tags or []) if tags else 'none'}",
+            "",
+            "Changed paths:",
+        ]
+    )
+    lines.extend(f"- {path}" for path in changed_paths)
+    return "\n".join(lines)
+
+
+def _git_run(repo_path: Path, *args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(repo_path), "-c", "core.hooksPath=/dev/null", *args],
+        check=check,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+    )
+
+
+def _cleanup_failed_authority_branch(
+    repo_path: Path,
+    branch: str,
+    original_branch: str | None,
+    original_head: str | None,
+    *,
+    created_paths: list[str] | None = None,
+) -> None:
+    # The workspace was clean before branch creation, so local reset/delete only
+    # discards caller-supplied proposal files from the failed transient branch.
+    _git_run(repo_path, "reset", "--hard", check=False)
+    _remove_created_paths(repo_path, created_paths)
+    if original_branch:
+        _git_run(repo_path, "switch", original_branch, check=False)
+    elif original_head:
+        _git_run(repo_path, "switch", "--detach", original_head, check=False)
+    _remove_created_paths(repo_path, created_paths)
+    _git_run(repo_path, "branch", "-D", branch, check=False)
+
+
+def _remove_created_paths(repo_path: Path, created_paths: list[str] | None) -> None:
+    if not created_paths:
+        return
+    repo_root = repo_path.resolve()
+    for relative_path in created_paths:
+        path = repo_root / relative_path
+        try:
+            if path.is_symlink() or path.is_file():
+                path.unlink(missing_ok=True)
+            parent = path.parent
+            while parent != repo_root:
+                parent.rmdir()
+                parent = parent.parent
+        except OSError:
+            continue
+
+
+def _command_exists(command: str) -> bool:
+    return shutil.which(command) is not None
+
+
+def _matches_any(relative_path: str, patterns: list[str]) -> bool:
+    path = Path(relative_path)
+    for pattern in patterns:
+        if fnmatch(relative_path, pattern) or path.match(pattern):
+            return True
+    return False
 
 
 def _query_invalid(

@@ -9,12 +9,15 @@ from fastmcp import FastMCP
 
 from project_knowledge_mcp.index import ProjectIndex, index_repo
 from project_knowledge_mcp.services import (
+    add_project_note_from_config,
     check_project_staleness_from_config,
+    create_draft_artifact_from_config,
     generate_session_brief_from_config,
     get_code_context_from_config,
     get_code_provider_status_from_config,
     get_current_doctrine_from_config,
     index_project_from_config,
+    propose_authority_change_from_config,
     retrieve_ops_code_evidence_from_config,
     search_code_from_config,
     search_decisions_from_config,
@@ -196,6 +199,69 @@ def create_mcp() -> FastMCP:
         """Compile a deterministic evidence packet for assistant session context."""
         return generate_session_brief_from_config(
             task=task, config_path=config_path, since=since, limit=limit
+        )
+
+    @mcp.tool
+    def add_project_note(
+        title: str,
+        body: str,
+        type: str = "note",
+        tags: list[str] | None = None,
+        source: str | None = None,
+        target: str | None = None,
+        config_path: str | None = None,
+    ) -> dict[str, Any]:
+        """Write a low-authority capture note and index only that document."""
+        return add_project_note_from_config(
+            title=title,
+            body=body,
+            type=type,
+            tags=tags,
+            source=source,
+            target=target,
+            config_path=config_path,
+        )
+
+    @mcp.tool
+    def create_draft_artifact(
+        kind: str,
+        title: str,
+        body: str,
+        source: str | None = None,
+        tags: list[str] | None = None,
+        target: str | None = None,
+        config_path: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a non-canonical proposal/draft artifact."""
+        return create_draft_artifact_from_config(
+            kind=kind,
+            title=title,
+            body=body,
+            source=source,
+            tags=tags,
+            target=target,
+            config_path=config_path,
+        )
+
+    @mcp.tool
+    def propose_authority_change(
+        title: str,
+        rationale: str,
+        changes: list[dict[str, Any]],
+        source: str | None = None,
+        tags: list[str] | None = None,
+        branch_name: str | None = None,
+        config_path: str | None = None,
+    ) -> dict[str, Any]:
+        """Prepare a branch/commit/optional PR for caller-supplied authority changes."""
+        return propose_authority_change_from_config(
+            title=title,
+            rationale=rationale,
+            changes=changes,
+            source=source,
+            tags=tags,
+            branch_name=branch_name,
+            config_path=config_path,
         )
 
     @mcp.tool
@@ -463,6 +529,103 @@ def check_project_staleness_command(
 ) -> None:
     """Report configured repo Git freshness and index staleness."""
     typer.echo(json.dumps(check_project_staleness_from_config(config_path=config), sort_keys=True))
+
+
+def _parse_changes_json(value: str) -> list[dict[str, Any]]:
+    candidate = Path(value)
+    if candidate.exists() and candidate.is_file():
+        raw = candidate.read_text(encoding="utf-8")
+    else:
+        raw = value
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise typer.BadParameter(f"changes must be JSON array or path to JSON file: {exc}") from exc
+    if not isinstance(parsed, list):
+        raise typer.BadParameter("changes JSON must be an array")
+    return parsed
+
+
+@app.command("add-project-note")
+def add_project_note_command(
+    title: str = typer.Option(..., help="Note title."),
+    body: str = typer.Option(..., help="Markdown note body."),
+    note_type: str = typer.Option("note", "--type", help="Low-authority note type."),
+    tag: list[str] | None = typer.Option(None, "--tag", help="Repeatable tag."),
+    source: str | None = typer.Option(None, help="Source/provenance label."),
+    target: str | None = typer.Option(None, help="Optional repo-relative target dir/file."),
+    config: Path | None = typer.Option(None, "--config", help="Project Knowledge config path."),
+) -> None:
+    """Write a low-authority project note and emit JSON."""
+    typer.echo(
+        json.dumps(
+            add_project_note_from_config(
+                title=title,
+                body=body,
+                type=note_type,
+                tags=tag,
+                source=source,
+                target=target,
+                config_path=config,
+            ),
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("create-draft-artifact")
+def create_draft_artifact_command(
+    kind: str = typer.Option(..., help="Draft kind."),
+    title: str = typer.Option(..., help="Artifact title."),
+    body: str = typer.Option(..., help="Markdown artifact body."),
+    source: str | None = typer.Option(None, help="Source/provenance label."),
+    tag: list[str] | None = typer.Option(None, "--tag", help="Repeatable tag."),
+    target: str | None = typer.Option(None, help="Optional repo-relative target dir/file."),
+    config: Path | None = typer.Option(None, "--config", help="Project Knowledge config path."),
+) -> None:
+    """Create a non-canonical draft/proposal artifact and emit JSON."""
+    typer.echo(
+        json.dumps(
+            create_draft_artifact_from_config(
+                kind=kind,
+                title=title,
+                body=body,
+                source=source,
+                tags=tag,
+                target=target,
+                config_path=config,
+            ),
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("propose-authority-change")
+def propose_authority_change_command(
+    title: str = typer.Option(..., help="Proposal title / commit subject."),
+    rationale: str = typer.Option(..., help="Proposal rationale."),
+    changes: str = typer.Option(..., help="JSON array or path to JSON file containing changes."),
+    source: str | None = typer.Option(None, help="Source/provenance label."),
+    tag: list[str] | None = typer.Option(None, "--tag", help="Repeatable tag."),
+    branch_name: str | None = typer.Option(None, "--branch-name", help="Optional branch name."),
+    config: Path | None = typer.Option(None, "--config", help="Project Knowledge config path."),
+) -> None:
+    """Prepare a branch/commit/optional PR for caller-supplied changes."""
+    parsed_changes = _parse_changes_json(changes)
+    typer.echo(
+        json.dumps(
+            propose_authority_change_from_config(
+                title=title,
+                rationale=rationale,
+                changes=parsed_changes,
+                source=source,
+                tags=tag,
+                branch_name=branch_name,
+                config_path=config,
+            ),
+            sort_keys=True,
+        )
+    )
 
 
 @app.command("search-index")
