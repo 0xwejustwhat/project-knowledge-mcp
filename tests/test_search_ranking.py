@@ -10,6 +10,7 @@ from project_knowledge_mcp.services import (
     index_project_from_config,
     search_decisions_from_config,
     search_open_questions_from_config,
+    search_ops_from_config,
 )
 
 
@@ -178,6 +179,94 @@ def test_candidate_fetch_uses_bm25_before_authority_post_ranking(tmp_path: Path)
     assert results[0].path == "docs/doctrine/zz-canonical.md"
 
 
+def test_authority_tier_dominates_exact_title_and_lexical_strength(tmp_path: Path):
+    repo = tmp_path / "ops"
+    state = tmp_path / "state"
+    write_doc(
+        repo,
+        "docs/decisions/accepted/zzz.md",
+        """
+        ---
+        title: Accepted Weak Match
+        type: decision
+        status: accepted
+        authority: accepted_decision
+        ---
+        # Accepted Weak Match
+
+        Alpha beta.
+        """,
+    )
+    write_doc(
+        repo,
+        "docs/decisions/draft/alpha-beta.md",
+        """
+        ---
+        title: Alpha Beta
+        type: decision
+        status: draft
+        authority: working
+        ---
+        # Alpha Beta
+
+        Alpha beta alpha beta alpha beta alpha beta alpha beta.
+        """,
+    )
+
+    index_repo(repo, state_dir=state, repo_id="ops", role="ops")
+
+    results = ProjectIndex.open(state).search("alpha beta", limit=2)
+
+    assert results[0].path == "docs/decisions/accepted/zzz.md"
+    assert results[0].authority == "accepted_decision"
+    assert results[1].authority == "working"
+
+
+def test_service_overfetch_preserves_authority_reranking_candidates(tmp_path: Path):
+    repo = tmp_path / "ops"
+    state = tmp_path / ".project-knowledge"
+    init_git_repo(repo)
+    for index in range(150):
+        write_doc(
+            repo,
+            f"docs/notes/noise-{index:03d}.md",
+            """
+            ---
+            title: High Lexical Noise
+            type: note
+            status: captured
+            authority: capture
+            ---
+            # High Lexical Noise
+
+            needle needle needle needle needle needle needle needle needle needle.
+            """,
+        )
+    write_doc(
+        repo,
+        "docs/doctrine/zz-low-lexical.md",
+        """
+        ---
+        title: Low Lexical Canonical Needle
+        type: doctrine
+        status: current
+        authority: canonical
+        ---
+        # Low Lexical Canonical Needle
+
+        needle.
+        """,
+    )
+    config_path = write_project_config(tmp_path, repo=repo, state_dir=state)
+    indexed = index_project_from_config(config_path=config_path)
+    assert indexed["status"] == "ok"
+
+    results = search_ops_from_config(query="needle", config_path=config_path, limit=5)
+
+    assert results["results"][0]["path"] == "docs/doctrine/zz-low-lexical.md"
+    assert results["results"][0]["authority"] == "canonical"
+
+
 def test_phase4_service_tools_scope_and_rank_typed_results(tmp_path: Path):
     repo = tmp_path / "ops"
     state = tmp_path / ".project-knowledge"
@@ -249,6 +338,22 @@ def test_phase4_service_tools_scope_and_rank_typed_results(tmp_path: Path):
     )
     write_doc(
         repo,
+        "docs/decisions/closed/context.md",
+        """
+        ---
+        title: Closed Context Decision
+        type: decision
+        status: closed
+        authority: historical
+        tags: [context]
+        ---
+        # Closed Context Decision
+
+        Closed context retrieval decision should not appear by default.
+        """,
+    )
+    write_doc(
+        repo,
         "docs/open-questions/context.md",
         """
         ---
@@ -267,6 +372,41 @@ def test_phase4_service_tools_scope_and_rank_typed_results(tmp_path: Path):
     )
     write_doc(
         repo,
+        "docs/open-questions/closed-context.md",
+        """
+        ---
+        title: Closed Context Question
+        type: open_question
+        status: closed
+        authority: historical
+        owner: Amin
+        tags: [context]
+        ---
+        # Closed Context Question
+
+        Closed context retrieval question should not appear by default.
+        """,
+    )
+    write_doc(
+        repo,
+        "docs/open-questions/superseded-context.md",
+        """
+        ---
+        title: Superseded Context Question
+        type: open_question
+        status: superseded
+        authority: superseded
+        superseded_by: docs/open-questions/context.md
+        owner: Amin
+        tags: [context]
+        ---
+        # Superseded Context Question
+
+        Superseded context retrieval question should appear only when explicitly requested.
+        """,
+    )
+    write_doc(
+        repo,
         "docs/notes/raw-context.md",
         "# Raw Context\n\nRaw context note should not appear in typed decision results.",
     )
@@ -277,6 +417,7 @@ def test_phase4_service_tools_scope_and_rank_typed_results(tmp_path: Path):
 
     decisions = search_decisions_from_config(query="context retrieval", config_path=config_path)
     assert [result["doc_type"] for result in decisions["results"]] == ["decision", "decision"]
+    assert {result["status"] for result in decisions["results"]} == {"accepted", "draft"}
     assert decisions["results"][0]["path"] == "docs/decisions/accepted/0001-context.md"
     assert decisions["results"][0]["authority"] == "accepted_decision"
     assert all(result["status"] != "superseded" for result in decisions["results"])
@@ -305,8 +446,19 @@ def test_phase4_service_tools_scope_and_rank_typed_results(tmp_path: Path):
         query="context retrieval", config_path=config_path
     )
     assert [result["doc_type"] for result in questions["results"]] == ["open_question"]
+    assert [result["status"] for result in questions["results"]] == ["open"]
     assert questions["results"][0]["owner"] == "Amin"
     assert questions["results"][0]["related_docs"] == ["docs/doctrine/context.md"]
+
+    questions_with_superseded = search_open_questions_from_config(
+        query="context retrieval",
+        config_path=config_path,
+        filters={"include_superseded": True},
+    )
+    assert {result["status"] for result in questions_with_superseded["results"]} == {
+        "open",
+        "superseded",
+    }
 
     invalid_scope = search_decisions_from_config(
         query="context", config_path=config_path, filters={"repo_id": "work"}
@@ -334,6 +486,28 @@ def test_phase4_service_tools_scope_and_rank_typed_results(tmp_path: Path):
     assert invalid_superseded_flag["results"] == []
     assert invalid_superseded_flag["error"]["code"] == "QUERY_INVALID"
 
+    invalid_limit = search_decisions_from_config(
+        query="context",
+        config_path=config_path,
+        limit="bad",  # type: ignore[arg-type]
+    )
+    assert invalid_limit["results"] == []
+    assert invalid_limit["error"]["code"] == "QUERY_INVALID"
+
+    invalid_bool_limit = search_decisions_from_config(
+        query="context",
+        config_path=config_path,
+        limit=True,  # type: ignore[arg-type]
+    )
+    assert invalid_bool_limit["results"] == []
+    assert invalid_bool_limit["error"]["code"] == "QUERY_INVALID"
+
+    invalid_decision_status = search_decisions_from_config(
+        query="context", config_path=config_path, filters={"status": "closed"}
+    )
+    assert invalid_decision_status["results"] == []
+    assert invalid_decision_status["error"]["code"] == "QUERY_INVALID"
+
     invalid_doctrine_status = get_current_doctrine_from_config(
         topic="context", config_path=config_path, filters={"status": "draft"}
     )
@@ -345,3 +519,19 @@ def test_phase4_service_tools_scope_and_rank_typed_results(tmp_path: Path):
     )
     assert invalid_filter["results"] == []
     assert invalid_filter["error"]["code"] == "QUERY_INVALID"
+
+    invalid_filter_container = search_ops_from_config(
+        query="context",
+        config_path=config_path,
+        filters="bad",  # type: ignore[arg-type]
+    )
+    assert invalid_filter_container["results"] == []
+    assert invalid_filter_container["error"]["code"] == "QUERY_INVALID"
+
+    invalid_typed_filter_container = search_decisions_from_config(
+        query="context",
+        config_path=config_path,
+        filters=["status"],  # type: ignore[arg-type]
+    )
+    assert invalid_typed_filter_container["results"] == []
+    assert invalid_typed_filter_container["error"]["code"] == "QUERY_INVALID"

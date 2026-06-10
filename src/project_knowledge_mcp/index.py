@@ -73,6 +73,16 @@ AUTHORITY_BOOST = {
     "superseded": -0.50,
     "rejected": -0.60,
 }
+AUTHORITY_RANK_BASE = {
+    "implementation_truth": 4.0,
+    "canonical": 3.0,
+    "accepted_decision": 2.0,
+    "working": 1.0,
+    "capture": 0.0,
+    "historical": -1.0,
+    "superseded": -2.0,
+    "rejected": -3.0,
+}
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
@@ -1009,7 +1019,11 @@ def _row_to_search_result(
 ) -> SearchResult:
     bm25_score = float(row[18])
     authority = str(row[9] or "working")
-    final_score = (relevance_score * 0.10) + AUTHORITY_BOOST.get(authority, 0.0)
+    final_score = (
+        AUTHORITY_RANK_BASE.get(authority, AUTHORITY_RANK_BASE["working"])
+        + (relevance_score * 0.10)
+        + AUTHORITY_BOOST.get(authority, 0.0)
+    )
     if _path_or_title_exact_match(original_query, path=str(row[5]), title=str(row[6])):
         final_score += 0.20
     if authority in {"superseded", "rejected"}:
