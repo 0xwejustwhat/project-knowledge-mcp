@@ -8,16 +8,17 @@ author: Hermes Agent
 created: 2026-06-09
 version: 0.5
 reviewed_after_step0: 2026-06-09
-snapshot_created: 2026-06-09
+snapshot_created: 2026-06-10
 canonical_source_repo: 0xwejustwhat/Project-Knowledge-MCP-ops
 canonical_source_path: docs/specs/0001-mvp-implementation-spec.md
-canonical_source_commit: 26e1e1aa0c3a909a7fc4ec5ec85c38af2efeef7d
-canonical_source_pr: https://github.com/0xwejustwhat/Project-Knowledge-MCP-ops/pull/4
+canonical_source_commit: cc9efa73b61f6fe7398b4e0f0f0313b6bf117199
+canonical_source_pr: https://github.com/0xwejustwhat/Project-Knowledge-MCP-ops/pull/5
 source_documents:
   - docs/PRD.md
   - docs/amendments/0001-capture-governance-reconciliation.md
   - docs/discussions/2026-06-09-initial-brainstorm-summary.md
   - docs/discussions/2026-06-09-local-parser-sqlite-codegraph-decision.md
+  - docs/decisions/0002-workspace-vs-snapshot-repo-source.md
   - project-knowledge-mcp:docs/decisions/0001-step-0-provider-evaluation.md
 ---
 
@@ -179,6 +180,7 @@ An evidence packet is a deterministic, structured object containing:
 - possible gaps;
 - source paths and line ranges where available;
 - authority/freshness metadata;
+- repository source mode metadata, including whether indexed evidence reflects the active workspace or a pinned snapshot;
 - Markdown rendering for humans/LLMs.
 
 The connected assistant turns the packet into a human answer.
@@ -273,7 +275,7 @@ As a developer, I want explicit repo freshness status before relying on context,
 
 Acceptance criteria:
 
-- `check_project_staleness()` reports branch, local HEAD, remote tracking branch, ahead/behind, dirty state, untracked files count, last indexed commit, and whether reindex is needed.
+- `check_project_staleness()` reports source mode, host path when known, container path, branch, local HEAD, remote tracking branch, ahead/behind, dirty state, untracked files count, last indexed commit, whether uncommitted changes are included, and whether reindex is needed.
 - If remote cannot be checked, response includes a warning rather than failing the whole tool.
 
 #### Story 9: Search Code With CodeGraph-Style Context and Safe Fallback
@@ -384,6 +386,28 @@ Assumptions:
 - MCP stdio must be supported for local clients.
 - A localhost-bound HTTP/StreamableHTTP mode should also be provided for tools that cannot launch stdio Docker commands directly.
 - The server must bind to loopback by default. Public/LAN exposure is out of default MVP behavior and requires explicit user configuration.
+
+### 4.1.1 Repo Source Modes
+
+PKMCP must distinguish the repository being edited from a repository snapshot used for deterministic analysis.
+
+**Workspace mode is the default for local development.** In workspace mode, the canonical repo lives on the host and Docker receives it through a bind mount. Humans and agents edit the host working tree; PKMCP indexes the mounted path inside the container. This ensures uncommitted edits, dirty state, and untracked files are visible to indexing and freshness checks.
+
+**Snapshot mode is opt-in.** In snapshot mode, setup or the container may clone a repo/ref/PR into container-managed storage for CI, demos, PR review, or deterministic remote analysis. Snapshot mode must disclose the pinned ref/commit and must not imply that uncommitted host changes are included.
+
+Required invariant: every repo status, index record, evidence packet, and staleness response must make the source explicit enough to answer: "Did this evidence come from the active workspace I am editing, or from a pinned snapshot?"
+
+At minimum, repo metadata should include:
+
+- `source_mode`: `workspace` or `snapshot`;
+- `host_path` when known/applicable;
+- `container_path` / configured repo path;
+- Git branch/ref and HEAD commit;
+- dirty state and untracked file count;
+- last indexed commit/time;
+- whether the indexed content includes uncommitted changes.
+
+The setup flow may offer clone-from-URL convenience, but for local developer workflows the result should still be a host clone bind-mounted into the container unless the user explicitly selects snapshot mode.
 
 ### 4.2 Example Docker Compose
 
@@ -503,6 +527,8 @@ repos:
   - id: ops
     role: ops
     name: Project Knowledge MCP Ops
+    source_mode: workspace
+    host_path: /root/work/Project-Knowledge-MCP-ops
     path: /workspace
     writable: true
     canonical_priority: high
@@ -518,6 +544,8 @@ repos:
   - id: ghostmesh
     role: work
     name: Ghost Mesh Runtime
+    source_mode: workspace
+    host_path: /root/work/ghostmesh
     path: /repos/ghostmesh
     writable: false
     include_globs:
@@ -611,6 +639,9 @@ On startup or `validate_config()`:
 - `project.id` must be non-empty and URL/path safe.
 - Every repo path must exist.
 - Every repo path must be a Git worktree unless `allow_non_git: true` is explicitly added in future.
+- Every repo must declare `source_mode: workspace` or `source_mode: snapshot`; omitted values may be normalized to `workspace` only for backward-compatible MVP configs, with a warning.
+- Workspace-mode repos should include `host_path` when running under Docker so status output can explain which host working tree is mounted.
+- Snapshot-mode repos must include enough provenance to identify the cloned source/ref/commit and must report `includes_uncommitted_changes: false` unless the snapshot was explicitly built from those changes.
 - Exactly one repo should have `role: ops` for MVP.
 - At least one repo must be configured.
 - If any repo has `writable: true`, the container filesystem must actually allow writes.
@@ -846,6 +877,8 @@ CREATE TABLE repos (
   id TEXT PRIMARY KEY,
   role TEXT NOT NULL,
   name TEXT NOT NULL,
+  source_mode TEXT NOT NULL DEFAULT 'workspace',
+  host_path TEXT,
   path TEXT NOT NULL,
   writable INTEGER NOT NULL DEFAULT 0,
   current_branch TEXT,
@@ -857,6 +890,9 @@ CREATE TABLE repos (
   behind_count INTEGER,
   dirty INTEGER,
   untracked_count INTEGER,
+  includes_uncommitted_changes INTEGER NOT NULL DEFAULT 0,
+  snapshot_ref TEXT,
+  snapshot_commit TEXT,
   last_status_checked_at TEXT,
   last_indexed_at TEXT,
   last_indexed_commit TEXT
