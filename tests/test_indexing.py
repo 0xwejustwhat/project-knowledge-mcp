@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 from textwrap import dedent
 
@@ -166,3 +167,103 @@ def test_index_persists_metadata_chunks_and_normalization_warnings(tmp_path: Pat
     assert warnings[0].path == "docs/decisions/typo-status.md"
     assert "Unknown status 'depreciated'" in warnings[0].message
     assert "authority='working'" in warnings[0].message
+
+
+def test_open_migrates_step1_index_before_searching_source_metadata(tmp_path: Path):
+    state = tmp_path / "state"
+    state.mkdir()
+    db_path = state / "index.sqlite3"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE repos (
+          id TEXT PRIMARY KEY,
+          role TEXT NOT NULL,
+          name TEXT NOT NULL,
+          path TEXT NOT NULL,
+          writable INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE documents (
+          id TEXT PRIMARY KEY,
+          repo_id TEXT NOT NULL,
+          path TEXT NOT NULL,
+          parser TEXT NOT NULL,
+          title TEXT,
+          doc_type TEXT,
+          status TEXT,
+          authority TEXT,
+          tags_json TEXT,
+          frontmatter_json TEXT,
+          superseded_by_json TEXT,
+          mtime REAL,
+          size_bytes INTEGER,
+          content_hash TEXT,
+          skipped INTEGER NOT NULL DEFAULT 0,
+          skip_reason TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(repo_id, path)
+        );
+        CREATE TABLE chunks (
+          rowid INTEGER PRIMARY KEY,
+          id TEXT UNIQUE NOT NULL,
+          document_id TEXT NOT NULL,
+          repo_id TEXT NOT NULL,
+          path TEXT NOT NULL,
+          heading_path_json TEXT,
+          chunk_index INTEGER NOT NULL,
+          start_line INTEGER,
+          end_line INTEGER,
+          page INTEGER,
+          text TEXT NOT NULL,
+          authority TEXT,
+          doc_type TEXT,
+          status TEXT,
+          content_hash TEXT
+        );
+        CREATE VIRTUAL TABLE chunks_fts USING fts5(
+          text,
+          content='chunks',
+          content_rowid='rowid',
+          tokenize='porter unicode61'
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO repos(id, role, name, path, writable) VALUES ('ops', 'ops', 'Ops', '/tmp/ops', 1)"
+    )
+    conn.execute(
+        """
+        INSERT INTO documents(
+          id, repo_id, path, parser, title, doc_type, status, authority,
+          tags_json, frontmatter_json, superseded_by_json, mtime, size_bytes,
+          content_hash, created_at, updated_at
+        ) VALUES (
+          'doc1', 'ops', 'docs/context.md', 'markdown', 'Context', 'note', 'draft', 'working',
+          '[]', '{}', '[]', 0, 10, 'hash', 'now', 'now'
+        )
+        """
+    )
+    cursor = conn.execute(
+        """
+        INSERT INTO chunks(
+          id, document_id, repo_id, path, heading_path_json, chunk_index, start_line, end_line,
+          text, authority, doc_type, status, content_hash
+        ) VALUES (
+          'chunk1', 'doc1', 'ops', 'docs/context.md', '[]', 0, 1, 1,
+          'legacy source metadata search', 'working', 'note', 'draft', 'hash'
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO chunks_fts(rowid, text) VALUES (?, ?)",
+        (cursor.lastrowid, "legacy source metadata search"),
+    )
+    conn.commit()
+    conn.close()
+
+    results = ProjectIndex.open(state).search("legacy source metadata", limit=1)
+
+    assert results[0].path == "docs/context.md"
+    assert results[0].source_mode == "workspace"
+    assert results[0].includes_uncommitted_changes is False

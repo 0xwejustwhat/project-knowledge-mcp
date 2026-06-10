@@ -25,9 +25,19 @@ poetry run python spikes/003-codegraphcontext-no-key/run_spike.py
 ## Minimal server smoke
 
 ```bash
-poetry run project-knowledge --transport stdio
-poetry run project-knowledge --transport http --host 127.0.0.1 --port 8765
+poetry run project-knowledge start --transport stdio
+poetry run project-knowledge start --transport http --host 127.0.0.1 --port 8765
 ```
+
+## Config-backed Step 2 tools
+
+```bash
+poetry run project-knowledge validate-config --config ./project.yaml
+poetry run project-knowledge index-project --config ./project.yaml
+poetry run project-knowledge search-ops "SQLite FTS5" --config ./project.yaml --limit 3
+```
+
+The same services are exposed through MCP tools: `validate_config`, `index_project`, and `search_ops`.
 
 MVP doctrine: the repo is memory; this MCP server is the deterministic access layer. It returns evidence packets and metadata. The connected assistant does synthesis.
 
