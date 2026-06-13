@@ -71,9 +71,7 @@ def test_streamable_http_transport_exposes_same_policy_enforced_tools():
     )
     try:
         http_tools, health = wait_for_http_mcp(port, process)
-        local_tools = asyncio.run(
-            _local_registry()
-        )
+        local_tools = asyncio.run(_local_registry())
         assert http_tools == local_tools == EXPECTED_TOOL_NAMES
         assert health["status"] == "ok"
         assert health["default_network_exposure"] == "loopback_or_stdio_only"

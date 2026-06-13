@@ -547,7 +547,9 @@ def setup_command(
     client: list[str] | None = typer.Option(
         None, "--client", help="Repeatable client snippet to include."
     ),
-    project_id: str | None = typer.Option(None, "--project-id", help="Project ID for generated config."),
+    project_id: str | None = typer.Option(
+        None, "--project-id", help="Project ID for generated config."
+    ),
     non_interactive: bool = typer.Option(
         False, "--non-interactive", help="Fail instead of prompting for missing values."
     ),
@@ -575,9 +577,13 @@ def setup_command(
 
 @app.command("print-client-config")
 def print_client_config_command(
-    config: Path = typer.Option(Path("project.yaml"), "--config", help="Project Knowledge config path."),
+    config: Path = typer.Option(
+        Path("project.yaml"), "--config", help="Project Knowledge config path."
+    ),
     client: str = typer.Option("hermes", "--client", help="Client type."),
-    transport: str = typer.Option("stdio", "--transport", help="stdio, streamable-http, or remote-https."),
+    transport: str = typer.Option(
+        "stdio", "--transport", help="stdio, streamable-http, or remote-https."
+    ),
     http_url: str | None = typer.Option(None, "--http-url", help="Loopback HTTP MCP URL."),
     remote_url: str | None = typer.Option(None, "--remote-url", help="Remote HTTPS MCP URL."),
 ) -> None:

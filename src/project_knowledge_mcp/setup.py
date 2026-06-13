@@ -257,9 +257,7 @@ def build_docker_guidance(
     ]
     for mount in repo_mounts:
         volume_args.append(
-            _volume_arg(
-                mount["host_path"], mount["container_path"], read_only=mount["read_only"]
-            )
+            _volume_arg(mount["host_path"], mount["container_path"], read_only=mount["read_only"])
         )
     run_command = " ".join(
         [

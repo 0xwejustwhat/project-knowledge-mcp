@@ -42,7 +42,9 @@ def test_compose_publishes_mcp_loopback_and_keeps_work_repos_read_only():
         "docker-compose.example.yaml"
     )
     command = service["command"]
-    assert ["--transport", "streamable-http"] == command[command.index("--transport") : command.index("--transport") + 2]
+    assert ["--transport", "streamable-http"] == command[
+        command.index("--transport") : command.index("--transport") + 2
+    ]
     assert ["--host", "0.0.0.0"] == command[command.index("--host") : command.index("--host") + 2]
     assert ["--port", "8000"] == command[command.index("--port") : command.index("--port") + 2]
 
@@ -63,7 +65,7 @@ def test_project_example_is_local_no_key_workspace_config():
 
 def test_caddyfile_requires_bearer_before_reverse_proxy():
     caddyfile = read_text("deploy/Caddyfile.example")
-    assert '{$PKMCP_SITE_ADDRESS:pkmcp.example.com}' in caddyfile
+    assert "{$PKMCP_SITE_ADDRESS:pkmcp.example.com}" in caddyfile
     assert '@missingAuth not header Authorization "Bearer {$MCP_AUTH_TOKEN}"' in caddyfile
     assert "respond @missingAuth 401" in caddyfile
     assert "reverse_proxy {$PKMCP_UPSTREAM:project-knowledge-mcp:8000}" in caddyfile
@@ -91,7 +93,9 @@ def test_readme_documents_same_tool_surface_and_remote_bridge_boundaries():
     assert "same FastMCP `/mcp` endpoint" in readme
     assert "cannot approve, merge, or mark proposals accepted" in readme
     assert "does not require `MCP_AUTH_TOKEN` for local-only" in readme
-    assert "remote-bridge service exits before Caddy starts unless you set a non-empty token" in readme
+    assert (
+        "remote-bridge service exits before Caddy starts unless you set a non-empty token" in readme
+    )
 
 
 def test_caddy_validate_when_binary_is_available():
