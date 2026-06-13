@@ -781,6 +781,39 @@ def search_code_from_config(
     if preflight_error is not None:
         return preflight_error
     assert config is not None
+    graph_provider = CodeGraphProvider(config)
+    graph_health = graph_provider.health()
+    warnings = list(graph_health.warnings)
+    active_provider = graph_health.active_provider
+    if graph_health.codegraph_healthy:
+        try:
+            results = graph_provider.search_code(query, repo_id=repo_id, limit=result_limit)
+        except RuntimeError:
+            if not config.code_context.fallback_on_unhealthy:
+                return _provider_unavailable(
+                    query,
+                    "CodeGraph search failed and text fallback is disabled",
+                    details={
+                        "configured_provider": config.code_context.provider,
+                        "active_provider": "unavailable",
+                        "codegraph_enabled": config.code_context.codegraph.enabled,
+                    },
+                    warnings=[*warnings, "CodeGraph search failed."],
+                )
+            warnings.append("CodeGraph search failed; using text fallback.")
+            active_provider = config.code_context.fallback_provider
+        else:
+            payload_results = [result.to_payload() for result in results]
+            return {
+                "tool": "search_code",
+                "query": query,
+                "project_id": config.project.id,
+                "configured_provider": graph_health.configured_provider,
+                "active_provider": "codegraph",
+                "results": payload_results,
+                "warnings": warnings,
+                "markdown": _render_code_markdown("Code Search Results", query, payload_results),
+            }
     try:
         provider = TextFallbackCodeContextProvider(config)
         results = provider.search_code(query, repo_id=repo_id, limit=result_limit)
@@ -805,14 +838,12 @@ def search_code_from_config(
             details={"repo_id": repo_id, "limit": result_limit},
         )
     payload_results = [result.to_payload() for result in results]
-    status = get_code_provider_status_from_config(config_path=config_path)
-    warnings = list(status.get("warnings", []))
     return {
         "tool": "search_code",
         "query": query,
         "project_id": config.project.id,
-        "configured_provider": status.get("configured_provider"),
-        "active_provider": status.get("active_provider"),
+        "configured_provider": graph_health.configured_provider,
+        "active_provider": active_provider,
         "results": payload_results,
         "warnings": warnings,
         "markdown": _render_code_markdown("Code Search Results", query, payload_results),
@@ -832,6 +863,42 @@ def get_code_context_from_config(
     if preflight_error is not None:
         return preflight_error
     assert config is not None
+    graph_provider = CodeGraphProvider(config)
+    graph_health = graph_provider.health()
+    warnings = list(graph_health.warnings)
+    active_provider = graph_health.active_provider
+    if graph_health.codegraph_healthy:
+        try:
+            results = graph_provider.get_code_context(
+                symbol_or_file, repo_id=repo_id, limit=result_limit
+            )
+        except RuntimeError:
+            if not config.code_context.fallback_on_unhealthy:
+                return _provider_unavailable(
+                    symbol_or_file,
+                    "CodeGraph context lookup failed and text fallback is disabled",
+                    details={
+                        "configured_provider": config.code_context.provider,
+                        "active_provider": "unavailable",
+                        "codegraph_enabled": config.code_context.codegraph.enabled,
+                    },
+                    warnings=[*warnings, "CodeGraph context lookup failed."],
+                )
+            warnings.append("CodeGraph context lookup failed; using text fallback.")
+            active_provider = config.code_context.fallback_provider
+        else:
+            payload_results = [result.to_payload() for result in results]
+            return {
+                "tool": "get_code_context",
+                "query": symbol_or_file,
+                "symbol_or_file": symbol_or_file,
+                "project_id": config.project.id,
+                "configured_provider": graph_health.configured_provider,
+                "active_provider": "codegraph",
+                "results": payload_results,
+                "warnings": warnings,
+                "markdown": _render_code_markdown("Code Context", symbol_or_file, payload_results),
+            }
     try:
         provider = TextFallbackCodeContextProvider(config)
         results = provider.get_code_context(symbol_or_file, repo_id=repo_id, limit=result_limit)
@@ -857,16 +924,15 @@ def get_code_context_from_config(
             details={"repo_id": repo_id, "limit": result_limit},
         )
     payload_results = [result.to_payload() for result in results]
-    status = get_code_provider_status_from_config(config_path=config_path)
     return {
         "tool": "get_code_context",
         "query": symbol_or_file,
         "symbol_or_file": symbol_or_file,
         "project_id": config.project.id,
-        "configured_provider": status.get("configured_provider"),
-        "active_provider": status.get("active_provider"),
+        "configured_provider": graph_health.configured_provider,
+        "active_provider": active_provider,
         "results": payload_results,
-        "warnings": list(status.get("warnings", [])),
+        "warnings": warnings,
         "markdown": _render_code_markdown("Code Context", symbol_or_file, payload_results),
     }
 
@@ -1246,6 +1312,12 @@ def _append_packet_section(lines: list[str], heading: str, results: list[dict[st
             [
                 f"{index}. **{title}**{label}",
                 f"   Source: `{source}`",
+            ]
+        )
+        if result.get("provider"):
+            lines.append(f"   provider: `{result['provider']}`")
+        lines.extend(
+            [
                 f"   Excerpt: {excerpt}",
                 "",
             ]

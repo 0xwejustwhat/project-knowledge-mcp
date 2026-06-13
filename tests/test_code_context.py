@@ -11,6 +11,7 @@ from project_knowledge_mcp.services import (
     get_code_context_from_config,
     get_code_provider_status_from_config,
     index_project_from_config,
+    retrieve_ops_code_evidence_from_config,
     search_code_from_config,
 )
 
@@ -120,6 +121,298 @@ def configured_project(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     return config_path, ops_repo, work_repo, state_dir
 
 
+def write_fake_codegraph(
+    root: Path,
+    *,
+    initialized: bool = True,
+    fail_explore: bool = False,
+    unparseable_explore: bool = False,
+    unfenced_explore: bool = False,
+    unsafe_explore_path: bool = False,
+    env_explore_path: bool = False,
+    env_dir_explore_path: bool = False,
+    hostile_explore_snippet: bool = False,
+    unnumbered_explore_snippet: bool = False,
+    malformed_fence_explore: bool = False,
+    symlink_explore_path: bool = False,
+    symlink_dir_explore_path: bool = False,
+    unparseable_node: bool = False,
+    wrong_status_path: bool = False,
+    omit_status_project_path: bool = False,
+    omit_status_index_path: bool = False,
+    initialized_text_false: bool = False,
+    hostile_status_fields: bool = False,
+    empty_node_snippet: bool = False,
+    hostile_node_metadata: bool = False,
+) -> Path:
+    command = root / "fake-codegraph"
+    command.write_text(
+        dedent(
+            f'''
+            #!/usr/bin/env python3
+            import json
+            import os
+            import sys
+
+            args = sys.argv[1:]
+            if os.environ.get("DO_NOT_TRACK") != "1" or os.environ.get("CODEGRAPH_TELEMETRY") != "0":
+                print("telemetry env not disabled", file=sys.stderr)
+                sys.exit(9)
+
+            if args and args[0] == "status":
+                project_path = "/tmp/not-the-configured-repo" if {str(wrong_status_path)} else args[1] if len(args) > 1 else "."
+                status = {{
+                    "initialized": "false" if {str(initialized_text_false)} else {str(initialized)},
+                    "version": "1.0.0",
+                    "fileCount": 3,
+                    "nodeCount": 8,
+                    "edgeCount": 5,
+                    "languages": ["python", "json"],
+                    "pendingChanges": {{"added": 0, "modified": 0, "removed": 0}},
+                }}
+                if not {str(omit_status_index_path)}:
+                    status["indexPath"] = project_path + "/.codegraph"
+                if not {str(omit_status_project_path)}:
+                    status["projectPath"] = project_path
+                if {str(hostile_status_fields)}:
+                    status["version"] = "--token=supersecret"
+                    status["languages"] = ["python", "../../secret"]
+                    status["pendingChanges"] = {{"added": 1, "secret": "do-not-return"}}
+                print(json.dumps(status))
+                sys.exit(0)
+
+            if args and args[0] == "explore":
+                if {str(fail_explore)}:
+                    print("explore failed", file=sys.stderr)
+                    sys.exit(7)
+                if {str(unparseable_explore)}:
+                    print("""## Provider diagnostic
+
+No concrete code result was found.
+Raw provider internals should not be exposed.
+""")
+                    sys.exit(0)
+                if {str(unfenced_explore)}:
+                    print("""## Exploration: compile_context evidence
+
+Found 1 symbol across 1 file.
+
+#### src/example.py — ExampleService(class)
+
+Provider diagnostic with no fenced source block.
+Raw provider internals should not be exposed.
+""")
+                    sys.exit(0)
+                if {str(unsafe_explore_path)}:
+                    print("""## Exploration: compile_context evidence
+
+Found 1 symbol across 1 file.
+
+#### ../secret_config.py — leaked(function)
+
+```python
+1\tPLACEHOLDER = \"do-not-return\"
+```
+""")
+                    sys.exit(0)
+                if {str(env_explore_path)}:
+                    print("""## Exploration: compile_context evidence
+
+Found 1 symbol across 1 file.
+
+#### .env.py — leaked(function)
+
+```python
+1\tPLACEHOLDER = \"do-not-return\"
+```
+""")
+                    sys.exit(0)
+                if {str(env_dir_explore_path)}:
+                    print("""## Exploration: compile_context evidence
+
+Found 1 symbol across 1 file.
+
+#### config/.env/settings.py — leaked(function)
+
+```python
+1\tPLACEHOLDER = \"do-not-return\"
+```
+""")
+                    sys.exit(0)
+                if {str(hostile_explore_snippet)}:
+                    print("""## Exploration: compile_context evidence
+
+Found 1 symbol across 1 file.
+
+#### src/example.py — --token=supersecret(secret)
+
+```python
+1\tPLACEHOLDER = \"do-not-return\"
+```
+""")
+                    sys.exit(0)
+                if {str(unnumbered_explore_snippet)}:
+                    print("""## Exploration: compile_context evidence
+
+Found 1 symbol across 1 file.
+
+#### src/example.py — ExampleService(class)
+
+```python
+class ExampleService:
+    PLACEHOLDER = \"do-not-return\"
+```
+""")
+                    sys.exit(0)
+                if {str(malformed_fence_explore)}:
+                    print("""## Exploration: compile_context evidence
+
+Found 1 symbol across 1 file.
+
+#### src/example.py — ExampleService(class)
+
+```python
+1\tclass ExampleService:
+2\t    PLACEHOLDER = \"do-not-return\"
+""")
+                    sys.exit(0)
+                if {str(symlink_explore_path)}:
+                    print("""## Exploration: compile_context evidence
+
+Found 1 symbol across 1 file.
+
+#### src/link.py — linked(function)
+
+```python
+1\tprint(\"symlink target\")
+```
+""")
+                    sys.exit(0)
+                if {str(symlink_dir_explore_path)}:
+                    print("""## Exploration: compile_context evidence
+
+Found 1 symbol across 1 file.
+
+#### src/alias/example.py — linked(function)
+
+```python
+1\tprint(\"symlink directory target\")
+```
+""")
+                    sys.exit(0)
+                print("""## Exploration: compile_context evidence
+
+Found 3 symbols across 3 files.
+
+#### src/example.py — ExampleService(class), compile_context(method)
+
+```python
+1\tclass ExampleService:
+2\t    def compile_context(self, topic: str) -> str:
+3\t        return f\"compiled evidence for {{topic}}\"
+```
+
+#### tests/test_example.py — test_compile_context_returns_evidence(function)
+
+```python
+1\tfrom src.example import ExampleService
+2\tdef test_compile_context_returns_evidence():
+3\t    assert ExampleService().compile_context(\"brief\")
+```
+
+#### schemas/example.schema.json — ExampleEvidence(schema)
+
+```json
+1\t{{\"title\": \"ExampleEvidence\"}}
+```
+""")
+                sys.exit(0)
+
+            if args and args[0] == "node":
+                if {str(unparseable_node)}:
+                    print("""## Provider diagnostic
+
+No concrete node location was found for this query.
+
+Raw provider internals should not be exposed.
+""")
+                    sys.exit(0)
+                name = args[-1]
+                if {str(empty_node_snippet)}:
+                    print("""## ExampleService (class)
+
+**Location:** src/example.py:1
+**Signature:** `class ExampleService`
+
+```python
+
+```
+
+Provider diagnostic with no source should not leak.
+""")
+                    sys.exit(0)
+                if {str(hostile_node_metadata)}:
+                    print("""## --token=supersecret (secret)
+
+**Location:** src/example.py:1
+**Signature:** `class ExampleService`
+
+```python
+1\tPLACEHOLDER = \"do-not-return\"
+```
+
+**Called by ←** --secret=do-not-return (tests/test_example.py:3)
+**Related files:** schemas/example.schema.json, ../secret.py
+""")
+                    sys.exit(0)
+                if name == "ExampleService":
+                    print("""## ExampleService (class)
+
+**Location:** src/example.py:1
+**Signature:** `class ExampleService`
+
+```python
+1\tclass ExampleService:
+2\t    def compile_context(self, topic: str) -> str:
+3\t        return f\"compiled evidence for {{topic}}\"
+```
+
+**Called by ←** test_compile_context_returns_evidence (tests/test_example.py:3)
+**Related files:** schemas/example.schema.json
+""")
+                    sys.exit(0)
+                print("""**src/example.py** — 3 lines, 1 symbol
+
+```python
+1\tclass ExampleService:
+2\t    def compile_context(self, topic: str) -> str:
+3\t        return f\"compiled evidence for {{topic}}\"
+```
+""")
+                sys.exit(0)
+
+            print("unexpected args: " + repr(args), file=sys.stderr)
+            sys.exit(2)
+            '''
+        )
+        .replace("\n            ", "\n")
+        .strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    command.chmod(0o755)
+    return command
+
+
+def configure_codegraph_command(config_path: Path, command: Path) -> None:
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            "    enabled: true\n", f"    enabled: true\n    command: {command.as_posix()}\n", 1
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_search_code_uses_text_fallback_for_indexed_work_repo(tmp_path: Path):
     config_path, _ops_repo, _work_repo, _state_dir = configured_project(tmp_path)
     indexed = index_project_from_config(config_path=config_path)
@@ -182,6 +475,495 @@ def test_code_provider_status_soft_fails_to_text_fallback(tmp_path: Path):
     assert status["work_repo_count"] == 1
     assert status["work_repos"] == ["app"]
     assert any("CodeGraph" in warning for warning in status["warnings"])
+
+
+def test_code_provider_status_reports_healthy_codegraph_from_configured_command(tmp_path: Path):
+    config_path, _ops_repo, _work_repo, _state_dir = configured_project(tmp_path)
+    command = write_fake_codegraph(tmp_path)
+    configure_codegraph_command(config_path, command)
+
+    status = get_code_provider_status_from_config(config_path=config_path)
+
+    assert status["status"] == "ok"
+    assert status["configured_provider"] == "codegraph"
+    assert status["active_provider"] == "codegraph"
+    assert status["codegraph_healthy"] is True
+    assert status["fallback_available"] is True
+    assert status["warnings"] == []
+    assert status["details"]["cli_path"] == command.name
+    assert status["details"]["indexed_repos"] == ["app"]
+    assert status["details"]["repo_statuses"][0]["file_count"] == 3
+    assert status["details"]["repo_statuses"][0]["index_present"] is True
+    assert status["details"]["repo_statuses"][0]["project_matches_config"] is True
+    assert status["details"]["repo_statuses"][0]["languages"] == ["python", "json"]
+
+
+def test_code_provider_status_sanitizes_hostile_provider_fields(tmp_path: Path):
+    config_path, _ops_repo, _work_repo, _state_dir = configured_project(tmp_path)
+    command = write_fake_codegraph(tmp_path, hostile_status_fields=True)
+    configure_codegraph_command(config_path, command)
+
+    status = get_code_provider_status_from_config(config_path=config_path)
+
+    repo_status = status["details"]["repo_statuses"][0]
+    assert status["active_provider"] == "codegraph"
+    assert repo_status["version"] is None
+    assert repo_status["languages"] == ["python"]
+    assert repo_status["pending_changes"] == {"added": 1}
+    assert "supersecret" not in str(status)
+    assert "--token" not in str(status)
+    assert "do-not-return" not in str(status)
+    assert "../../secret" not in str(status)
+
+
+def test_code_provider_status_does_not_expose_configured_command_arguments(tmp_path: Path):
+    config_path, _ops_repo, _work_repo, _state_dir = configured_project(tmp_path)
+    command = write_fake_codegraph(tmp_path)
+    configure_codegraph_command(config_path, command)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            f"command: {command.as_posix()}", f"command: {command.as_posix()} --token=supersecret"
+        ),
+        encoding="utf-8",
+    )
+
+    status = get_code_provider_status_from_config(config_path=config_path)
+
+    assert "command" not in status["details"]
+    assert status["details"]["command_configured"] is True
+    assert "supersecret" not in str(status)
+    assert "--token" not in str(status)
+
+
+def test_search_code_prefers_codegraph_and_normalizes_public_results(tmp_path: Path):
+    config_path, _ops_repo, _work_repo, _state_dir = configured_project(tmp_path)
+    command = write_fake_codegraph(tmp_path)
+    configure_codegraph_command(config_path, command)
+
+    payload = search_code_from_config(
+        query="compile_context evidence", config_path=config_path, repo_id="app", limit=5
+    )
+
+    assert payload["tool"] == "search_code"
+    assert payload["active_provider"] == "codegraph"
+    assert payload["warnings"] == []
+    assert [result["provider"] for result in payload["results"]] == [
+        "codegraph",
+        "codegraph",
+        "codegraph",
+    ]
+    first = payload["results"][0]
+    assert first == {
+        "repo_id": "app",
+        "path": "src/example.py",
+        "start_line": 1,
+        "end_line": 3,
+        "symbol": "ExampleService",
+        "kind": "class",
+        "snippet": (
+            "class ExampleService:\n"
+            "    def compile_context(self, topic: str) -> str:\n"
+            '        return f"compiled evidence for {topic}"'
+        ),
+        "provider": "codegraph",
+        "score": 1.0,
+        "related": [],
+    }
+    assert "raw" not in str(payload["results"]).lower()
+    assert "## Exploration" not in str(payload["results"])
+
+
+def test_search_code_uses_repo_source_not_provider_fenced_text(tmp_path: Path):
+    config_path, _ops_repo, _work_repo, _state_dir = configured_project(tmp_path)
+    command = write_fake_codegraph(tmp_path, hostile_explore_snippet=True)
+    configure_codegraph_command(config_path, command)
+
+    payload = search_code_from_config(
+        query="compile_context evidence", config_path=config_path, repo_id="app", limit=5
+    )
+
+    assert payload["active_provider"] == "codegraph"
+    assert payload["results"][0]["path"] == "src/example.py"
+    assert payload["results"][0]["symbol"] is None
+    assert payload["results"][0]["kind"] == "file"
+    assert payload["results"][0]["snippet"] == "class ExampleService:"
+    assert "supersecret" not in str(payload)
+    assert "--token" not in str(payload)
+    assert "do-not-return" not in str(payload)
+
+
+def test_get_code_context_uses_codegraph_related_evidence(tmp_path: Path):
+    config_path, _ops_repo, _work_repo, _state_dir = configured_project(tmp_path)
+    command = write_fake_codegraph(tmp_path)
+    configure_codegraph_command(config_path, command)
+
+    payload = get_code_context_from_config(
+        symbol_or_file="ExampleService", config_path=config_path, repo_id="app", limit=3
+    )
+
+    assert payload["tool"] == "get_code_context"
+    assert payload["active_provider"] == "codegraph"
+    assert payload["results"][0]["repo_id"] == "app"
+    assert payload["results"][0]["path"] == "src/example.py"
+    assert payload["results"][0]["symbol"] == "ExampleService"
+    assert payload["results"][0]["kind"] == "class"
+    assert payload["results"][0]["related"] == [
+        {
+            "kind": "caller",
+            "path": "tests/test_example.py",
+            "symbol": "test_compile_context_returns_evidence",
+            "line": "3",
+        },
+        {"kind": "related_file", "path": "schemas/example.schema.json"},
+    ]
+
+
+def test_get_code_context_sanitizes_provider_metadata_and_related_fields(tmp_path: Path):
+    config_path, _ops_repo, _work_repo, _state_dir = configured_project(tmp_path)
+    command = write_fake_codegraph(tmp_path, hostile_node_metadata=True)
+    configure_codegraph_command(config_path, command)
+
+    payload = get_code_context_from_config(
+        symbol_or_file="ExampleService", config_path=config_path, repo_id="app", limit=3
+    )
+
+    result = payload["results"][0]
+    assert payload["active_provider"] == "codegraph"
+    assert result["path"] == "src/example.py"
+    assert result["symbol"] is None
+    assert result["kind"] == "file"
+    assert result["snippet"] == "class ExampleService:"
+    assert result["related"] == [
+        {"kind": "caller", "path": "tests/test_example.py", "line": "3"},
+        {"kind": "related_file", "path": "schemas/example.schema.json"},
+    ]
+    assert "supersecret" not in str(payload)
+    assert "--token" not in str(payload)
+    assert "do-not-return" not in str(payload)
+    assert "../secret.py" not in str(payload)
+
+
+def test_evidence_packet_includes_graph_backed_code_results(tmp_path: Path):
+    config_path, _ops_repo, _work_repo, _state_dir = configured_project(tmp_path)
+    command = write_fake_codegraph(tmp_path)
+    configure_codegraph_command(config_path, command)
+    indexed = index_project_from_config(config_path=config_path, repo_id="ops")
+    assert indexed["status"] == "ok"
+
+    packet = retrieve_ops_code_evidence_from_config(
+        topic="compile_context evidence", config_path=config_path, limit=3
+    )
+
+    assert packet["tool"] == "retrieve_ops_code_evidence"
+    assert packet["sections"]["code"]
+    assert packet["sections"]["code"][0]["provider"] == "codegraph"
+    assert packet["gaps"] == []
+    assert "provider: `codegraph`" in packet["markdown"]
+
+
+def test_codegraph_search_failure_falls_back_with_explicit_warning(tmp_path: Path):
+    config_path, _ops_repo, _work_repo, _state_dir = configured_project(tmp_path)
+    command = write_fake_codegraph(tmp_path, fail_explore=True)
+    configure_codegraph_command(config_path, command)
+    index_project_from_config(config_path=config_path)
+
+    payload = search_code_from_config(
+        query="compile_context evidence", config_path=config_path, repo_id="app", limit=3
+    )
+
+    assert payload["active_provider"] == "text"
+    assert payload["results"][0]["provider"] == "text"
+    assert any("CodeGraph search failed" in warning for warning in payload["warnings"])
+    assert "explore failed" not in str(payload)
+
+
+def test_unrecognized_codegraph_explore_output_falls_back_without_raw_provider_text(tmp_path: Path):
+    config_path, _ops_repo, _work_repo, _state_dir = configured_project(tmp_path)
+    command = write_fake_codegraph(tmp_path, unparseable_explore=True)
+    configure_codegraph_command(config_path, command)
+    index_project_from_config(config_path=config_path)
+
+    payload = search_code_from_config(
+        query="compile_context evidence", config_path=config_path, repo_id="app", limit=3
+    )
+
+    assert payload["active_provider"] == "text"
+    assert payload["results"][0]["provider"] == "text"
+    assert any("CodeGraph search failed" in warning for warning in payload["warnings"])
+    assert "Provider diagnostic" not in str(payload)
+    assert "Raw provider internals" not in str(payload)
+
+
+def test_unfenced_codegraph_explore_output_falls_back_without_raw_provider_text(tmp_path: Path):
+    config_path, _ops_repo, _work_repo, _state_dir = configured_project(tmp_path)
+    command = write_fake_codegraph(tmp_path, unfenced_explore=True)
+    configure_codegraph_command(config_path, command)
+    index_project_from_config(config_path=config_path)
+
+    payload = search_code_from_config(
+        query="compile_context evidence", config_path=config_path, repo_id="app", limit=3
+    )
+
+    assert payload["active_provider"] == "text"
+    assert payload["results"][0]["provider"] == "text"
+    assert any("CodeGraph search failed" in warning for warning in payload["warnings"])
+    assert "Provider diagnostic" not in str(payload)
+    assert "Raw provider internals" not in str(payload)
+
+
+def test_malformed_codegraph_explore_fence_falls_back_without_raw_text(tmp_path: Path):
+    config_path, _ops_repo, _work_repo, _state_dir = configured_project(tmp_path)
+    command = write_fake_codegraph(tmp_path, malformed_fence_explore=True)
+    configure_codegraph_command(config_path, command)
+    index_project_from_config(config_path=config_path)
+
+    payload = search_code_from_config(
+        query="compile_context evidence", config_path=config_path, repo_id="app", limit=3
+    )
+
+    assert payload["active_provider"] == "text"
+    assert payload["results"][0]["provider"] == "text"
+    assert any("CodeGraph search failed" in warning for warning in payload["warnings"])
+    assert "do-not-return" not in str(payload)
+    assert "Provider diagnostic" not in str(payload)
+
+
+def test_unnumbered_codegraph_explore_snippet_falls_back_without_raw_text(tmp_path: Path):
+    config_path, _ops_repo, _work_repo, _state_dir = configured_project(tmp_path)
+    command = write_fake_codegraph(tmp_path, unnumbered_explore_snippet=True)
+    configure_codegraph_command(config_path, command)
+    index_project_from_config(config_path=config_path)
+
+    payload = search_code_from_config(
+        query="compile_context evidence", config_path=config_path, repo_id="app", limit=3
+    )
+
+    assert payload["active_provider"] == "text"
+    assert payload["results"][0]["provider"] == "text"
+    assert any("CodeGraph search failed" in warning for warning in payload["warnings"])
+    assert "do-not-return" not in str(payload)
+    assert "PLACEHOLDER" not in str(payload)
+
+
+def test_codegraph_rejects_env_like_provider_paths(tmp_path: Path):
+    config_path, _ops_repo, work_repo, _state_dir = configured_project(tmp_path)
+    write_file(work_repo, ".env.py", 'PLACEHOLDER = "do-not-return"')
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            'include_globs: ["README.md", "src/**/*.py", "tests/**/*.py", "schemas/**/*.json"]',
+            'include_globs: ["README.md", "src/**/*.py", "tests/**/*.py", "schemas/**/*.json", ".env.py"]',
+        ),
+        encoding="utf-8",
+    )
+    command = write_fake_codegraph(tmp_path, env_explore_path=True)
+    configure_codegraph_command(config_path, command)
+    index_project_from_config(config_path=config_path)
+
+    payload = search_code_from_config(
+        query="compile_context evidence", config_path=config_path, repo_id="app", limit=3
+    )
+
+    assert payload["active_provider"] == "text"
+    assert payload["results"][0]["provider"] == "text"
+    assert ".env.py" not in str(payload)
+    assert "do-not-return" not in str(payload)
+
+
+def test_codegraph_rejects_env_directory_provider_paths(tmp_path: Path):
+    config_path, _ops_repo, work_repo, _state_dir = configured_project(tmp_path)
+    write_file(work_repo, "config/.env/settings.py", 'PLACEHOLDER = "do-not-return"')
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            'include_globs: ["README.md", "src/**/*.py", "tests/**/*.py", "schemas/**/*.json"]',
+            'include_globs: ["README.md", "src/**/*.py", "tests/**/*.py", "schemas/**/*.json", "config/**/*.py"]',
+        ),
+        encoding="utf-8",
+    )
+    command = write_fake_codegraph(tmp_path, env_dir_explore_path=True)
+    configure_codegraph_command(config_path, command)
+    index_project_from_config(config_path=config_path)
+
+    payload = search_code_from_config(
+        query="compile_context evidence", config_path=config_path, repo_id="app", limit=3
+    )
+
+    assert payload["active_provider"] == "text"
+    assert payload["results"][0]["provider"] == "text"
+    assert "config/.env/settings.py" not in str(payload)
+    assert "do-not-return" not in str(payload)
+
+
+def test_codegraph_rejects_provider_paths_outside_repo_scope(tmp_path: Path):
+    config_path, _ops_repo, _work_repo, _state_dir = configured_project(tmp_path)
+    command = write_fake_codegraph(tmp_path, unsafe_explore_path=True)
+    configure_codegraph_command(config_path, command)
+    index_project_from_config(config_path=config_path)
+
+    payload = search_code_from_config(
+        query="compile_context evidence", config_path=config_path, repo_id="app", limit=3
+    )
+
+    assert payload["active_provider"] == "text"
+    assert payload["results"][0]["provider"] == "text"
+    assert "../secret_config.py" not in str(payload)
+    assert "do-not-return" not in str(payload)
+
+
+def test_codegraph_rejects_symlinked_provider_paths_before_resolution(tmp_path: Path):
+    config_path, _ops_repo, work_repo, _state_dir = configured_project(tmp_path)
+    (work_repo / "src" / "link.py").symlink_to(work_repo / "src" / "example.py")
+    command = write_fake_codegraph(tmp_path, symlink_explore_path=True)
+    configure_codegraph_command(config_path, command)
+    index_project_from_config(config_path=config_path)
+
+    payload = search_code_from_config(
+        query="compile_context evidence", config_path=config_path, repo_id="app", limit=3
+    )
+
+    assert payload["active_provider"] == "text"
+    assert payload["results"][0]["provider"] == "text"
+    assert "src/link.py" not in str(payload)
+    assert "symlink target" not in str(payload)
+
+
+def test_codegraph_rejects_symlinked_directory_provider_paths(tmp_path: Path):
+    config_path, _ops_repo, work_repo, _state_dir = configured_project(tmp_path)
+    (work_repo / "src" / "alias").symlink_to(work_repo / "src", target_is_directory=True)
+    command = write_fake_codegraph(tmp_path, symlink_dir_explore_path=True)
+    configure_codegraph_command(config_path, command)
+    index_project_from_config(config_path=config_path)
+
+    payload = search_code_from_config(
+        query="compile_context evidence", config_path=config_path, repo_id="app", limit=3
+    )
+
+    assert payload["active_provider"] == "text"
+    assert payload["results"][0]["provider"] == "text"
+    assert "src/alias/example.py" not in str(payload)
+    assert "symlink directory target" not in str(payload)
+
+
+def test_codegraph_status_rejects_wrong_provider_project_path(tmp_path: Path):
+    config_path, _ops_repo, _work_repo, _state_dir = configured_project(tmp_path)
+    command = write_fake_codegraph(tmp_path, wrong_status_path=True)
+    configure_codegraph_command(config_path, command)
+
+    status = get_code_provider_status_from_config(config_path=config_path)
+
+    assert status["active_provider"] == "text"
+    assert status["codegraph_healthy"] is False
+    assert status["details"]["repo_statuses"][0]["project_matches_config"] is False
+    assert "/tmp/not-the-configured-repo" not in str(status)
+
+
+def test_codegraph_status_rejects_missing_provider_project_path(tmp_path: Path):
+    config_path, _ops_repo, _work_repo, _state_dir = configured_project(tmp_path)
+    command = write_fake_codegraph(tmp_path, omit_status_project_path=True)
+    configure_codegraph_command(config_path, command)
+
+    status = get_code_provider_status_from_config(config_path=config_path)
+
+    assert status["active_provider"] == "text"
+    assert status["codegraph_healthy"] is False
+    assert status["details"]["repo_statuses"][0]["project_matches_config"] is False
+
+
+def test_codegraph_status_requires_boolean_initialized_true(tmp_path: Path):
+    config_path, _ops_repo, _work_repo, _state_dir = configured_project(tmp_path)
+    command = write_fake_codegraph(tmp_path, initialized_text_false=True)
+    configure_codegraph_command(config_path, command)
+
+    status = get_code_provider_status_from_config(config_path=config_path)
+
+    repo_status = status["details"]["repo_statuses"][0]
+    assert status["active_provider"] == "text"
+    assert status["codegraph_healthy"] is False
+    assert repo_status["initialized"] is False
+    assert repo_status["index_present"] is True
+
+
+def test_codegraph_status_requires_index_path(tmp_path: Path):
+    config_path, _ops_repo, _work_repo, _state_dir = configured_project(tmp_path)
+    command = write_fake_codegraph(tmp_path, omit_status_index_path=True)
+    configure_codegraph_command(config_path, command)
+
+    status = get_code_provider_status_from_config(config_path=config_path)
+
+    repo_status = status["details"]["repo_statuses"][0]
+    assert status["active_provider"] == "text"
+    assert status["codegraph_healthy"] is False
+    assert repo_status["initialized"] is True
+    assert repo_status["index_present"] is False
+
+
+def test_malformed_codegraph_command_soft_fails_to_text_fallback(tmp_path: Path):
+    config_path, _ops_repo, _work_repo, _state_dir = configured_project(tmp_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            "    enabled: true\n", "    enabled: true\n    command: '\"unterminated'\n", 1
+        ),
+        encoding="utf-8",
+    )
+
+    status = get_code_provider_status_from_config(config_path=config_path)
+
+    assert status["active_provider"] == "text"
+    assert status["codegraph_healthy"] is False
+    assert any("command configuration is invalid" in warning for warning in status["warnings"])
+    assert "unterminated" not in str(status)
+
+
+def test_option_only_codegraph_command_soft_fails_without_argv_leak(tmp_path: Path):
+    config_path, _ops_repo, _work_repo, _state_dir = configured_project(tmp_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            "    enabled: true\n", "    enabled: true\n    command: --token=supersecret\n", 1
+        ),
+        encoding="utf-8",
+    )
+
+    status = get_code_provider_status_from_config(config_path=config_path)
+
+    assert status["active_provider"] == "text"
+    assert status["codegraph_healthy"] is False
+    assert status["details"]["cli_path"] is None
+    assert any("command configuration is invalid" in warning for warning in status["warnings"])
+    assert "supersecret" not in str(status)
+    assert "--token" not in str(status)
+
+
+def test_unrecognized_codegraph_node_output_falls_back_without_raw_provider_text(tmp_path: Path):
+    config_path, _ops_repo, _work_repo, _state_dir = configured_project(tmp_path)
+    command = write_fake_codegraph(tmp_path, unparseable_node=True)
+    configure_codegraph_command(config_path, command)
+    index_project_from_config(config_path=config_path)
+
+    payload = get_code_context_from_config(
+        symbol_or_file="ExampleService", config_path=config_path, repo_id="app", limit=3
+    )
+
+    assert payload["active_provider"] == "text"
+    assert payload["results"][0]["provider"] == "text"
+    assert any("CodeGraph context lookup failed" in warning for warning in payload["warnings"])
+    assert "Provider diagnostic" not in str(payload)
+    assert "Raw provider internals" not in str(payload)
+
+
+def test_empty_codegraph_node_snippet_falls_back_without_raw_provider_text(tmp_path: Path):
+    config_path, _ops_repo, _work_repo, _state_dir = configured_project(tmp_path)
+    command = write_fake_codegraph(tmp_path, empty_node_snippet=True)
+    configure_codegraph_command(config_path, command)
+    index_project_from_config(config_path=config_path)
+
+    payload = get_code_context_from_config(
+        symbol_or_file="ExampleService", config_path=config_path, repo_id="app", limit=3
+    )
+
+    assert payload["active_provider"] == "text"
+    assert payload["results"][0]["provider"] == "text"
+    assert any("CodeGraph context lookup failed" in warning for warning in payload["warnings"])
+    assert "Provider diagnostic" not in str(payload)
+    assert "no source should not leak" not in str(payload)
 
 
 def test_search_code_rejects_repo_scope_widening_and_invalid_limit(tmp_path: Path):
