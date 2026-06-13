@@ -13,6 +13,7 @@ from project_knowledge_mcp.setup import (
     build_setup_plan,
     write_setup_artifacts,
 )
+from project_knowledge_mcp.setup_ui import run_setup_ui
 from project_knowledge_mcp.services import (
     add_project_note_from_config,
     check_project_staleness_from_config,
@@ -573,6 +574,20 @@ def setup_command(
     except (FileExistsError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     typer.echo(json.dumps(plan, sort_keys=True))
+
+
+@app.command("setup-ui")
+def setup_ui_command(
+    host: str = typer.Option(
+        "127.0.0.1", "--host", help="Local setup UI bind host. Must be loopback."
+    ),
+    port: int = typer.Option(8765, "--port", help="Local setup UI port."),
+) -> None:
+    """Start the localhost browser setup wizard for no-terminal onboarding."""
+    try:
+        run_setup_ui(host=host, port=port)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
 
 @app.command("print-client-config")

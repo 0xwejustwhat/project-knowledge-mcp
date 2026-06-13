@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" role="img" aria-label="Guided setup welcome placeholder">
+  <rect width="960" height="540" fill="#0f172a"/>
+  <rect x="80" y="80" width="800" height="380" rx="24" fill="#f8fafc"/>
+  <text x="130" y="165" font-family="Arial, sans-serif" font-size="38" font-weight="700" fill="#111827">Project Knowledge MCP guided setup</text>
+  <text x="130" y="225" font-family="Arial, sans-serif" font-size="24" fill="#374151">Local-first setup. No secrets written. Remote bridge off by default.</text>
+  <rect x="130" y="285" width="700" height="70" rx="12" fill="#dcfce7" stroke="#16a34a"/>
+  <text x="160" y="330" font-family="Arial, sans-serif" font-size="22" fill="#14532d">Start with folders, preview config, then connect your client.</text>
+</svg>
