@@ -1,0 +1,62 @@
+schema_version: 1
+project:
+  id: project-knowledge-mcp
+  name: Project Knowledge MCP
+  description: Local-first repo-grounded MCP evidence layer
+storage:
+  project_root: /workspace
+  state_dir: /workspace/.project-knowledge
+repos:
+  - id: ops
+    role: ops
+    name: Mounted workspace repository
+    source_mode: workspace
+    path: /workspace
+    writable: true
+    include_globs:
+      - README.md
+      - docs/**/*.md
+      - docs/*.md
+      - "*.md"
+      - src/**/*.py
+      - tests/**/*.py
+    exclude_globs:
+      - .git/**
+      - .project-knowledge/**
+      - .venv/**
+      - __pycache__/**
+      - .pytest_cache/**
+retrieval:
+  provider: sqlite_fts5
+  mode: local_no_llm
+  llm_enabled: false
+  embeddings_enabled: false
+  cloud_parsers_enabled: false
+  default_limit: 5
+  include_superseded_by_default: false
+indexing:
+  provider: local_parser_registry
+  max_file_bytes: 1000000
+  chunk_target_chars: 1800
+  chunk_overlap_chars: 200
+  auto_reindex_after_note_write: true
+code_context:
+  provider: codegraph
+  fallback_provider: text
+  required_for_code_repos: true
+  fallback_on_unhealthy: true
+  codegraph:
+    enabled: true
+    vector_resolve_enabled: false
+write_policy:
+  default_capture_repo: ops
+  default_capture_dir: docs/notes
+  allow_direct_capture: true
+  blocked_direct_write_globs:
+    - docs/doctrine/**
+    - docs/decisions/accepted/**
+    - docs/specs/**
+  proposal_dirs:
+    doctrine_delta: docs/proposals/doctrine-deltas
+    decision: docs/proposals/decisions
+    spec_change: docs/proposals/specs

@@ -24,6 +24,9 @@ def test_cli_help_lists_step1_index_commands():
     assert "get-code-provider-status" in result.output
     assert "retrieve-ops-code-evidence" in result.output
     assert "generate-session-brief" in result.output
+    assert "setup" in result.output
+    assert "status" in result.output
+    assert "print-client-config" in result.output
 
 
 def init_git_repo(path: Path) -> None:
@@ -77,6 +80,299 @@ write_policy:
         encoding="utf-8",
     )
     return config_path
+
+
+def test_setup_dry_run_generates_config_mount_and_client_instructions(tmp_path: Path):
+    ops_repo = tmp_path / "ops"
+    work_repo = tmp_path / "work"
+    init_git_repo(ops_repo)
+    init_git_repo(work_repo)
+    config_path = tmp_path / "project.yaml"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "setup",
+            "--non-interactive",
+            "--dry-run",
+            "--config",
+            str(config_path),
+            "--project-root",
+            str(tmp_path),
+            "--ops-repo",
+            str(ops_repo),
+            "--work-repo",
+            str(work_repo),
+            "--client",
+            "hermes",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "ok"
+    assert payload["dry_run"] is True
+    assert payload["would_write"] is False
+    assert payload["artifacts"]["config"]["path"] == str(config_path.resolve())
+    assert config_path.exists() is False
+    assert payload["config"]["retrieval"]["mode"] == "local_no_llm"
+    assert payload["config"]["retrieval"]["llm_enabled"] is False
+    assert payload["config"]["repos"][0]["role"] == "ops"
+    assert payload["docker"]["network_exposure"] == "loopback_only"
+    assert "127.0.0.1" in payload["docker"]["run_command"]
+    assert payload["docker"]["compose_command"] == (
+        "docker compose -f docker-compose.example.yaml up --build project-knowledge-mcp"
+    )
+    assert payload["client_configs"]["hermes"]["transport"] == "stdio"
+    assert payload["client_configs"]["hermes"]["config"]["env"]["PROJECT_KNOWLEDGE_CONFIG"] == str(
+        config_path.resolve()
+    )
+    assert payload["safety"]["starts_services"] is False
+    assert payload["safety"]["secrets_written"] is False
+    assert payload["remote_bridge"]["enabled_by_default"] is False
+    assert payload["remote_bridge"]["requires_https"] is True
+    assert payload["remote_bridge"]["authorization_header"] == "Authorization: Bearer [REDACTED]"
+
+
+def test_setup_writes_valid_config_and_refuses_overwrite_without_force(tmp_path: Path):
+    ops_repo = tmp_path / "ops"
+    work_repo = tmp_path / "work"
+    init_git_repo(ops_repo)
+    init_git_repo(work_repo)
+    config_path = tmp_path / "project.yaml"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "setup",
+            "--non-interactive",
+            "--config",
+            str(config_path),
+            "--project-root",
+            str(tmp_path),
+            "--ops-repo",
+            str(ops_repo),
+            "--work-repo",
+            str(work_repo),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "ok"
+    assert payload["would_write"] is True
+    assert payload["artifacts"]["config"]["written"] is True
+    assert config_path.exists()
+
+    validation = CliRunner().invoke(app, ["validate-config", "--config", str(config_path)])
+    assert validation.exit_code == 0, validation.output
+    assert json.loads(validation.output)["valid"] is True
+
+    refused = CliRunner().invoke(
+        app,
+        [
+            "setup",
+            "--non-interactive",
+            "--config",
+            str(config_path),
+            "--project-root",
+            str(tmp_path),
+            "--ops-repo",
+            str(ops_repo),
+        ],
+    )
+    assert refused.exit_code != 0
+    assert "already exists" in refused.output
+
+
+def test_print_client_config_outputs_policy_enforced_connection_snippets(tmp_path: Path):
+    repo = tmp_path / "ops"
+    state = tmp_path / ".project-knowledge"
+    init_git_repo(repo)
+    config_path = write_project_config(tmp_path, repo=repo, state_dir=state)
+
+    stdio_result = CliRunner().invoke(
+        app,
+        [
+            "print-client-config",
+            "--config",
+            str(config_path),
+            "--client",
+            "hermes",
+            "--transport",
+            "stdio",
+        ],
+    )
+    assert stdio_result.exit_code == 0, stdio_result.output
+    stdio = json.loads(stdio_result.output)
+    assert stdio["client"] == "hermes"
+    assert stdio["transport"] == "stdio"
+    assert stdio["config"]["command"] == "project-knowledge"
+    assert stdio["config"]["args"] == ["serve"]
+    assert stdio["config"]["env"]["PROJECT_KNOWLEDGE_CONFIG"] == str(config_path.resolve())
+    assert "token" not in json.dumps(stdio).lower()
+
+    remote_result = CliRunner().invoke(
+        app,
+        [
+            "print-client-config",
+            "--config",
+            str(config_path),
+            "--client",
+            "generic",
+            "--transport",
+            "remote-https",
+            "--remote-url",
+            "https://pkmcp.example.com/mcp",
+        ],
+    )
+    assert remote_result.exit_code == 0, remote_result.output
+    remote = json.loads(remote_result.output)
+    assert remote["client"] == "generic"
+    assert remote["transport"] == "remote-https"
+    assert remote["config"]["url"] == "https://pkmcp.example.com/mcp"
+    assert remote["config"]["headers"]["Authorization"] == "Bearer [REDACTED]"
+    assert remote["safety"]["remote_requires_explicit_bridge"] is True
+    assert "secret" not in json.dumps(remote).lower()
+
+    insecure_remote = CliRunner().invoke(
+        app,
+        [
+            "print-client-config",
+            "--config",
+            str(config_path),
+            "--client",
+            "generic",
+            "--transport",
+            "remote-https",
+            "--remote-url",
+            "http://pkmcp.example.com/mcp",
+        ],
+    )
+    assert insecure_remote.exit_code != 0
+    assert "https" in insecure_remote.output.lower()
+
+
+def test_status_reports_config_and_repo_freshness(tmp_path: Path):
+    repo = tmp_path / "ops"
+    state = tmp_path / ".project-knowledge"
+    init_git_repo(repo)
+    (repo / "README.md").write_text("# Ops\n", encoding="utf-8")
+    commit_all(repo, "initial")
+    config_path = write_project_config(tmp_path, repo=repo, state_dir=state)
+
+    result = CliRunner().invoke(app, ["status", "--config", str(config_path)])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "ok"
+    assert payload["config"]["valid"] is True
+    assert payload["project_id"] == "project-knowledge-mcp"
+    assert payload["staleness"]["status"] == "ok"
+    assert payload["staleness"]["repos"][0]["repo_id"] == "ops"
+    assert "## Project Staleness" in payload["markdown"]
+
+
+def test_print_client_config_rejects_unknown_client_or_transport(tmp_path: Path):
+    repo = tmp_path / "ops"
+    state = tmp_path / ".project-knowledge"
+    init_git_repo(repo)
+    config_path = write_project_config(tmp_path, repo=repo, state_dir=state)
+
+    bad_transport = CliRunner().invoke(
+        app,
+        [
+            "print-client-config",
+            "--config",
+            str(config_path),
+            "--client",
+            "generic",
+            "--transport",
+            "bogus",
+        ],
+    )
+    assert bad_transport.exit_code != 0
+    assert "transport" in bad_transport.output
+
+    bad_client = CliRunner().invoke(
+        app,
+        [
+            "print-client-config",
+            "--config",
+            str(config_path),
+            "--client",
+            "unknown",
+            "--transport",
+            "stdio",
+        ],
+    )
+    assert bad_client.exit_code != 0
+    assert "client" in bad_client.output
+
+
+def test_setup_dry_run_can_load_existing_config_without_repo_arguments(tmp_path: Path):
+    repo = tmp_path / "ops"
+    state = tmp_path / ".project-knowledge"
+    init_git_repo(repo)
+    config_path = write_project_config(tmp_path, repo=repo, state_dir=state)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "setup",
+            "--non-interactive",
+            "--dry-run",
+            "--config",
+            str(config_path),
+            "--client",
+            "hermes",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["dry_run"] is True
+    assert payload["artifacts"]["config"]["exists"] is True
+    assert payload["config"]["project"]["id"] == "project-knowledge-mcp"
+    assert payload["client_configs"]["hermes"]["config"]["env"]["PROJECT_KNOWLEDGE_CONFIG"] == str(
+        config_path.resolve()
+    )
+
+
+def test_setup_docker_guidance_starts_loopback_http_and_mounts_repo_paths(tmp_path: Path):
+    root_with_space = tmp_path / "project root"
+    ops_repo = tmp_path / "external ops"
+    work_repo = tmp_path / "external work"
+    root_with_space.mkdir()
+    init_git_repo(ops_repo)
+    init_git_repo(work_repo)
+    config_path = root_with_space / "project.yaml"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "setup",
+            "--non-interactive",
+            "--dry-run",
+            "--config",
+            str(config_path),
+            "--project-root",
+            str(root_with_space),
+            "--ops-repo",
+            str(ops_repo),
+            "--work-repo",
+            str(work_repo),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    run_command = payload["docker"]["run_command"]
+    assert "start --transport streamable-http --host 0.0.0.0 --port 8000" in run_command
+    assert "'" in run_command
+    mount_host_paths = {mount["host_path"] for mount in payload["docker"]["repo_mounts"]}
+    assert str(ops_repo.resolve()) in mount_host_paths
+    assert str(work_repo.resolve()) in mount_host_paths
 
 
 def test_cli_indexes_and_searches_project(tmp_path: Path):
