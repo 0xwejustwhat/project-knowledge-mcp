@@ -168,7 +168,16 @@ class SetupUIRequestHandler(BaseHTTPRequestHandler):
                 clients = payload.get("clients") or ["hermes"]
                 if isinstance(clients, str):
                     clients = [clients]
-                self._send_json(build_client_handoff(config_path, clients=list(clients)))
+                self._send_json(
+                    build_client_handoff(
+                        config_path,
+                        clients=list(clients),
+                        remote_bridge_enabled=bool(payload.get("remote_bridge_opt_in", False)),
+                        remote_url=str(payload["remote_url"])
+                        if payload.get("remote_url")
+                        else None,
+                    )
+                )
                 return
             if path == "/api/service/start":
                 config_path = Path(str(payload.get("config_path") or "project.yaml"))
@@ -184,6 +193,12 @@ class SetupUIRequestHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/service/stop":
                 self._send_json(self.server.service_manager.stop())
+                return
+            if path == "/api/remote-bridge/start":
+                self._send_json(_start_remote_bridge(Path(str(payload.get("project_root") or "."))))
+                return
+            if path == "/api/remote-bridge/stop":
+                self._send_json(_stop_remote_bridge(Path(str(payload.get("project_root") or "."))))
                 return
         except GuidedSetupError as exc:
             self._send_json(
@@ -261,6 +276,68 @@ class SetupUIRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+def _remote_bridge_compose_path(project_root: Path) -> Path:
+    return (
+        project_root.expanduser().resolve()
+        / ".project-knowledge"
+        / "remote-bridge"
+        / "docker-compose.remote-bridge.yaml"
+    )
+
+
+def _run_remote_bridge_compose(project_root: Path, action: str) -> dict[str, Any]:
+    compose_path = _remote_bridge_compose_path(project_root)
+    if not compose_path.exists():
+        raise GuidedSetupError(
+            "REMOTE_BRIDGE_NOT_CONFIGURED",
+            "Write setup with the HTTPS bridge toggle enabled before starting Caddy.",
+            details={"compose_path": str(compose_path)},
+        )
+    command = ["docker", "compose", "-f", str(compose_path), action]
+    if action == "up":
+        command.append("-d")
+    try:
+        result = subprocess.run(
+            command,
+            cwd=compose_path.parent,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except FileNotFoundError as exc:
+        raise GuidedSetupError(
+            "DOCKER_REQUIRED",
+            "Install Docker or Docker Desktop to run the managed Caddy HTTPS bridge.",
+            details={"command": command},
+        ) from exc
+    if result.returncode != 0:
+        raise GuidedSetupError(
+            "REMOTE_BRIDGE_DOCKER_FAILED",
+            "Docker could not start or stop the managed Caddy HTTPS bridge.",
+            details={
+                "command": command,
+                "returncode": result.returncode,
+                "stderr": result.stderr.strip(),
+            },
+        )
+    return {
+        "status": "ok",
+        "compose_path": str(compose_path),
+        "command": command,
+        "stdout": result.stdout.strip(),
+        "message": "Managed Caddy HTTPS bridge command completed.",
+    }
+
+
+def _start_remote_bridge(project_root: Path) -> dict[str, Any]:
+    return _run_remote_bridge_compose(project_root, "up")
+
+
+def _stop_remote_bridge(project_root: Path) -> dict[str, Any]:
+    return _run_remote_bridge_compose(project_root, "down")
+
+
 def create_setup_ui_server(host: str = "127.0.0.1", port: int = 8765) -> SetupUIServer:
     ensure_loopback_host(host)
     return SetupUIServer((host, port), SetupUIRequestHandler)
@@ -304,12 +381,19 @@ _HTML = """<!doctype html>
   <label>Code repo folders (one per line)<textarea id="work_repos" rows="4"></textarea></label>
   <label>Client<select id="client"><option>hermes</option><option>claude-desktop</option><option>cursor</option><option>generic</option></select></label>
   <label><input id="confirm_overwrite" type="checkbox" style="width:auto" /> Overwrite existing config if one is already there</label>
-  <p class="warn">Remote HTTPS bridge is intentionally not part of the happy path. Use local stdio or loopback HTTP first.</p>
+  <div class="warn">
+    <label><input id="remote_bridge_opt_in" type="checkbox" style="width:auto" /> Enable HTTPS remote bridge with managed Caddy</label>
+    <label>Public HTTPS URL<input id="remote_url" placeholder="https://pkmcp.example.com/mcp" /></label>
+    <label><input id="remote_bridge_risk_acknowledged" type="checkbox" style="width:auto" /> I understand this exposes the MCP server through a bearer-token-gated HTTPS bridge</label>
+    <p>If enabled, setup writes a Docker-managed Caddy bridge, a generated token file, and a redacted remote client snippet. Remote access stays off unless this toggle is enabled.</p>
+  </div>
   <button onclick="plan()">Preview setup</button>
   <button onclick="writeConfig()">Write config</button>
   <button onclick="startService()">Start local service</button>
   <button onclick="indexProject()">Run initial indexing</button>
   <button onclick="clientHandoff()">Show client connection snippet</button>
+  <button onclick="startRemoteBridge()">Start HTTPS bridge (Caddy)</button>
+  <button onclick="stopRemoteBridge()">Stop HTTPS bridge (Caddy)</button>
   <button onclick="stopService()">Stop local service</button>
   <pre id="out">Fill in folders, then preview setup.</pre>
 <script>
@@ -321,7 +405,10 @@ function payload() {
     ops_repo: document.getElementById('ops_repo').value,
     work_repos: document.getElementById('work_repos').value.split('\n').filter(Boolean),
     clients: [document.getElementById('client').value],
-    confirm_overwrite: document.getElementById('confirm_overwrite').checked
+    confirm_overwrite: document.getElementById('confirm_overwrite').checked,
+    remote_bridge_opt_in: document.getElementById('remote_bridge_opt_in').checked,
+    remote_bridge_risk_acknowledged: document.getElementById('remote_bridge_risk_acknowledged').checked,
+    remote_url: document.getElementById('remote_url').value
   };
 }
 async function post(path, body) {
@@ -337,7 +424,9 @@ function writeConfig() { post('/api/write', payload()); }
 function startService() { post('/api/service/start', {config_path: document.getElementById('config_path').value}); }
 function stopService() { post('/api/service/stop', {}); }
 function indexProject() { post('/api/index', {config_path: document.getElementById('config_path').value}); }
-function clientHandoff() { post('/api/client-handoff', {config_path: document.getElementById('config_path').value, clients: [document.getElementById('client').value]}); }
+function clientHandoff() { post('/api/client-handoff', payload()); }
+function startRemoteBridge() { post('/api/remote-bridge/start', {project_root: document.getElementById('project_root').value}); }
+function stopRemoteBridge() { post('/api/remote-bridge/stop', {project_root: document.getElementById('project_root').value}); }
 </script>
 </body>
 </html>
