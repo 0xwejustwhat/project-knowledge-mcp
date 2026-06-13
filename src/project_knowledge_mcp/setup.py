@@ -6,6 +6,7 @@ from typing import Any, Literal, cast
 
 import yaml
 
+from project_knowledge_mcp.codegraph_installer import ensure_codegraph_configured
 from project_knowledge_mcp.config import CONFIG_ENV_VAR
 
 ClientName = Literal["hermes", "claude-desktop", "cursor", "generic"]
@@ -315,6 +316,8 @@ def build_setup_plan(
         )
 
     selected_clients = clients or ["hermes"]
+    codegraph_setup = ensure_codegraph_configured(config, install=False)
+    config_yaml = dump_config_yaml(config)
     client_configs = {
         client: build_client_config(config_path=resolved_config, client=client, transport="stdio")
         for client in selected_clients
@@ -332,7 +335,8 @@ def build_setup_plan(
             }
         },
         "config": config,
-        "config_yaml": dump_config_yaml(config),
+        "config_yaml": config_yaml,
+        "codegraph_setup": codegraph_setup,
         "docker": build_docker_guidance(
             config_path=resolved_config, project_root=root, config=config
         ),
@@ -361,9 +365,15 @@ def write_setup_artifacts(plan: dict[str, Any], *, force: bool = False) -> dict[
     config_path = Path(plan["artifacts"]["config"]["path"])
     if config_path.exists() and not force:
         raise FileExistsError(f"Config already exists: {config_path}")
+    config = dict(plan["config"])
+    codegraph_setup = ensure_codegraph_configured(config, install=True)
+    config_yaml = dump_config_yaml(config)
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(plan["config_yaml"], encoding="utf-8")
+    config_path.write_text(config_yaml, encoding="utf-8")
     updated = dict(plan)
+    updated["config"] = config
+    updated["config_yaml"] = config_yaml
+    updated["codegraph_setup"] = codegraph_setup
     updated["artifacts"] = dict(plan["artifacts"])
     updated["artifacts"]["config"] = dict(plan["artifacts"]["config"])
     updated["artifacts"]["config"]["written"] = True

@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
+import sys
+import textwrap
 import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+import yaml
 
 from typer.testing import CliRunner
 
@@ -88,6 +93,122 @@ def test_guided_setup_invalid_repo_explains_failure_in_plain_language(tmp_path: 
     assert check["code"] == "REPO_PATH_MISSING"
     assert "could not find" in check["message"]
     assert "Git" not in check["message"]
+
+
+def write_fake_npm_installer(path: Path) -> Path:
+    command = path / "npm"
+    command.write_text(
+        textwrap.dedent(
+            f"""
+            #!{sys.executable}
+            import os
+            import stat
+            import sys
+            from pathlib import Path
+
+            args = sys.argv[1:]
+            if "install" not in args or "--prefix" not in args:
+                print("unexpected npm args: " + repr(args), file=sys.stderr)
+                sys.exit(2)
+            prefix = Path(args[args.index("--prefix") + 1])
+            bin_dir = prefix / "node_modules" / ".bin"
+            bin_dir.mkdir(parents=True, exist_ok=True)
+            codegraph = bin_dir / "codegraph"
+            codegraph.write_text(
+                "#!{sys.executable}\\n"
+                "import sys\\n"
+                "from pathlib import Path\\n"
+                "if '--version' in sys.argv:\\n"
+                "    print('1.0.0')\\n"
+                "    raise SystemExit(0)\\n"
+                "if len(sys.argv) >= 3 and sys.argv[1] == 'init':\\n"
+                f"    log = Path({(path / ".project-knowledge" / "codegraph-init.log").as_posix()!r})\\n"
+                "    log.parent.mkdir(parents=True, exist_ok=True)\\n"
+                "    log.write_text(sys.argv[2] + '\\\\n', encoding='utf-8')\\n"
+                "    print('initialized fake codegraph')\\n"
+                "    raise SystemExit(0)\\n"
+                "print('fake codegraph installed')\\n",
+                encoding="utf-8",
+            )
+            codegraph.chmod(codegraph.stat().st_mode | stat.S_IXUSR)
+            print("installed fake codegraph")
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    command.chmod(0o755)
+    return command
+
+
+def test_guided_setup_preview_reports_codegraph_will_be_installed_when_missing(
+    tmp_path: Path, monkeypatch
+):
+    ops_repo = tmp_path / "ops"
+    work_repo = tmp_path / "code"
+    init_git_repo(ops_repo)
+    init_git_repo(work_repo)
+    monkeypatch.setattr("project_knowledge_mcp.codegraph_installer.shutil.which", lambda name: None)
+
+    state = build_guided_setup_state(
+        GuidedSetupInput(
+            config_path=tmp_path / "project.yaml",
+            project_root=tmp_path,
+            ops_repo=ops_repo,
+            work_repos=[work_repo],
+            clients=["hermes"],
+        )
+    )
+
+    assert state["status"] == "ready"
+    assert state["codegraph_setup"]["status"] == "missing"
+    assert state["codegraph_setup"]["will_install_on_write"] is True
+    assert "CodeGraph" in state["codegraph_setup"]["message"]
+
+
+def test_guided_setup_installs_and_configures_codegraph_when_missing(tmp_path: Path, monkeypatch):
+    project_root = tmp_path / "project with spaces"
+    ops_repo = project_root / "ops"
+    work_repo = project_root / "code"
+    init_git_repo(ops_repo)
+    init_git_repo(work_repo)
+    fake_npm = write_fake_npm_installer(project_root)
+
+    def fake_which(name: str) -> str | None:
+        if name == "codegraph":
+            return None
+        if name == "npm":
+            return str(fake_npm)
+        return None
+
+    monkeypatch.setattr("project_knowledge_mcp.codegraph_installer.shutil.which", fake_which)
+    config_path = project_root / "project.yaml"
+
+    result = write_guided_setup_config(
+        GuidedSetupInput(
+            config_path=config_path,
+            project_root=project_root,
+            ops_repo=ops_repo,
+            work_repos=[work_repo],
+            clients=["hermes"],
+            project_id="project-with-spaces",
+        )
+    )
+
+    assert result["status"] == "ok"
+    assert result["written"]["codegraph_setup"]["status"] == "installed"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    command_string = config["code_context"]["codegraph"]["command"]
+    command_argv = shlex.split(command_string)
+    assert len(command_argv) == 1
+    command = Path(command_argv[0])
+    assert command.exists()
+    assert command.is_file()
+    assert ".project-knowledge/tools/codegraph-cli" in command.as_posix()
+    assert " " in command.as_posix()
+    assert (project_root / ".project-knowledge" / "codegraph-init.log").read_text(
+        encoding="utf-8"
+    ).strip() == work_repo.as_posix()
 
 
 def test_guided_setup_requires_explicit_overwrite_confirmation(tmp_path: Path):
