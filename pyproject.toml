@@ -14,11 +14,6 @@ python = "^3.12"
 fastmcp = "^3.4.2"
 pyyaml = "^6.0.3"
 typer = "^0.26.7"
-codegraphcontext = { version = "^0.4.17", optional = true }
-
-[tool.poetry.extras]
-codegraph = ["codegraphcontext"]
-
 [tool.poetry.group.dev.dependencies]
 pytest = "^9.0.0"
 ruff = "^0.14.0"

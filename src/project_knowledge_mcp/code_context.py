@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import ast
-import importlib.util
+import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -68,14 +68,13 @@ class CodeContextProvider(Protocol):
     ) -> list[CodeResult]: ...
 
 
-class CodeGraphContextProvider:
-    """Soft-failing adapter boundary for CodeGraphContext.
+class CodeGraphProvider:
+    """Soft-failing boundary for the external `colbymchenry/codegraph` provider.
 
-    Step 0 accepted CodeGraphContext as the first provider candidate with a known
-    limitation: the tested CLI output is human/Rich oriented rather than a stable
-    machine-readable response. Until a future adapter can prove a stable query
-    shape, this provider reports actionable health and lets services use text
-    fallback without leaking raw provider output.
+    Project Knowledge MCP does not vendor or import provider internals. The active
+    provider path is an operator-installed `codegraph` CLI / MCP sidecar. Health
+    detection is intentionally conservative: if the CLI or a repo-local index is
+    missing, report explicit fallback status instead of silently indexing.
     """
 
     def __init__(self, config: ProjectKnowledgeConfig):
@@ -83,30 +82,59 @@ class CodeGraphContextProvider:
 
     def health(self) -> CodeProviderHealth:
         codegraph = self.config.code_context.codegraph
-        installed = importlib.util.find_spec("codegraphcontext") is not None
+        binary = shutil.which("codegraph")
+        work_repos = [repo for repo in self.config.repos if repo.role == "work"]
+        indexed_repos = [repo for repo in work_repos if self._index_dir_for(repo).exists()]
         warnings: list[str] = []
+        healthy = False
+
         if not codegraph.enabled:
             warnings.append("CodeGraph is disabled by config; using text fallback.")
-        elif not installed:
-            warnings.append("CodeGraphContext package is not installed; using text fallback.")
-        else:
+        elif binary is None:
             warnings.append(
-                "CodeGraphContext adapter has no stable machine-readable query surface yet; "
-                "using text fallback until provider health is proven."
+                "CodeGraph CLI is not installed; install `colbymchenry/codegraph` and run "
+                "`codegraph init` for each configured work repo, or use text fallback."
             )
+        elif not work_repos:
+            warnings.append("No work repos are configured for CodeGraph context.")
+        elif not indexed_repos:
+            warnings.append(
+                "CodeGraph index not found for configured work repos; run `codegraph init` "
+                "from the repo before enabling the graph provider."
+            )
+        else:
+            healthy = True
+
         return CodeProviderHealth(
             configured_provider=self.config.code_context.provider,
-            active_provider=self.config.code_context.fallback_provider,
+            active_provider=(
+                "codegraph"
+                if healthy
+                else self.config.code_context.fallback_provider
+                if self.config.code_context.fallback_on_unhealthy
+                else "unavailable"
+            ),
             codegraph_enabled=codegraph.enabled,
-            codegraph_healthy=False,
+            codegraph_healthy=healthy,
             fallback_available=self.config.code_context.fallback_on_unhealthy,
             warnings=warnings,
             details={
-                "package_installed": installed,
+                "provider_repo": "https://github.com/colbymchenry/codegraph",
+                "cli_path": binary,
+                "indexed_repos": [repo.id for repo in indexed_repos],
+                "missing_index_repos": [
+                    repo.id for repo in work_repos if repo not in indexed_repos
+                ],
                 "index_dir": str(codegraph.index_dir) if codegraph.index_dir is not None else None,
-                "vector_resolve_enabled": codegraph.vector_resolve_enabled,
+                "telemetry_required_off": True,
             },
         )
+
+    def _index_dir_for(self, repo: RepoConfig) -> Path:
+        configured = self.config.code_context.codegraph.index_dir
+        if configured is not None:
+            return configured
+        return repo.path / ".codegraph"
 
 
 class TextFallbackCodeContextProvider:

@@ -8,7 +8,7 @@ created: 2026-06-13
 snapshot_created: 2026-06-13
 canonical_source_repo: 0xwejustwhat/Project-Knowledge-MCP-ops
 canonical_source_path: docs/runbooks/2026-06-13-step10-codegraph-guided-setup-release-gates.md
-canonical_source_commit: db899d5ed7d7403f1a08a417be063ef3352be301
+canonical_source_commit: 6b70fe8efb7607892291d22d75ff63936fadd4dc
 canonical_source_pr: https://github.com/0xwejustwhat/Project-Knowledge-MCP-ops/pull/7
 tags:
   - project-knowledge-mcp
@@ -46,7 +46,7 @@ Project Knowledge MCP fails its product goal if a normal user must be a computer
 
 The CLI is infrastructure for developers, CI, and automation. It is not the primary user experience. The user-facing setup path must be guided, local-first, safe by default, and explicit about network exposure.
 
-For codebases, text search is a degraded fallback. It is not the intended code-intelligence path. A codebase-oriented MVP must retrieve structured code evidence through a CodeGraph-style provider or an explicitly selected replacement that can answer symbol/file/test/schema relationship questions in stable machine-readable form.
+For codebases, text search is a degraded fallback. It is not the intended code-intelligence path. A codebase-oriented MVP must retrieve structured code evidence through the external CodeGraph provider from `colbymchenry/codegraph` (`https://github.com/colbymchenry/codegraph`) or an explicitly selected replacement that can answer symbol/file/test/schema relationship questions in stable machine-readable form. The provider is a separate codebase; Project Knowledge MCP shells out to the `codegraph` CLI / MCP sidecar and does not vendor or own CodeGraph internals.
 
 ## Current Baseline
 
@@ -63,7 +63,7 @@ As of the Step 8/9 merge, the code repo has:
 
 Known gaps:
 
-- CodeGraphContext is behind an adapter boundary but not healthy as the active code provider.
+- `colbymchenry/codegraph` is the selected CodeGraph provider candidate; the implementation must shell out to the external `codegraph` CLI / MCP sidecar rather than vendoring provider code.
 - Text fallback is available, but that only partially satisfies codebase-context value.
 - Setup is CLI-first, not guided/no-terminal user onboarding.
 - Docker/Caddy checks are not yet first-class release gates in CI.
@@ -80,10 +80,10 @@ Make codebase context genuinely valuable by integrating a real code-structure pr
 
 Step 10A owns:
 
-- CodeGraphContext candidate evaluation refresh;
+- `colbymchenry/codegraph` provider validation;
 - provider decision record;
-- adapter implementation if candidate passes;
-- replacement-provider selection if candidate fails;
+- shell-out adapter implementation for the external `codegraph` CLI / MCP sidecar;
+- replacement-provider selection only if `colbymchenry/codegraph` fails with recorded blocker evidence;
 - graph-backed `search_code`, `get_code_context`, and `get_code_provider_status` behavior;
 - evidence-packet use of graph-backed code results;
 - Docker/runtime proof for the chosen provider.
@@ -107,14 +107,14 @@ docs/decisions/0004-step10-codegraph-provider-decision.md
 
 The decision must answer:
 
-1. Can CodeGraphContext install cleanly in the canonical Python/Docker runtime?
-2. Can it index fixture and real code repos without credentials?
-3. Can it run with vector/embedding modes disabled?
-4. Does it expose stable machine-readable query output for files, symbols, and relationships?
+1. Can `colbymchenry/codegraph` install cleanly as an external CLI / MCP sidecar in the canonical Docker/runtime path?
+2. Can `codegraph init`, `codegraph status --json`, `codegraph explore`, and `codegraph node` operate on fixture and real code repos without credentials?
+3. Can it run local-only with telemetry disabled (`codegraph telemetry off`, `CODEGRAPH_TELEMETRY=0`, or `DO_NOT_TRACK=1`) and without LLM, embedding, GPU, OpenAI, or hosted parser requirements?
+4. Does it expose stable output that the adapter can normalize for files, symbols, and relationships without leaking provider-specific raw shapes?
 5. Can it return enough structure for tests, schemas, call relationships, and file context?
 6. What languages are supported well enough for expected users?
 7. How does it fail, and can the MCP server recover with text fallback and warnings?
-8. If rejected, what named replacement candidate is selected and why?
+8. If `colbymchenry/codegraph` is rejected, what named replacement candidate is selected and why?
 
 ## Acceptance Criteria
 
@@ -142,17 +142,19 @@ Step 10A is complete only when all of the following are true:
 
 ## Suggested Implementation Tasks
 
-### Task 10A.1: Refresh CodeGraphContext spike
+### Task 10A.1: Validate `colbymchenry/codegraph` provider
 
-- Re-run install/index/query against a tiny fixture repo and one real repo.
+- Install the external `codegraph` CLI / MCP sidecar from `https://github.com/colbymchenry/codegraph`.
+- Disable telemetry for the local-first product path.
+- Run `codegraph init`, `codegraph status --json`, `codegraph explore`, and `codegraph node` against a tiny fixture repo and one real repo.
 - Capture commands and raw evidence in `docs/spikes/` or in the decision doc appendix.
-- Verify Docker/Python runtime compatibility.
+- Verify Docker/runtime compatibility for shelling out to the external provider.
 
 ### Task 10A.2: Write provider decision doc
 
 - Record pass/fail evidence.
-- If CodeGraphContext passes, approve it as the active provider candidate.
-- If it fails, name the next replacement candidate and why.
+- Approve `colbymchenry/codegraph` as the active provider candidate unless blocker evidence rejects it.
+- If `colbymchenry/codegraph` fails, name the next replacement candidate and why.
 
 ### Task 10A.3: Add provider contract tests
 
@@ -349,8 +351,8 @@ Step 10C is complete only when all of the following are true:
 
 Recommended order:
 
-1. **10A decision first.** CodeGraph value determines whether the current provider candidate remains viable.
-2. **10B setup surface second, in parallel only after setup state boundaries are clear.** A guided setup UX should expose real provider status, not hide CodeGraph uncertainty.
+1. **10A decision first.** `colbymchenry/codegraph` provider evidence determines whether the selected external provider remains viable.
+2. **10B setup surface second, in parallel only after setup state boundaries are clear.** A guided setup UX should expose real external CodeGraph provider status, not hide provider uncertainty.
 3. **10C hardening continuously.** Add CI checks as soon as each behavior exists.
 
 The work can run in parallel only if each lane preserves the product gates:
@@ -363,7 +365,7 @@ The work can run in parallel only if each lane preserves the product gates:
 
 Step 10 is complete when:
 
-1. CodeGraph-style provider path is either healthy and integrated, or formally rejected with a selected replacement and implementation plan.
+1. The external `colbymchenry/codegraph` provider path is either healthy and integrated, or formally rejected with a selected replacement and implementation plan.
 2. Text fallback is clearly marked degraded mode, not the primary codebase value path.
 3. Guided setup exists for normal users and does not require terminal fluency for the happy path.
 4. Setup includes safe local lifecycle/status/indexing/client-handoff behavior.

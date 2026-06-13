@@ -14,7 +14,7 @@ from typing import Any
 import yaml
 
 from project_knowledge_mcp.code_context import (
-    CodeGraphContextProvider,
+    CodeGraphProvider,
     TextFallbackCodeContextProvider,
 )
 from project_knowledge_mcp.config import (
@@ -748,8 +748,8 @@ def get_code_provider_status_from_config(
         }
     config = load_project_config(config_path)
     work_repos = [repo for repo in config.repos if repo.role == "work"]
-    codegraph_health = CodeGraphContextProvider(config).health()
-    active_provider = "text" if config.code_context.fallback_on_unhealthy else "unavailable"
+    codegraph_health = CodeGraphProvider(config).health()
+    active_provider = codegraph_health.active_provider
     warnings = list(codegraph_health.warnings)
     if not work_repos:
         warnings.append("No work repos are configured for code context.")
@@ -1324,14 +1324,14 @@ def _code_context_preflight(
                 details={"repo_id": repo_id, "work_repos": [repo.id for repo in work_repos]},
             ),
         )
-    codegraph_health = CodeGraphContextProvider(config).health()
+    codegraph_health = CodeGraphProvider(config).health()
     if not codegraph_health.codegraph_healthy and not config.code_context.fallback_on_unhealthy:
         return (
             config,
             0,
             _provider_unavailable(
                 query,
-                "CodeGraphContext is unhealthy and text fallback is disabled",
+                "CodeGraph is unavailable and text fallback is disabled",
                 details={
                     "configured_provider": config.code_context.provider,
                     "active_provider": "unavailable",
