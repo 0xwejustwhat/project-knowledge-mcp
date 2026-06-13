@@ -46,6 +46,28 @@ If Poetry is unavailable in a local shell, tests can be run from the repo root w
 PYTHONPATH=src python3 -m pytest tests -q
 ```
 
+## Guided setup: recommended onboarding path
+
+Start the local browser setup wizard and follow the prompts:
+
+```bash
+poetry run project-knowledge setup-ui
+```
+
+The setup page is served on `http://127.0.0.1:8765/` by default. It guides a normal user through choosing an ops/project repo, choosing one or more code repos, validating paths, previewing config, confirming before writes, starting/checking the loopback local service, running initial indexing, and copying a client connection snippet.
+
+Safety defaults:
+
+- local-only browser app and MCP service binding;
+- per-run setup token and same-origin checks for setup actions;
+- no hosted SaaS account;
+- no LLM key, embedding key, cloud parser, GPU, or network API requirement;
+- no secrets written;
+- existing config files are not overwritten without explicit confirmation;
+- remote HTTPS bridge remains off unless separately and explicitly opted in behind a bearer token.
+
+Developer/automation alternatives remain available below.
+
 ## Configuration
 
 Copy or adapt the example config:
@@ -58,7 +80,7 @@ poetry run project-knowledge index-project --config ./project.yaml
 
 The Docker example expects the config at `/workspace/project.yaml`; the included `project.example.yaml` is therefore written with `/workspace` container paths.
 
-## Step 9 setup/client bootstrap
+## CLI setup/client bootstrap
 
 Use `setup` to preview or generate a local/no-LLM `project.yaml`, Docker mount guidance, and client snippets without manually assembling YAML:
 
