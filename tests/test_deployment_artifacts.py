@@ -21,7 +21,7 @@ def test_dockerfile_packages_same_project_knowledge_cli():
     assert "COPY pyproject.toml poetry.lock README.md" in dockerfile
     assert "COPY src ./src" in dockerfile
     assert "apt-get install -y --no-install-recommends git" in dockerfile
-    assert "python -m pip install ." in dockerfile
+    assert "python -m pip install '.[codegraph]'" in dockerfile
     assert "EXPOSE 8000" in dockerfile
     assert 'ENTRYPOINT ["project-knowledge"]' in dockerfile
     assert 'CMD ["start", "--transport", "stdio"]' in dockerfile

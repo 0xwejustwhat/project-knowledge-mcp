@@ -8,6 +8,7 @@ from textwrap import dedent
 import project_knowledge_mcp.services as services
 from fastmcp import Client
 
+from project_knowledge_mcp.code_context import CodeGraphContextProvider
 from project_knowledge_mcp.server import create_mcp
 
 
@@ -590,7 +591,8 @@ def test_mcp_phase4_search_tools_return_typed_results(tmp_path: Path):
     assert questions["results"][0]["owner"] == "Amin"
 
 
-def test_mcp_code_context_tools_return_text_fallback_results(tmp_path: Path):
+def test_mcp_code_context_tools_return_text_fallback_results(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(CodeGraphContextProvider, "_package_installed", lambda self: False)
     ops_repo = tmp_path / "ops"
     work_repo = tmp_path / "work"
     state = tmp_path / ".project-knowledge"

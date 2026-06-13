@@ -7,6 +7,7 @@ from textwrap import dedent
 
 from typer.testing import CliRunner
 
+from project_knowledge_mcp.code_context import CodeGraphContextProvider
 from project_knowledge_mcp.server import app
 
 
@@ -583,7 +584,8 @@ Context retrieval unresolved question.
     assert questions["results"][0]["owner"] == "Amin"
 
 
-def test_cli_code_context_commands_from_config(tmp_path: Path):
+def test_cli_code_context_commands_from_config(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(CodeGraphContextProvider, "_package_installed", lambda self: False)
     ops_repo = tmp_path / "ops"
     work_repo = tmp_path / "work"
     state = tmp_path / ".project-knowledge"

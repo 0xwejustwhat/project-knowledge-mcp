@@ -14,7 +14,9 @@ from typing import Any
 import yaml
 
 from project_knowledge_mcp.code_context import (
+    CodeContextProvider,
     CodeGraphContextProvider,
+    CodeProviderHealth,
     TextFallbackCodeContextProvider,
 )
 from project_knowledge_mcp.config import (
@@ -96,6 +98,17 @@ def index_project_from_config(
         )
         warnings.extend(f"{repo.id}: {warning}" for warning in repo_warnings)
 
+    codegraph_warnings = CodeGraphContextProvider(config).index_repos(selected_repos, force=force)
+    selected_work_repos = [repo for repo in selected_repos if repo.role == "work"]
+    codegraph_requested = config.code_context.codegraph.enabled and bool(selected_work_repos)
+    codegraph_indexed = codegraph_requested and not codegraph_warnings
+    codegraph_status = (
+        "indexed"
+        if codegraph_indexed
+        else ("warning" if codegraph_requested and codegraph_warnings else "skipped")
+    )
+    warnings.extend(codegraph_warnings)
+
     return {
         "status": "ok",
         "started_at": started_at,
@@ -105,6 +118,9 @@ def index_project_from_config(
         "force": force,
         "repos": repo_summaries,
         "warnings": warnings,
+        "codegraph_indexed": codegraph_indexed,
+        "codegraph_status": codegraph_status,
+        "codegraph_warnings": codegraph_warnings,
     }
 
 
@@ -726,6 +742,28 @@ def check_project_staleness_from_config(
     }
 
 
+def _active_code_context_provider(
+    config: ProjectKnowledgeConfig,
+) -> tuple[CodeContextProvider, CodeProviderHealth]:
+    codegraph_provider = CodeGraphContextProvider(config)
+    codegraph_health = codegraph_provider.health()
+    if codegraph_health.codegraph_healthy:
+        return codegraph_provider, codegraph_health
+    if config.code_context.fallback_on_unhealthy:
+        text_provider = TextFallbackCodeContextProvider(config)
+        text_health = text_provider.health()
+        return text_provider, CodeProviderHealth(
+            configured_provider=codegraph_health.configured_provider,
+            active_provider=text_health.active_provider,
+            codegraph_enabled=codegraph_health.codegraph_enabled,
+            codegraph_healthy=False,
+            fallback_available=text_health.fallback_available,
+            warnings=[*codegraph_health.warnings, *text_health.warnings],
+            details={**codegraph_health.details, "fallback_provider": "text"},
+        )
+    return codegraph_provider, codegraph_health
+
+
 def get_code_provider_status_from_config(
     *,
     config_path: Path | str | None = None,
@@ -749,18 +787,15 @@ def get_code_provider_status_from_config(
     config = load_project_config(config_path)
     work_repos = [repo for repo in config.repos if repo.role == "work"]
     codegraph_health = CodeGraphContextProvider(config).health()
-    active_provider = "text" if config.code_context.fallback_on_unhealthy else "unavailable"
     warnings = list(codegraph_health.warnings)
-    if not work_repos:
-        warnings.append("No work repos are configured for code context.")
     return {
         "status": "ok",
         "project_id": config.project.id,
-        "configured_provider": config.code_context.provider,
-        "active_provider": active_provider,
-        "codegraph_enabled": config.code_context.codegraph.enabled,
+        "configured_provider": codegraph_health.configured_provider,
+        "active_provider": codegraph_health.active_provider,
+        "codegraph_enabled": codegraph_health.codegraph_enabled,
         "codegraph_healthy": codegraph_health.codegraph_healthy,
-        "fallback_available": config.code_context.fallback_on_unhealthy and bool(work_repos),
+        "fallback_available": codegraph_health.fallback_available,
         "work_repo_count": len(work_repos),
         "work_repos": [repo.id for repo in work_repos],
         "warnings": warnings,
@@ -782,37 +817,82 @@ def search_code_from_config(
         return preflight_error
     assert config is not None
     try:
-        provider = TextFallbackCodeContextProvider(config)
+        provider, provider_health = _active_code_context_provider(config)
         results = provider.search_code(query, repo_id=repo_id, limit=result_limit)
     except (FileNotFoundError, sqlite3.Error, OSError):
-        return {
-            "tool": "search_code",
-            "query": query,
-            "results": [],
-            "warnings": ["Index is not ready; run index_project first."],
-            "markdown": "## Code Search Results\n\nIndex is not ready; run `index_project` first.",
-            "error": {
-                "code": "INDEX_NOT_READY",
-                "message": "Index is not ready; run index_project first.",
-                "details": {"state_dir": str(config.storage.state_dir)},
-                "recoverable": True,
-            },
-        }
+        if config.code_context.fallback_on_unhealthy:
+            try:
+                provider = TextFallbackCodeContextProvider(config)
+                results = provider.search_code(query, repo_id=repo_id, limit=result_limit)
+                provider_health = provider.health()
+                provider_health.warnings.append(
+                    "CodeGraph index is not ready; using text fallback."
+                )
+            except (FileNotFoundError, sqlite3.Error, OSError):
+                return {
+                    "tool": "search_code",
+                    "query": query,
+                    "results": [],
+                    "warnings": ["Index is not ready; run index_project first."],
+                    "markdown": "## Code Search Results\n\nIndex is not ready; run `index_project` first.",
+                    "error": {
+                        "code": "INDEX_NOT_READY",
+                        "message": "Index is not ready; run index_project first.",
+                        "details": {"state_dir": str(config.storage.state_dir)},
+                        "recoverable": True,
+                    },
+                }
+        else:
+            return {
+                "tool": "search_code",
+                "query": query,
+                "results": [],
+                "warnings": ["CodeGraph index is not ready and fallback is disabled."],
+                "markdown": "## Code Search Results\n\nCodeGraph index is not ready and fallback is disabled.",
+                "error": {
+                    "code": "CODEGRAPH_UNAVAILABLE",
+                    "message": "CodeGraph index is not ready and fallback is disabled.",
+                    "details": {"state_dir": str(config.storage.state_dir)},
+                    "recoverable": True,
+                },
+            }
     except ValueError as exc:
         return _query_invalid(
             query,
             str(exc),
             details={"repo_id": repo_id, "limit": result_limit},
         )
+    except Exception as exc:
+        if not config.code_context.fallback_on_unhealthy:
+            raise
+        try:
+            provider = TextFallbackCodeContextProvider(config)
+            results = provider.search_code(query, repo_id=repo_id, limit=result_limit)
+            provider_health = provider.health()
+            provider_health.warnings.append(f"CodeGraph query failed; using text fallback: {exc}")
+        except (FileNotFoundError, sqlite3.Error, OSError):
+            return {
+                "tool": "search_code",
+                "query": query,
+                "results": [],
+                "warnings": ["Index is not ready; run index_project first."],
+                "markdown": "## Code Search Results\n\nIndex is not ready; run `index_project` first.",
+                "error": {
+                    "code": "INDEX_NOT_READY",
+                    "message": "Index is not ready; run index_project first.",
+                    "details": {"state_dir": str(config.storage.state_dir)},
+                    "recoverable": True,
+                },
+            }
     payload_results = [result.to_payload() for result in results]
-    status = get_code_provider_status_from_config(config_path=config_path)
-    warnings = list(status.get("warnings", []))
+    warnings = list(provider_health.warnings)
     return {
         "tool": "search_code",
         "query": query,
         "project_id": config.project.id,
-        "configured_provider": status.get("configured_provider"),
-        "active_provider": status.get("active_provider"),
+        "configured_provider": provider_health.configured_provider,
+        "active_provider": provider_health.active_provider,
+        "codegraph_healthy": provider_health.codegraph_healthy,
         "results": payload_results,
         "warnings": warnings,
         "markdown": _render_code_markdown("Code Search Results", query, payload_results),
@@ -833,40 +913,104 @@ def get_code_context_from_config(
         return preflight_error
     assert config is not None
     try:
-        provider = TextFallbackCodeContextProvider(config)
+        provider, provider_health = _active_code_context_provider(config)
         results = provider.get_code_context(symbol_or_file, repo_id=repo_id, limit=result_limit)
+        if (
+            not results
+            and provider_health.active_provider == "codegraph"
+            and config.code_context.fallback_on_unhealthy
+        ):
+            fallback = TextFallbackCodeContextProvider(config)
+            fallback_results = fallback.get_code_context(
+                symbol_or_file, repo_id=repo_id, limit=result_limit
+            )
+            if fallback_results:
+                results = fallback_results
+                provider_health = fallback.health()
+                provider_health.warnings.append(
+                    "CodeGraph returned no direct file context; using text fallback for this request."
+                )
     except (FileNotFoundError, sqlite3.Error, OSError):
-        return {
-            "tool": "get_code_context",
-            "query": symbol_or_file,
-            "symbol_or_file": symbol_or_file,
-            "results": [],
-            "warnings": ["Index is not ready; run index_project first."],
-            "markdown": "## Code Context\n\nIndex is not ready; run `index_project` first.",
-            "error": {
-                "code": "INDEX_NOT_READY",
-                "message": "Index is not ready; run index_project first.",
-                "details": {"state_dir": str(config.storage.state_dir)},
-                "recoverable": True,
-            },
-        }
+        if config.code_context.fallback_on_unhealthy:
+            try:
+                provider = TextFallbackCodeContextProvider(config)
+                results = provider.get_code_context(
+                    symbol_or_file, repo_id=repo_id, limit=result_limit
+                )
+                provider_health = provider.health()
+                provider_health.warnings.append(
+                    "CodeGraph index is not ready; using text fallback."
+                )
+            except (FileNotFoundError, sqlite3.Error, OSError):
+                return {
+                    "tool": "get_code_context",
+                    "query": symbol_or_file,
+                    "symbol_or_file": symbol_or_file,
+                    "results": [],
+                    "warnings": ["Index is not ready; run index_project first."],
+                    "markdown": "## Code Context\n\nIndex is not ready; run `index_project` first.",
+                    "error": {
+                        "code": "INDEX_NOT_READY",
+                        "message": "Index is not ready; run index_project first.",
+                        "details": {"state_dir": str(config.storage.state_dir)},
+                        "recoverable": True,
+                    },
+                }
+        else:
+            return {
+                "tool": "get_code_context",
+                "query": symbol_or_file,
+                "symbol_or_file": symbol_or_file,
+                "results": [],
+                "warnings": ["CodeGraph index is not ready and fallback is disabled."],
+                "markdown": "## Code Context\n\nCodeGraph index is not ready and fallback is disabled.",
+                "error": {
+                    "code": "CODEGRAPH_UNAVAILABLE",
+                    "message": "CodeGraph index is not ready and fallback is disabled.",
+                    "details": {"state_dir": str(config.storage.state_dir)},
+                    "recoverable": True,
+                },
+            }
     except ValueError as exc:
         return _query_invalid(
             symbol_or_file,
             str(exc),
             details={"repo_id": repo_id, "limit": result_limit},
         )
+    except Exception as exc:
+        if not config.code_context.fallback_on_unhealthy:
+            raise
+        try:
+            provider = TextFallbackCodeContextProvider(config)
+            results = provider.get_code_context(symbol_or_file, repo_id=repo_id, limit=result_limit)
+            provider_health = provider.health()
+            provider_health.warnings.append(f"CodeGraph query failed; using text fallback: {exc}")
+        except (FileNotFoundError, sqlite3.Error, OSError):
+            return {
+                "tool": "get_code_context",
+                "query": symbol_or_file,
+                "symbol_or_file": symbol_or_file,
+                "results": [],
+                "warnings": ["Index is not ready; run index_project first."],
+                "markdown": "## Code Context\n\nIndex is not ready; run `index_project` first.",
+                "error": {
+                    "code": "INDEX_NOT_READY",
+                    "message": "Index is not ready; run index_project first.",
+                    "details": {"state_dir": str(config.storage.state_dir)},
+                    "recoverable": True,
+                },
+            }
     payload_results = [result.to_payload() for result in results]
-    status = get_code_provider_status_from_config(config_path=config_path)
     return {
         "tool": "get_code_context",
         "query": symbol_or_file,
         "symbol_or_file": symbol_or_file,
         "project_id": config.project.id,
-        "configured_provider": status.get("configured_provider"),
-        "active_provider": status.get("active_provider"),
+        "configured_provider": provider_health.configured_provider,
+        "active_provider": provider_health.active_provider,
+        "codegraph_healthy": provider_health.codegraph_healthy,
         "results": payload_results,
-        "warnings": list(status.get("warnings", [])),
+        "warnings": list(provider_health.warnings),
         "markdown": _render_code_markdown("Code Context", symbol_or_file, payload_results),
     }
 
@@ -1324,6 +1468,16 @@ def _code_context_preflight(
                 details={"repo_id": repo_id, "work_repos": [repo.id for repo in work_repos]},
             ),
         )
+    if not _valid_code_context_query(query):
+        return (
+            config,
+            0,
+            _query_invalid(
+                query,
+                "code search query must include at least one letter, number, underscore, dot, slash, or hyphen",
+                details={"query": query},
+            ),
+        )
     codegraph_health = CodeGraphContextProvider(config).health()
     if not codegraph_health.codegraph_healthy and not config.code_context.fallback_on_unhealthy:
         return (
@@ -1388,6 +1542,10 @@ def _provider_unavailable(
         "error": error,
         "errors": [error],
     }
+
+
+def _valid_code_context_query(query: str) -> bool:
+    return bool(re.search(r"[A-Za-z0-9_./-]", query or ""))
 
 
 def _load_validated_config_for_write(

@@ -1078,17 +1078,24 @@ def worktree_fingerprint(repo_path: Path, porcelain: str) -> str:
 
 
 def _filter_state_dir_status(repo_path: Path, porcelain: str, *, state_dir: Path | None) -> str:
-    if state_dir is None:
-        return porcelain
-    try:
-        state_relative = state_dir.resolve().relative_to(repo_path.resolve()).as_posix()
-    except ValueError:
-        return porcelain
-    state_prefix = state_relative.rstrip("/") + "/"
     kept_lines: list[str] = []
+    ignored_relatives = {".cgcignore"}
+    state_relative: str | None = None
+    state_prefix: str | None = None
+    if state_dir is not None:
+        try:
+            state_relative = state_dir.resolve().relative_to(repo_path.resolve()).as_posix()
+            state_prefix = state_relative.rstrip("/") + "/"
+        except ValueError:
+            state_relative = None
+            state_prefix = None
     for line in porcelain.splitlines():
         relative = _status_relative_path(line)
-        if relative == state_relative or (relative and relative.startswith(state_prefix)):
+        if relative in ignored_relatives:
+            continue
+        if state_relative and (
+            relative == state_relative or (relative and relative.startswith(state_prefix or ""))
+        ):
             continue
         kept_lines.append(line)
     return "\n".join(kept_lines) + ("\n" if kept_lines else "")

@@ -6,6 +6,8 @@ from textwrap import dedent
 
 import pytest
 
+from project_knowledge_mcp.code_context import CodeGraphContextProvider
+from project_knowledge_mcp.config import load_project_config
 from project_knowledge_mcp.index import index_repo
 from project_knowledge_mcp.services import (
     get_code_context_from_config,
@@ -120,7 +122,39 @@ def configured_project(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     return config_path, ops_repo, work_repo, state_dir
 
 
-def test_search_code_uses_text_fallback_for_indexed_work_repo(tmp_path: Path):
+def activate_fake_codegraph(
+    monkeypatch: pytest.MonkeyPatch, config_path: Path, work_repo: Path
+) -> None:
+    config = load_project_config(config_path)
+    provider = CodeGraphContextProvider(config)
+    work_config = next(repo for repo in config.repos if repo.id == "app")
+    provider._write_provenance([work_config])
+    monkeypatch.setattr(CodeGraphContextProvider, "_package_installed", lambda self: True)
+    monkeypatch.setattr(
+        CodeGraphContextProvider,
+        "_indexed_repo_paths",
+        lambda self: {"app": str(work_repo.resolve())},
+    )
+
+
+def fake_codegraph_rows(work_repo: Path) -> list[dict[str, object]]:
+    return [
+        {
+            "label": "Function",
+            "name": "compile_context",
+            "path": str((work_repo / "src/example.py").resolve()),
+            "line_number": 2,
+            "end_line": 3,
+            "source": "def compile_context(self, topic: str) -> str:\n    return f'compiled evidence for {topic}'",
+            "provider_internal_shape": {"must_not_leak": True},
+        }
+    ]
+
+
+def test_search_code_uses_text_fallback_for_indexed_work_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(CodeGraphContextProvider, "_package_installed", lambda self: False)
     config_path, _ops_repo, _work_repo, _state_dir = configured_project(tmp_path)
     indexed = index_project_from_config(config_path=config_path)
     assert indexed["status"] == "ok"
@@ -147,7 +181,164 @@ def test_search_code_uses_text_fallback_for_indexed_work_repo(tmp_path: Path):
     assert "## Code Search Results" in payload["markdown"]
 
 
-def test_get_code_context_resolves_symbol_and_file_path(tmp_path: Path):
+def test_search_code_prefers_healthy_codegraph_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    config_path, _ops_repo, work_repo, _state_dir = configured_project(tmp_path)
+    indexed = index_project_from_config(config_path=config_path)
+    assert indexed["status"] == "ok"
+    activate_fake_codegraph(monkeypatch, config_path, work_repo)
+    monkeypatch.setattr(
+        CodeGraphContextProvider,
+        "_query_code_elements",
+        lambda self, repo, query, per_label_limit: fake_codegraph_rows(work_repo),
+    )
+    monkeypatch.setattr(
+        CodeGraphContextProvider,
+        "_graph_call_related",
+        lambda self, repo, path, symbol, limit: [
+            {
+                "repo_id": repo.id,
+                "path": "tests/test_example.py",
+                "symbol": "test_compile_context_returns_evidence",
+                "kind": "test",
+                "relation": "called_by",
+                "provider": "codegraph",
+            }
+        ],
+    )
+
+    status = get_code_provider_status_from_config(config_path=config_path)
+    payload = search_code_from_config(
+        query="compile_context evidence", config_path=config_path, repo_id="app", limit=5
+    )
+
+    assert status["active_provider"] == "codegraph"
+    assert status["codegraph_healthy"] is True
+    assert payload["active_provider"] == "codegraph"
+    assert payload["codegraph_healthy"] is True
+    result = payload["results"][0]
+    assert result == {
+        "repo_id": "app",
+        "path": "src/example.py",
+        "start_line": 2,
+        "end_line": 3,
+        "symbol": "compile_context",
+        "kind": "code",
+        "snippet": "def compile_context(self, topic: str) -> str:\n    return f'compiled evidence for {topic}'",
+        "provider": "codegraph",
+        "score": result["score"],
+        "related": result["related"],
+    }
+    assert isinstance(result["score"], float)
+    assert result["related"][0]["path"] == "tests/test_example.py"
+    assert "provider_internal_shape" not in result
+
+
+def test_get_code_context_uses_codegraph_file_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    config_path, _ops_repo, work_repo, _state_dir = configured_project(tmp_path)
+    index_project_from_config(config_path=config_path)
+    activate_fake_codegraph(monkeypatch, config_path, work_repo)
+    monkeypatch.setattr(
+        CodeGraphContextProvider,
+        "_file_context",
+        lambda self, repo, relative_path, limit: [
+            self._row_to_result(repo, fake_codegraph_rows(work_repo)[0], query=relative_path)
+        ],
+    )
+    monkeypatch.setattr(
+        CodeGraphContextProvider,
+        "_graph_call_related",
+        lambda self, repo, path, symbol, limit: [],
+    )
+
+    payload = get_code_context_from_config(
+        symbol_or_file="src/example.py", config_path=config_path, repo_id="app", limit=3
+    )
+
+    assert payload["active_provider"] == "codegraph"
+    assert payload["results"][0]["provider"] == "codegraph"
+    assert payload["results"][0]["path"] == "src/example.py"
+    assert payload["results"][0]["symbol"] == "compile_context"
+
+
+def test_codegraph_query_failure_falls_back_with_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    config_path, _ops_repo, work_repo, _state_dir = configured_project(tmp_path)
+    index_project_from_config(config_path=config_path)
+    activate_fake_codegraph(monkeypatch, config_path, work_repo)
+
+    def fail_query(self, repo, query, per_label_limit):
+        raise RuntimeError("synthetic graph failure")
+
+    monkeypatch.setattr(CodeGraphContextProvider, "_query_code_elements", fail_query)
+
+    payload = search_code_from_config(
+        query="compile_context evidence", config_path=config_path, repo_id="app", limit=5
+    )
+
+    assert payload["active_provider"] == "text"
+    assert payload["results"][0]["provider"] == "text"
+    assert any("CodeGraph query failed" in warning for warning in payload["warnings"])
+
+
+def test_codegraph_ignore_file_changes_mark_graph_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    config_path, _ops_repo, work_repo, _state_dir = configured_project(tmp_path)
+    index_project_from_config(config_path=config_path)
+    activate_fake_codegraph(monkeypatch, config_path, work_repo)
+
+    healthy = get_code_provider_status_from_config(config_path=config_path)
+    assert healthy["active_provider"] == "codegraph"
+    assert healthy["codegraph_healthy"] is True
+
+    (work_repo / ".cgcignore").write_text("src/**\n", encoding="utf-8")
+
+    stale = get_code_provider_status_from_config(config_path=config_path)
+    assert stale["active_provider"] == "text"
+    assert stale["codegraph_healthy"] is False
+    assert stale["details"]["stale_repos"] == ["app"]
+
+
+def test_index_project_reports_codegraph_skipped_when_disabled(tmp_path: Path):
+    config_path, _ops_repo, _work_repo, _state_dir = configured_project(tmp_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace("    enabled: true", "    enabled: false"),
+        encoding="utf-8",
+    )
+
+    indexed = index_project_from_config(config_path=config_path)
+
+    assert indexed["status"] == "ok"
+    assert indexed["codegraph_indexed"] is False
+    assert indexed["codegraph_status"] == "skipped"
+    assert indexed["codegraph_warnings"] == []
+
+
+def test_index_project_reports_codegraph_warning_when_package_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(CodeGraphContextProvider, "_package_installed", lambda self: False)
+    config_path, _ops_repo, _work_repo, _state_dir = configured_project(tmp_path)
+
+    indexed = index_project_from_config(config_path=config_path)
+
+    assert indexed["status"] == "ok"
+    assert indexed["codegraph_indexed"] is False
+    assert indexed["codegraph_status"] == "warning"
+    assert indexed["codegraph_warnings"] == [
+        "CodeGraphContext package is not installed; code graph indexing skipped."
+    ]
+
+
+def test_get_code_context_resolves_symbol_and_file_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(CodeGraphContextProvider, "_package_installed", lambda self: False)
     config_path, _ops_repo, _work_repo, _state_dir = configured_project(tmp_path)
     index_project_from_config(config_path=config_path)
 
@@ -557,7 +748,10 @@ def test_code_context_fails_closed_on_corrupt_index_db(tmp_path: Path):
     assert "compiled evidence" not in context_payload["markdown"]
 
 
-def test_code_context_honors_disabled_text_fallback(tmp_path: Path):
+def test_code_context_honors_disabled_text_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(CodeGraphContextProvider, "_package_installed", lambda self: False)
     config_path, _ops_repo, _work_repo, _state_dir = configured_project(tmp_path)
     config_path.write_text(
         config_path.read_text(encoding="utf-8").replace(

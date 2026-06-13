@@ -15,7 +15,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/* \
     && python -m pip install --upgrade pip \
-    && python -m pip install .
+    && python -m pip install '.[codegraph]'
 
 EXPOSE 8000
 
