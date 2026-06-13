@@ -571,7 +571,7 @@ def setup_command(
         )
         if not dry_run:
             plan = write_setup_artifacts(plan, force=force)
-    except (FileExistsError, ValueError) as exc:
+    except (FileExistsError, ValueError, RuntimeError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     typer.echo(json.dumps(plan, sort_keys=True))
 

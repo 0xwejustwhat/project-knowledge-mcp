@@ -26,9 +26,14 @@ http://127.0.0.1:8765/
 4. Validates folders and explains missing/non-Git paths in plain language.
 5. Shows a YAML preview before writing `project.yaml`.
 6. Requires explicit confirmation before overwriting an existing config.
-7. Can start/inspect/stop the local loopback StreamableHTTP service.
-8. Can trigger initial indexing through the same policy-enforced config path as the CLI.
-9. Shows copy-ready client connection snippets.
+7. Tests for CodeGraph when code repos are selected:
+   - uses an existing healthy `codegraph` CLI if one is already configured or on `PATH`;
+   - otherwise installs `@colbymchenry/codegraph@1.0.0` locally under `.project-knowledge/tools/codegraph-cli` via npm;
+   - initializes CodeGraph for the selected code repos;
+   - writes the verified local `codegraph` command into `project.yaml`.
+8. Can start/inspect/stop the local loopback StreamableHTTP service.
+9. Can trigger initial indexing through the same policy-enforced config path as the CLI.
+10. Shows copy-ready client connection snippets.
 
 ## Screenshot placeholders
 

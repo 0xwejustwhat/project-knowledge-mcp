@@ -54,12 +54,13 @@ Start the local browser setup wizard and follow the prompts:
 poetry run project-knowledge setup-ui
 ```
 
-The setup page is served on `http://127.0.0.1:8765/` by default. It guides a normal user through choosing an ops/project repo, choosing one or more code repos, validating paths, previewing config, confirming before writes, starting/checking the loopback local service, running initial indexing, and copying a client connection snippet.
+The setup page is served on `http://127.0.0.1:8765/` by default. It guides a normal user through choosing an ops/project repo, choosing one or more code repos, validating paths, testing for CodeGraph, installing/configuring/initializing a local CodeGraph CLI when missing, previewing config, confirming before writes, starting/checking the loopback local service, running initial indexing, and copying a client connection snippet.
 
 Safety defaults:
 
 - local-only browser app and MCP service binding;
 - per-run setup token and same-origin checks for setup actions;
+- local CodeGraph CLI auto-install/configure/initialize for selected code repos when missing;
 - no hosted SaaS account;
 - no LLM key, embedding key, cloud parser, GPU, or network API requirement;
 - no secrets written;

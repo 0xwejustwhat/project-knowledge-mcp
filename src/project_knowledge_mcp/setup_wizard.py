@@ -212,6 +212,7 @@ def build_guided_setup_state(input_data: GuidedSetupInput) -> dict[str, Any]:
         state["errors"] = [*errors, error]
         return state
     state["plan"] = plan
+    state["codegraph_setup"] = plan["codegraph_setup"]
     state["config_preview"] = {
         "summary": "Project Knowledge will use local files only and keep remote access off.",
         "config_yaml": plan["config_yaml"],
@@ -248,6 +249,12 @@ def write_guided_setup_config(input_data: GuidedSetupInput) -> dict[str, Any]:
         raise GuidedSetupError(
             "OVERWRITE_CONFIRMATION_REQUIRED",
             "A config file already exists. Review it and check the overwrite confirmation box first.",
+        ) from exc
+    except RuntimeError as exc:
+        raise GuidedSetupError(
+            "CODEGRAPH_INSTALL_FAILED",
+            str(exc),
+            details={"codegraph_setup": state.get("codegraph_setup")},
         ) from exc
     validation = validate_project_config(written["artifacts"]["config"]["path"])
     return {

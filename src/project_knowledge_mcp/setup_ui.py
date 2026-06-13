@@ -295,7 +295,7 @@ _HTML = """<!doctype html>
 </head>
 <body>
   <h1>Project Knowledge MCP guided setup</h1>
-  <p class="safe">This setup page is local-only. It writes no secrets and keeps remote HTTPS off unless you explicitly opt in later.</p>
+  <p class="safe">This setup page is local-only. For selected code repos it tests CodeGraph and, if missing, installs, initializes, and configures a local pinned CodeGraph CLI before writing config. It writes no secrets and keeps remote HTTPS off unless you explicitly opt in later.</p>
   <div class="row">
     <div><label>Config file<input id="config_path" value="project.yaml" /></label></div>
     <div><label>Project folder<input id="project_root" value="." /></label></div>

@@ -31,7 +31,8 @@ The release deployment gate must prove all of the following before shipping:
    - Wrong token returns `401` before MCP.
    - Correct token reaches the same policy-enforced MCP tool registry.
 6. The setup wizard remains a local onboarding surface; remote HTTPS bridge setup stays explicit opt-in.
-7. No secrets, public network exposure, GPU, model keys, or hosted parser credentials are required.
+7. Guided setup detects CodeGraph for selected code repos and, when missing, installs/configures/initializes the pinned local CodeGraph CLI instead of requiring a user-managed install.
+8. No secrets, public network exposure, GPU, model keys, or hosted parser credentials are required.
 
 ## Release evidence to include with a tag or release PR
 

@@ -119,8 +119,8 @@ class CodeGraphProvider:
             warnings.append("CodeGraph is disabled by config; using text fallback.")
         elif command is None:
             warnings.append(
-                "CodeGraph CLI is not installed; install `colbymchenry/codegraph` and run "
-                "`codegraph init` for each configured work repo, or use text fallback."
+                "CodeGraph CLI is not configured; rerun guided setup so it can install/configure "
+                "the local CodeGraph CLI, or use text fallback."
             )
         elif not work_repos:
             warnings.append("No work repos are configured for CodeGraph context.")
