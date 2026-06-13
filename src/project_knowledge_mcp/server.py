@@ -8,6 +8,11 @@ import typer
 from fastmcp import FastMCP
 
 from project_knowledge_mcp.index import ProjectIndex, index_repo
+from project_knowledge_mcp.setup import (
+    build_client_config,
+    build_setup_plan,
+    write_setup_artifacts,
+)
 from project_knowledge_mcp.services import (
     add_project_note_from_config,
     check_project_staleness_from_config,
@@ -279,7 +284,7 @@ def serve(
         "stdio", help="FastMCP transport. Use stdio for local MCP clients; http for loopback smoke."
     ),
     host: str = typer.Option("127.0.0.1", help="Host for HTTP-like transports."),
-    port: int = typer.Option(8765, help="Port for HTTP-like transports."),
+    port: int = typer.Option(8000, help="Port for HTTP-like transports."),
 ) -> None:
     """Run the MCP server."""
     mcp = create_mcp()
@@ -529,6 +534,92 @@ def check_project_staleness_command(
 ) -> None:
     """Report configured repo Git freshness and index staleness."""
     typer.echo(json.dumps(check_project_staleness_from_config(config_path=config), sort_keys=True))
+
+
+@app.command("setup")
+def setup_command(
+    config: Path = typer.Option(Path("project.yaml"), "--config", help="Config file to generate."),
+    project_root: Path = typer.Option(Path("."), "--project-root", help="Project workspace root."),
+    ops_repo: Path | None = typer.Option(None, "--ops-repo", help="Writable ops repository path."),
+    work_repo: list[Path] | None = typer.Option(
+        None, "--work-repo", help="Repeatable read-only work repository path."
+    ),
+    client: list[str] | None = typer.Option(
+        None, "--client", help="Repeatable client snippet to include."
+    ),
+    project_id: str | None = typer.Option(None, "--project-id", help="Project ID for generated config."),
+    non_interactive: bool = typer.Option(
+        False, "--non-interactive", help="Fail instead of prompting for missing values."
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview setup without writing files."),
+    force: bool = typer.Option(False, "--force", help="Overwrite an existing config file."),
+) -> None:
+    """Generate safe local setup config, mount guidance, and client snippets."""
+    selected_clients = [str(item) for item in client] if client else ["hermes"]
+    try:
+        plan = build_setup_plan(
+            config_path=config,
+            project_root=project_root,
+            ops_repo=ops_repo,
+            work_repos=[Path(path) for path in work_repo or []],
+            clients=selected_clients,
+            dry_run=dry_run,
+            project_id=project_id,
+        )
+        if not dry_run:
+            plan = write_setup_artifacts(plan, force=force)
+    except (FileExistsError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(json.dumps(plan, sort_keys=True))
+
+
+@app.command("print-client-config")
+def print_client_config_command(
+    config: Path = typer.Option(Path("project.yaml"), "--config", help="Project Knowledge config path."),
+    client: str = typer.Option("hermes", "--client", help="Client type."),
+    transport: str = typer.Option("stdio", "--transport", help="stdio, streamable-http, or remote-https."),
+    http_url: str | None = typer.Option(None, "--http-url", help="Loopback HTTP MCP URL."),
+    remote_url: str | None = typer.Option(None, "--remote-url", help="Remote HTTPS MCP URL."),
+) -> None:
+    """Print a redacted MCP client connection snippet."""
+    try:
+        payload = build_client_config(
+            config_path=config,
+            client=client,
+            transport=transport,
+            http_url=http_url,
+            remote_url=remote_url,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(json.dumps(payload, sort_keys=True))
+
+
+@app.command("status")
+def status_command(
+    config: Path | None = typer.Option(None, "--config", help="Project Knowledge config path."),
+) -> None:
+    """Validate config and report repo/index freshness in one packet."""
+    validation = validate_config_service(config)
+    if validation["valid"]:
+        staleness = check_project_staleness_from_config(config_path=config)
+    else:
+        staleness = {
+            "status": "error",
+            "repos": [],
+            "warnings": validation["warnings"],
+            "errors": validation["errors"],
+            "markdown": "## Project Staleness\n\nConfig is invalid; no staleness check was run.",
+        }
+    payload = {
+        "status": "ok" if validation["valid"] else "error",
+        "project_id": validation.get("project_id"),
+        "config": validation,
+        "staleness": staleness,
+        "warnings": [*validation.get("warnings", []), *staleness.get("warnings", [])],
+        "markdown": staleness.get("markdown", ""),
+    }
+    typer.echo(json.dumps(payload, sort_keys=True))
 
 
 def _parse_changes_json(value: str) -> list[dict[str, Any]]:

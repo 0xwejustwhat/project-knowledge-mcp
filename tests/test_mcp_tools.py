@@ -5,9 +5,30 @@ import subprocess
 from pathlib import Path
 from textwrap import dedent
 
+import project_knowledge_mcp.services as services
 from fastmcp import Client
 
 from project_knowledge_mcp.server import create_mcp
+
+
+EXPECTED_TOOL_NAMES = {
+    "health",
+    "validate_config",
+    "index_project",
+    "search_ops",
+    "search_decisions",
+    "get_current_doctrine",
+    "search_open_questions",
+    "search_code",
+    "get_code_context",
+    "get_code_provider_status",
+    "retrieve_ops_code_evidence",
+    "generate_session_brief",
+    "add_project_note",
+    "create_draft_artifact",
+    "propose_authority_change",
+    "check_project_staleness",
+}
 
 
 def init_git_repo(path: Path) -> None:
@@ -196,6 +217,93 @@ def test_mcp_check_project_staleness_ignores_state_dir_inside_repo(tmp_path: Pat
 async def call_tool(tool_name: str, args: dict) -> dict:
     async with Client(create_mcp()) as client:
         return json.loads(result_text(await client.call_tool(tool_name, args)))
+
+
+async def list_tool_names() -> set[str]:
+    async with Client(create_mcp()) as client:
+        return {tool.name for tool in await client.list_tools()}
+
+
+def test_mcp_tool_registry_matches_phase7_surface():
+    import asyncio
+
+    assert asyncio.run(list_tool_names()) == EXPECTED_TOOL_NAMES
+    health = asyncio.run(call_tool("health", {}))
+    assert health == {
+        "status": "ok",
+        "phase": "step2_config_backed_mcp_tools",
+        "llm_required": False,
+        "default_network_exposure": "loopback_or_stdio_only",
+    }
+
+
+def test_mcp_step7_write_tools_are_client_callable(monkeypatch, tmp_path: Path):
+    repo = tmp_path / "ops"
+    state = tmp_path / ".project-knowledge"
+    init_git_repo(repo)
+    write_doc(repo, "README.md", "# Ops Repo\n\nInitial content.")
+    commit_all(repo, "initial")
+    config_path = write_project_config(tmp_path, repo=repo, state_dir=state)
+    monkeypatch.setattr(services, "_command_exists", lambda _command: False)
+
+    import asyncio
+
+    note = asyncio.run(
+        call_tool(
+            "add_project_note",
+            {
+                "config_path": str(config_path),
+                "title": "Client Capture",
+                "body": "Client-callable safe capture note.",
+                "tags": ["step8"],
+                "source": "pytest-mcp-client",
+            },
+        )
+    )
+    assert note["status"] == "written"
+    assert note["authority"] == "capture"
+    assert note["indexed"] is True
+    assert (repo / note["path"]).exists()
+
+    draft = asyncio.run(
+        call_tool(
+            "create_draft_artifact",
+            {
+                "config_path": str(config_path),
+                "kind": "doctrine_delta",
+                "title": "Client Draft",
+                "body": "Reviewable client-callable draft.",
+                "tags": ["step8"],
+            },
+        )
+    )
+    assert draft["status"] == "written"
+    assert draft["authority"] == "proposal"
+    assert draft["path"].startswith("docs/proposals/doctrine-deltas/")
+    commit_all(repo, "commit mcp client writes before proposal branch")
+
+    proposal = asyncio.run(
+        call_tool(
+            "propose_authority_change",
+            {
+                "config_path": str(config_path),
+                "title": "Client Proposal",
+                "rationale": "MCP client supplied reviewable content.",
+                "changes": [
+                    {
+                        "operation": "add_file",
+                        "path": "docs/decisions/0008-client-proposal.md",
+                        "content": "# Client Proposal\n\nReviewable content.\n",
+                    }
+                ],
+                "branch_name": "pkmcp/authority-proposal/client-step8",
+            },
+        )
+    )
+    assert proposal["status"] == "branch_prepared_pr_not_opened"
+    assert proposal["authority_boundary"] == "review_required_before_promotion"
+    assert proposal["changed_paths"] == ["docs/decisions/0008-client-proposal.md"]
+    assert proposal["next_action"] == "push branch and open PR manually"
 
 
 def test_mcp_validate_config_indexes_and_searches_ops(tmp_path: Path):

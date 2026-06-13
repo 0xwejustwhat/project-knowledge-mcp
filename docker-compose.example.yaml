@@ -1,0 +1,46 @@
+services:
+  project-knowledge-mcp:
+    build: .
+    image: project-knowledge-mcp:dev
+    environment:
+      PROJECT_KNOWLEDGE_CONFIG: /workspace/project.yaml
+      PROJECT_KNOWLEDGE_ROOT: /workspace
+      PROJECT_KNOWLEDGE_STATE_DIR: /workspace/.project-knowledge
+    volumes:
+      - ./:/workspace:rw
+      # Mount additional work repos read-only, then add them to project.yaml.
+      # - ../example-work-repo:/repos/example-work-repo:ro
+    ports:
+      - "127.0.0.1:8000:8000"
+    command:
+      - start
+      - --transport
+      - streamable-http
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["remote-bridge"]
+    depends_on:
+      - project-knowledge-mcp
+    environment:
+      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:-}
+      PKMCP_SITE_ADDRESS: ${PKMCP_SITE_ADDRESS:-pkmcp.example.com}
+      PKMCP_UPSTREAM: project-knowledge-mcp:8000
+    entrypoint:
+      - /bin/sh
+      - -c
+    command:
+      - |
+        test -n "$$MCP_AUTH_TOKEN" || {
+          echo "MCP_AUTH_TOKEN is required before enabling the remote bridge" >&2
+          exit 64
+        }
+        exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
+    volumes:
+      - ./deploy/Caddyfile.example:/etc/caddy/Caddyfile:ro
+    ports:
+      - "443:443"

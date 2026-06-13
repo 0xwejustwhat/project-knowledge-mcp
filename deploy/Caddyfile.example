@@ -1,0 +1,6 @@
+{$PKMCP_SITE_ADDRESS:pkmcp.example.com} {
+	@missingAuth not header Authorization "Bearer {$MCP_AUTH_TOKEN}"
+	respond @missingAuth 401
+
+	reverse_proxy {$PKMCP_UPSTREAM:project-knowledge-mcp:8000}
+}
