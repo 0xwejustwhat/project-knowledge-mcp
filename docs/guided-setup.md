@@ -33,7 +33,13 @@ http://127.0.0.1:8765/
    - writes the verified local `codegraph` command into `project.yaml`.
 8. Can start/inspect/stop the local loopback StreamableHTTP service.
 9. Can trigger initial indexing through the same policy-enforced config path as the CLI.
-10. Shows copy-ready client connection snippets.
+10. Offers an explicit **Enable HTTPS remote bridge with managed Caddy** toggle:
+   - remains off by default;
+   - requires risk acknowledgement and a public `https://.../mcp` URL;
+   - writes a Docker-managed Caddy bridge under `.project-knowledge/remote-bridge/`;
+   - generates a bearer token into local `0600` files instead of printing secrets into logs;
+   - provides buttons to start/stop the Caddy bridge after the local service is running.
+11. Shows copy-ready client connection snippets, including a redacted remote HTTPS snippet when the bridge is enabled.
 
 ## Screenshot placeholders
 
@@ -45,4 +51,6 @@ Desktop packaging and final screenshots are deferred. Until then, docs and relea
 
 ## Remote bridge safety
 
-Remote HTTPS bridge setup is not part of the default happy path. It remains off unless an operator explicitly opts in, acknowledges the risk, and configures a bearer-token-gated bridge.
+Remote HTTPS bridge setup is not part of the default local-only path. It remains off unless an operator explicitly opts in and acknowledges the risk.
+
+When the toggle is enabled, guided setup owns the bridge setup instead of requiring a user-managed Caddy install: it writes a Docker-managed `caddy:2-alpine` compose file, Caddyfile, `.env`, and token file under `.project-knowledge/remote-bridge/`. The bridge uses Caddy automatic HTTPS for the provided site address and rejects requests unless they include the generated bearer token.

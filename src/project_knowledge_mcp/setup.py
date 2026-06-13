@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import os
+import secrets
 import shlex
 from pathlib import Path
 from typing import Any, Literal, cast
+from urllib.parse import urlparse
 
 import yaml
 
@@ -288,6 +291,166 @@ def build_docker_guidance(
     }
 
 
+def _remote_bridge_dir(project_root: Path) -> Path:
+    return project_root / ".project-knowledge" / "remote-bridge"
+
+
+def _remote_client_url(remote_url: str | None) -> str:
+    if not remote_url:
+        return DEFAULT_REMOTE_URL
+    parsed = urlparse(remote_url)
+    if parsed.path and parsed.path != "/":
+        return remote_url.rstrip("/")
+    return remote_url.rstrip("/") + "/mcp"
+
+
+def _remote_site_address(remote_url: str | None) -> str:
+    parsed = urlparse(remote_url or DEFAULT_REMOTE_URL)
+    return parsed.netloc or "example.invalid"
+
+
+def build_remote_bridge_plan(
+    *,
+    project_root: Path | str,
+    config_path: Path | str,
+    remote_url: str | None,
+    enabled: bool = False,
+) -> dict[str, Any]:
+    root = _resolved(project_root)
+    resolved_config = _resolved(config_path)
+    assert root is not None
+    assert resolved_config is not None
+    bridge_dir = _remote_bridge_dir(root)
+    client_url = _remote_client_url(remote_url)
+    site_address = _remote_site_address(client_url)
+    artifacts = {
+        "env": {"path": str(bridge_dir / ".env"), "written": False, "secret": True},
+        "token_file": {
+            "path": str(bridge_dir / "REMOTE_BRIDGE_TOKEN.txt"),
+            "written": False,
+            "secret": True,
+        },
+        "caddyfile": {"path": str(bridge_dir / "Caddyfile"), "written": False},
+        "compose": {
+            "path": str(bridge_dir / "docker-compose.remote-bridge.yaml"),
+            "written": False,
+        },
+    }
+    remote_client_config = build_client_config(
+        config_path=resolved_config,
+        client="generic",
+        transport="remote-https",
+        remote_url=client_url,
+    )
+    if not enabled:
+        return {
+            "enabled": False,
+            "enabled_by_default": False,
+            "managed_by_setup": False,
+            "requires_https": True,
+            "requires_bearer_token": True,
+            "writes_token": False,
+            "authorization_header": "Authorization: Bearer [REDACTED]",
+            "caddy_example": "deploy/Caddyfile.example",
+            "compose_profile": "remote-bridge",
+            "instructions": (
+                "Remote HTTPS stays off unless enabled in guided setup. When enabled, "
+                "guided setup writes a managed Docker/Caddy bridge."
+            ),
+        }
+    return {
+        "enabled": True,
+        "enabled_by_default": False,
+        "managed_by_setup": True,
+        "requires_https": True,
+        "requires_bearer_token": True,
+        "writes_token": True,
+        "remote_url": client_url,
+        "site_address": site_address,
+        "upstream": "127.0.0.1:8000",
+        "authorization_header": "Authorization: Bearer [REDACTED]",
+        "token": {"source": "generated_on_write", "redacted": "[REDACTED]"},
+        "caddy": {
+            "install_mode": "docker",
+            "image": "caddy:2-alpine",
+            "requires_host_caddy": False,
+            "requires_docker": True,
+        },
+        "artifacts": artifacts,
+        "remote_client_config": remote_client_config,
+        "start_command": f"docker compose -f {shlex.quote(str(bridge_dir / 'docker-compose.remote-bridge.yaml'))} up -d",
+        "stop_command": f"docker compose -f {shlex.quote(str(bridge_dir / 'docker-compose.remote-bridge.yaml'))} down",
+        "message": (
+            "Guided setup will create a Docker-managed Caddy HTTPS bridge with a generated "
+            "bearer token; no host Caddy install is required."
+        ),
+    }
+
+
+def _caddyfile_text(*, site_address: str) -> str:
+    return (
+        f"{{$PKMCP_SITE_ADDRESS:{site_address}}} {{\n"
+        '\t@missingAuth not header Authorization "Bearer {$MCP_AUTH_TOKEN}"\n'
+        "\trespond @missingAuth 401\n\n"
+        "\treverse_proxy {$PKMCP_UPSTREAM:127.0.0.1:8000}\n"
+        "}\n"
+    )
+
+
+def _remote_bridge_compose_text() -> str:
+    compose = {
+        "services": {
+            "caddy": {
+                "image": "caddy:2-alpine",
+                "network_mode": "host",
+                "env_file": [".env"],
+                "volumes": [
+                    "./Caddyfile:/etc/caddy/Caddyfile:ro",
+                    "./caddy-data:/data",
+                    "./caddy-config:/config",
+                ],
+                "restart": "unless-stopped",
+            }
+        }
+    }
+    return yaml.safe_dump(compose, sort_keys=False)
+
+
+def _write_remote_bridge_artifacts(plan: dict[str, Any]) -> dict[str, Any]:
+    remote_bridge = dict(plan.get("remote_bridge") or {})
+    if not remote_bridge.get("enabled"):
+        return remote_bridge or {"enabled": False}
+    artifacts = {
+        name: dict(value) for name, value in (remote_bridge.get("artifacts") or {}).items()
+    }
+    bridge_dir = Path(artifacts["caddyfile"]["path"]).parent
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    token = secrets.token_urlsafe(32)
+    site_address = str(remote_bridge["site_address"])
+    upstream = str(remote_bridge.get("upstream") or "127.0.0.1:8000")
+    env_text = (
+        f"MCP_AUTH_TOKEN={token}\nPKMCP_SITE_ADDRESS={site_address}\nPKMCP_UPSTREAM={upstream}\n"
+    )
+    Path(artifacts["env"]["path"]).write_text(env_text, encoding="utf-8")
+    Path(artifacts["token_file"]["path"]).write_text(token + "\n", encoding="utf-8")
+    Path(artifacts["caddyfile"]["path"]).write_text(
+        _caddyfile_text(site_address=site_address), encoding="utf-8"
+    )
+    Path(artifacts["compose"]["path"]).write_text(_remote_bridge_compose_text(), encoding="utf-8")
+    os.chmod(artifacts["env"]["path"], 0o600)
+    os.chmod(artifacts["token_file"]["path"], 0o600)
+    for artifact in artifacts.values():
+        artifact["written"] = True
+    updated = dict(remote_bridge)
+    updated["artifacts"] = artifacts
+    updated["token"] = {
+        "source": "generated",
+        "redacted": "[REDACTED]",
+        "token_file": artifacts["token_file"]["path"],
+    }
+    return updated
+
+
 def build_setup_plan(
     *,
     config_path: Path | str,
@@ -297,6 +460,8 @@ def build_setup_plan(
     clients: list[str] | None = None,
     dry_run: bool = True,
     project_id: str | None = None,
+    remote_bridge_enabled: bool = False,
+    remote_url: str | None = None,
 ) -> dict[str, Any]:
     resolved_config = _resolved(config_path)
     assert resolved_config is not None
@@ -322,6 +487,12 @@ def build_setup_plan(
         client: build_client_config(config_path=resolved_config, client=client, transport="stdio")
         for client in selected_clients
     }
+    remote_bridge = build_remote_bridge_plan(
+        project_root=root,
+        config_path=resolved_config,
+        remote_url=remote_url,
+        enabled=remote_bridge_enabled,
+    )
     return {
         "status": "ok",
         "dry_run": dry_run,
@@ -340,23 +511,15 @@ def build_setup_plan(
         "docker": build_docker_guidance(
             config_path=resolved_config, project_root=root, config=config
         ),
-        "remote_bridge": {
-            "enabled_by_default": False,
-            "requires_https": True,
-            "authorization_header": "Authorization: Bearer [REDACTED]",
-            "caddy_example": "deploy/Caddyfile.example",
-            "compose_profile": "remote-bridge",
-            "instructions": (
-                "Enable the HTTPS bridge explicitly with the remote-bridge compose profile; "
-                "setup does not start or expose remote services."
-            ),
-        },
+        "remote_bridge": remote_bridge,
         "client_configs": client_configs,
         "safety": {
             "starts_services": False,
-            "network_exposure": "loopback_or_stdio_only",
-            "remote_enabled": False,
-            "secrets_written": False,
+            "network_exposure": "loopback_or_stdio_only"
+            if not remote_bridge_enabled
+            else "local_service_plus_explicit_https_bridge",
+            "remote_enabled": remote_bridge_enabled,
+            "secrets_written": remote_bridge_enabled,
         },
     }
 
@@ -378,4 +541,5 @@ def write_setup_artifacts(plan: dict[str, Any], *, force: bool = False) -> dict[
     updated["artifacts"]["config"] = dict(plan["artifacts"]["config"])
     updated["artifacts"]["config"]["written"] = True
     updated["artifacts"]["config"]["exists"] = True
+    updated["remote_bridge"] = _write_remote_bridge_artifacts(plan)
     return updated

@@ -15,9 +15,10 @@ import yaml
 from typer.testing import CliRunner
 
 from project_knowledge_mcp.server import app
-from project_knowledge_mcp.setup_ui import create_setup_ui_server
+from project_knowledge_mcp.setup_ui import _HTML, create_setup_ui_server
 from project_knowledge_mcp.setup_wizard import (
     GuidedSetupInput,
+    build_client_handoff,
     build_guided_setup_state,
     validate_repo_path,
     write_guided_setup_config,
@@ -67,6 +68,7 @@ def test_guided_setup_state_machine_happy_path_writes_valid_config(tmp_path: Pat
         "write_confirmation",
         "service_lifecycle",
         "indexing",
+        "remote_bridge",
         "client_handoff",
     ]
     assert state["surface"] == "localhost_browser_setup"
@@ -258,6 +260,83 @@ def test_guided_setup_remote_bridge_is_opt_in_and_requires_risk_ack(tmp_path: Pa
     assert state["remote_bridge"]["requires_bearer_token"] is True
     assert state["remote_bridge"]["writes_token"] is False
     assert state["remote_bridge"]["errors"][0]["code"] == "REMOTE_BRIDGE_RISK_ACK_REQUIRED"
+
+
+def test_guided_setup_remote_bridge_writes_managed_caddy_artifacts(tmp_path: Path, monkeypatch):
+    ops_repo = tmp_path / "ops"
+    init_git_repo(ops_repo)
+    monkeypatch.setattr(
+        "project_knowledge_mcp.setup.secrets.token_urlsafe", lambda size: "test-token"
+    )
+    setup_input = GuidedSetupInput(
+        config_path=tmp_path / "project.yaml",
+        project_root=tmp_path,
+        ops_repo=ops_repo,
+        remote_bridge_opt_in=True,
+        remote_bridge_risk_acknowledged=True,
+        remote_url="https://pkmcp.example.com/mcp",
+    )
+
+    state = build_guided_setup_state(setup_input)
+
+    assert state["status"] == "ready"
+    assert "remote_bridge" in [step["id"] for step in state["steps"]]
+    assert state["remote_bridge"]["can_enable"] is True
+    assert state["remote_bridge"]["managed_by_setup"] is True
+    assert state["remote_bridge"]["caddy"]["install_mode"] == "docker"
+    assert "Caddy" in state["remote_bridge"]["message"]
+    assert any(
+        path.endswith(".project-knowledge/remote-bridge/Caddyfile")
+        for path in state["config_preview"]["would_write"]
+    )
+    assert state["client_handoff"]["remote_bridge_enabled"] is True
+    assert (
+        state["client_handoff"]["remote_client_config"]["config"]["headers"]["Authorization"]
+        == "Bearer [REDACTED]"
+    )
+
+    result = write_guided_setup_config(setup_input)
+
+    bridge = result["written"]["remote_bridge"]
+    assert bridge["enabled"] is True
+    assert bridge["token"]["redacted"] == "[REDACTED]"
+    env_path = Path(bridge["artifacts"]["env"]["path"])
+    caddyfile_path = Path(bridge["artifacts"]["caddyfile"]["path"])
+    compose_path = Path(bridge["artifacts"]["compose"]["path"])
+    assert env_path.exists()
+    assert caddyfile_path.exists()
+    assert compose_path.exists()
+    assert "MCP_AUTH_TOKEN=test-token" in env_path.read_text(encoding="utf-8")
+    caddyfile_text = caddyfile_path.read_text(encoding="utf-8")
+    assert "{$PKMCP_SITE_ADDRESS:pkmcp.example.com}" in caddyfile_text
+    assert "pkmcp.example.com" in caddyfile_text
+    assert "caddy:2-alpine" in compose_path.read_text(encoding="utf-8")
+    assert "test-token" not in json.dumps(result)
+
+
+def test_client_handoff_includes_remote_https_when_bridge_enabled(tmp_path: Path):
+    result = build_client_handoff(
+        tmp_path / "project.yaml",
+        clients=["hermes"],
+        remote_bridge_enabled=True,
+        remote_url="https://pkmcp.example.com/mcp",
+    )
+
+    assert result["remote_bridge_enabled"] is True
+    assert result["snippets"]["generic-remote-https"]["transport"] == "remote-https"
+    assert result["snippets"]["generic-remote-https"]["config"]["url"] == (
+        "https://pkmcp.example.com/mcp"
+    )
+    assert result["snippets"]["generic-remote-https"]["config"]["headers"] == {
+        "Authorization": "Bearer [REDACTED]"
+    }
+
+
+def test_setup_ui_exposes_easy_remote_bridge_toggle():
+    assert "remote_bridge_opt_in" in _HTML
+    assert "remote_bridge_risk_acknowledged" in _HTML
+    assert "remote_url" in _HTML
+    assert "Start HTTPS bridge" in _HTML
 
 
 def test_setup_ui_api_returns_state_without_public_binding(tmp_path: Path):

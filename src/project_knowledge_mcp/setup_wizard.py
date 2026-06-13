@@ -6,7 +6,12 @@ import subprocess
 from typing import Any, Literal
 
 from project_knowledge_mcp.config import validate_project_config
-from project_knowledge_mcp.setup import build_client_config, build_setup_plan, write_setup_artifacts
+from project_knowledge_mcp.setup import (
+    build_client_config,
+    build_remote_bridge_plan,
+    build_setup_plan,
+    write_setup_artifacts,
+)
 
 SetupStep = Literal[
     "welcome",
@@ -16,6 +21,7 @@ SetupStep = Literal[
     "write_confirmation",
     "service_lifecycle",
     "indexing",
+    "remote_bridge",
     "client_handoff",
 ]
 
@@ -27,6 +33,7 @@ SETUP_STEPS: list[SetupStep] = [
     "write_confirmation",
     "service_lifecycle",
     "indexing",
+    "remote_bridge",
     "client_handoff",
 ]
 
@@ -38,6 +45,7 @@ _STEP_LABELS: dict[SetupStep, str] = {
     "write_confirmation": "Confirm before writing files",
     "service_lifecycle": "Start or check the local service",
     "indexing": "Build the local search index",
+    "remote_bridge": "Optional HTTPS bridge with Caddy",
     "client_handoff": "Connect your MCP client",
 }
 
@@ -204,6 +212,8 @@ def build_guided_setup_state(input_data: GuidedSetupInput) -> dict[str, Any]:
             clients=input_data.clients,
             dry_run=True,
             project_id=input_data.project_id,
+            remote_bridge_enabled=remote_bridge["can_enable"],
+            remote_url=input_data.remote_url,
         )
     except ValueError as exc:
         error = GuidedSetupError("SETUP_PLAN_INVALID", _plain_setup_error(str(exc))).as_dict()
@@ -213,16 +223,39 @@ def build_guided_setup_state(input_data: GuidedSetupInput) -> dict[str, Any]:
         return state
     state["plan"] = plan
     state["codegraph_setup"] = plan["codegraph_setup"]
-    state["config_preview"] = {
-        "summary": "Project Knowledge will use local files only and keep remote access off.",
-        "config_yaml": plan["config_yaml"],
-        "would_write": [plan["artifacts"]["config"]["path"]],
+    planned_writes = [plan["artifacts"]["config"]["path"]]
+    if plan["remote_bridge"].get("enabled"):
+        planned_writes.extend(
+            artifact["path"] for artifact in plan["remote_bridge"]["artifacts"].values()
+        )
+    state["remote_bridge"] = {
+        **remote_bridge,
+        **plan["remote_bridge"],
+        "can_enable": remote_bridge["can_enable"],
+        "errors": remote_bridge["errors"],
     }
-    state["client_handoff"] = {
+    state["config_preview"] = {
+        "summary": (
+            "Project Knowledge will use local files and add an explicit HTTPS bridge."
+            if plan["remote_bridge"].get("enabled")
+            else "Project Knowledge will use local files only and keep remote access off."
+        ),
+        "config_yaml": plan["config_yaml"],
+        "would_write": planned_writes,
+    }
+    client_handoff = {
         "clients": plan["client_configs"],
         "copy_ready": True,
+        "remote_bridge_enabled": bool(plan["remote_bridge"].get("enabled")),
         "message": "Copy the generated client snippet into your local MCP client.",
     }
+    if plan["remote_bridge"].get("enabled"):
+        client_handoff["remote_client_config"] = plan["remote_bridge"]["remote_client_config"]
+        client_handoff["message"] = (
+            "Use the local snippet first, or use the remote HTTPS snippet after starting "
+            "the Caddy bridge and copying the generated bearer token from the token file."
+        )
+    state["client_handoff"] = client_handoff
     return state
 
 
@@ -270,7 +303,13 @@ def write_guided_setup_config(input_data: GuidedSetupInput) -> dict[str, Any]:
     }
 
 
-def build_client_handoff(config_path: Path, *, clients: list[str] | None = None) -> dict[str, Any]:
+def build_client_handoff(
+    config_path: Path,
+    *,
+    clients: list[str] | None = None,
+    remote_bridge_enabled: bool = False,
+    remote_url: str | None = None,
+) -> dict[str, Any]:
     selected_clients = clients or ["hermes"]
     snippets = {
         client: build_client_config(config_path=config_path, client=client, transport="stdio")
@@ -282,12 +321,25 @@ def build_client_handoff(config_path: Path, *, clients: list[str] | None = None)
         transport="streamable-http",
         http_url="http://127.0.0.1:8000/mcp",
     )
+    if remote_bridge_enabled:
+        remote_bridge = build_remote_bridge_plan(
+            project_root=config_path.expanduser().resolve().parent,
+            config_path=config_path,
+            remote_url=remote_url,
+            enabled=True,
+        )
+        snippets["generic-remote-https"] = remote_bridge["remote_client_config"]
     return {
         "status": "ok",
         "copy_ready": True,
-        "remote_bridge_enabled": False,
+        "remote_bridge_enabled": remote_bridge_enabled,
         "snippets": snippets,
-        "message": "Use local stdio or loopback HTTP first. Remote HTTPS is a separate opt-in step.",
+        "message": (
+            "Use local stdio or loopback HTTP first. Remote HTTPS is available after the "
+            "managed Caddy bridge is written and started."
+            if remote_bridge_enabled
+            else "Use local stdio or loopback HTTP first. Remote HTTPS is a separate opt-in step."
+        ),
     }
 
 
@@ -311,6 +363,13 @@ def _remote_bridge_state(input_data: GuidedSetupInput) -> dict[str, Any]:
                 "Remote HTTPS can expose project metadata. Acknowledge the risk before enabling it.",
             ).as_dict()
         )
+    if requested and not input_data.remote_url:
+        errors.append(
+            GuidedSetupError(
+                "REMOTE_BRIDGE_URL_REQUIRED",
+                "Enter the public https:// URL before enabling the remote bridge.",
+            ).as_dict()
+        )
     if requested and input_data.remote_url and not input_data.remote_url.startswith("https://"):
         errors.append(
             GuidedSetupError(
@@ -324,8 +383,15 @@ def _remote_bridge_state(input_data: GuidedSetupInput) -> dict[str, Any]:
         "requested": requested,
         "risk_acknowledged": acknowledged,
         "can_enable": requested and acknowledged and not errors,
+        "managed_by_setup": requested and acknowledged and not errors,
         "requires_bearer_token": True,
-        "writes_token": False,
+        "writes_token": requested and acknowledged and not errors,
+        "caddy": {
+            "install_mode": "docker",
+            "image": "caddy:2-alpine",
+            "requires_host_caddy": False,
+            "requires_docker": requested,
+        },
         "message": (
             "Remote HTTPS stays off unless you explicitly opt in, acknowledge the risk, "
             "and configure a bearer-token-gated bridge."
