@@ -54,3 +54,55 @@ Desktop packaging and final screenshots are deferred. Until then, docs and relea
 Remote HTTPS bridge setup is not part of the default local-only path. It remains off unless an operator explicitly opts in and acknowledges the risk.
 
 When the toggle is enabled, guided setup owns the bridge setup instead of requiring a user-managed Caddy install: it writes a Docker-managed `caddy:2-alpine` compose file, Caddyfile, `.env`, and token file under `.project-knowledge/remote-bridge/`. The bridge uses Caddy automatic HTTPS for the provided site address and rejects requests unless they include the generated bearer token.
+
+## CLI setup path
+
+For headless or automation environments, use the non-interactive CLI:
+
+```bash
+# Dry-run first to preview
+poetry run project-knowledge setup \
+  --non-interactive \
+  --dry-run \
+  --config project.yaml \
+  --project-root "$PWD" \
+  --ops-repo /path/to/ops-repo \
+  --work-repo /path/to/work-repo \
+  --client hermes
+
+# Remove --dry-run to write config and install CodeGraph
+poetry run project-knowledge setup \
+  --non-interactive \
+  --config project.yaml \
+  --project-root "$PWD" \
+  --ops-repo /path/to/ops-repo \
+  --work-repo /path/to/work-repo \
+  --client hermes
+```
+
+The write phase automatically:
+- Generates a complete `project.yaml` with both repos configured.
+- Checks for an existing `codegraph` CLI on PATH or at the configured local path.
+- If missing: installs `@colbymchenry/codegraph@1.0.0` via `npm install --prefix` under `.project-knowledge/tools/codegraph-cli/`.
+- Initializes CodeGraph for each work repo.
+- Writes the verified command path into `project.yaml`.
+
+After setup, index the repos:
+
+```bash
+poetry run project-knowledge index-project --config project.yaml
+```
+
+### Stale-install pitfall
+
+If the config has a `codegraph.command` path but the binary was never actually installed at that path (e.g. setup was run with `--dry-run` and the config was edited by hand, or the `.project-knowledge/` directory was carried over from a previous version), CodeGraph reports as unhealthy. Fresh setup — removing stale state and re-running the write phase — is the reliable fix:
+
+```bash
+rm -f project.yaml
+rm -rf .project-knowledge/
+poetry run project-knowledge setup --non-interactive --config project.yaml \
+  --project-root "$PWD" --ops-repo /path/to/ops-repo --work-repo /path/to/work-repo --client hermes
+poetry run project-knowledge index-project --config project.yaml
+```
+
+The `rm -rf .project-knowledge/` is important after pulling PRs that change setup, indexing, or CodeGraph integration logic — stale state from a prior version poisons the new workflow.

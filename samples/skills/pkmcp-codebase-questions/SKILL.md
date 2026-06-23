@@ -108,9 +108,9 @@ For a broad codebase/project-memory question:
      known.
 
 4. **Inspect directly before precise claims or edits.**
-   - PKMCP snippets establish relevance, not complete semantics.
-   - Before editing, citing exact behavior, or saying a test covers something,
-     inspect the returned files directly and/or run the relevant checks.
+   - PKMCP snippets establish relevance, not complete semantics. They are bounded evidence — the snippet covers a few lines, not the full function.
+   - PKMCP can surface *what's there* (files, symbols, snippets) but it **cannot surface what's missing** (missing else-branches, control flow gaps, absent error handling).
+   - Before editing, citing exact behavior, or saying a test covers something, use `read_file` at the specific line range to see the complete logic. PKMCP → direct read is the intended two-step pattern, not a replacement decision.
 
 5. **Synthesize with citations and uncertainty.**
    - Cite paths, line ranges, symbols, doc titles, decision status, and warnings.
@@ -260,6 +260,29 @@ Rules:
   do not claim code intelligence from PKMCP. Fall back to direct repo tools or ask
   the user/operator to repair provider setup.
 
+### When CodeGraph is unhealthy
+
+If `codegraph_healthy: false` with a warning like `CodeGraph status failed for repo X`,
+first check whether the configured `codegraph.command` path actually exists on the
+filesystem:
+
+```bash
+ls -la /path/to/configured/codegraph/command
+```
+
+If the binary is missing:
+- The config has a stale path — likely the setup write phase was never run or the
+  `.project-knowledge/` directory was carried over from a previous version.
+- Run a fresh setup to re-install CodeGraph (see the guided-setup docs).
+
+If the binary exists but is unhealthy:
+- Try `codegraph init && codegraph index` from the repo root.
+- Check whether `codegraph status --json` can read the existing index.
+
+Do not try to patch the path in project.yaml manually — that addresses the symptom,
+not the root cause. A fresh `project-knowledge setup --non-interactive ...` (removing
+`--dry-run`) installs CodeGraph at the correct path and writes the verified command.
+
 ## Error and Recovery Rules
 
 PKMCP errors are usually structured as `error: {code, message, details,
@@ -327,7 +350,9 @@ Before finalizing a PKMCP-grounded answer:
 - [ ] I checked staleness or disclosed that I did not when freshness matters.
 - [ ] I interpreted `authority`, `status`, `warnings`, `gaps`, and `errors`.
 - [ ] I distinguished graph-backed `codegraph` evidence from `text` fallback.
-- [ ] I inspected live files or ran checks before precise behavioral claims or edits.
+- [ ] I inspected live files at the specific line ranges PKMCP pointed at before making precise behavioral claims or edits — PKMCP found the *where*, I verified the *what*.
+- [ ] I did not ask PKMCP to do full logic tracing — it shows what's there, not what's missing.
+- [ ] When CodeGraph was unhealthy, I checked whether the binary actually exists at the configured path rather than patching project.yaml by hand.
 - [ ] I cited concrete paths, line ranges, symbols, or decision/doc statuses.
 - [ ] I did not present PKMCP evidence packets as final truth without synthesis.
 - [ ] I did not use write tools unless the user explicitly requested a capture,

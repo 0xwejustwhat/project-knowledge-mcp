@@ -69,6 +69,28 @@ Safety defaults:
 
 Developer/automation alternatives remain available below.
 
+## Working with PKMCP as an AI agent
+
+PKMCP is designed for the **discovery → verify** two-step pattern:
+
+1. **PKMCP for discovery** — use `search_code`, `get_code_context`, `search_ops`, or `retrieve_ops_code_evidence` to find which files, symbols, and docs are relevant to a question. PKMCP returns bounded snippets with provenance metadata (authority, staleness, provider type).
+
+2. **Direct read for verification** — once PKMCP points you at a file and line range, use `read_file` or the equivalent to see the complete logic. PKMCP snippets are bounded and cannot show what's *missing* (control flow gaps, absent error handling, missing else-branches).
+
+**What PKMCP is good for:**
+- "Where is this feature implemented?" — broad codebase queries
+- "What does the project memory say about this decision?" — docs/decisions discovery
+- "Which files touch this concept?" — cross-repo evidence surfacing
+- "Is the index stale?" — staleness and provider health checks
+
+**What PKMCP is not for:**
+- Full function-level logic tracing — PKMCP shows bounded snippets, not complete functions
+- Finding what's *absent* — PKMCP indexes what exists in the repo; it cannot surface missing code paths
+- Live state — branch status, uncommitted diffs, test results require direct tool access
+- Replacing direct read — PKMCP finds the *where*, direct read confirms the *what*
+
+When CodeGraph reports as unhealthy, check `get_code_provider_status` for the `details` block. If `indexed_repos: []` or `missing_index_repos` is non-empty, the binary exists but needs indexing (`codegraph init && codegraph index`). If the binary path in `project.yaml` doesn't exist on disk, the setup write phase was never completed — do **not** patch the path by hand. Instead, run a fresh setup that correctly installs and initializes CodeGraph.
+
 ## Configuration
 
 Copy or adapt the example config:
