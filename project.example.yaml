@@ -14,18 +14,25 @@ repos:
     path: /workspace
     writable: true
     include_globs:
-      - README.md
-      - docs/**/*.md
-      - docs/*.md
-      - "*.md"
-      - src/**/*.py
-      - tests/**/*.py
+      - "**/*"
     exclude_globs:
       - .git/**
       - .project-knowledge/**
+      - .codegraph/**
       - .venv/**
+      - venv/**
       - __pycache__/**
       - .pytest_cache/**
+      - .ruff_cache/**
+      - .mypy_cache/**
+      - node_modules/**
+      - .tox/**
+      - dist/**
+      - build/**
+      - "*.egg-info/**"
+      - .coverage*
+      - "*.pyc"
+      - "*.pyo"
 retrieval:
   provider: sqlite_fts5
   mode: local_no_llm

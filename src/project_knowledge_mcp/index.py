@@ -15,7 +15,43 @@ import yaml
 
 STATE_DIR_NAME = ".project-knowledge"
 INDEX_DB_NAME = "index.sqlite3"
-SUPPORTED_SUFFIXES = {".md", ".mdx", ".txt", ".py", ".json"}
+SUPPORTED_SUFFIXES = {
+    "",  # suffixless files like Dockerfile, Makefile
+    ".md",
+    ".mdx",
+    ".txt",
+    ".py",
+    ".pyi",
+    ".pyx",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".cfg",
+    ".ini",
+    ".conf",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".css",
+    ".html",
+    ".xml",
+    ".go",
+    ".rs",
+    ".java",
+    ".rb",
+    ".kt",
+    ".sql",
+    ".dockerfile",
+    ".env",
+    ".gitignore",
+    ".gitattributes",
+    ".lock",
+}
 
 VALID_TYPES = {
     "doctrine",
@@ -747,14 +783,27 @@ def parse_document(path: str, text: str, *, repo_id: str, repo_role: str) -> Par
         title = next((line.strip() for line in text.splitlines() if line.strip()), Path(path).name)[
             :120
         ]
-    elif suffix in {".py", ".json"}:
-        parser = "code" if suffix == ".py" else "json"
+    elif suffix in {
+        ".py", ".pyi", ".pyx",
+        ".json",
+        ".yaml", ".yml", ".toml", ".cfg", ".ini", ".conf",
+        ".sh", ".bash", ".zsh",
+        ".js", ".jsx", ".ts", ".tsx",
+        ".css", ".html", ".xml",
+        ".go", ".rs", ".java", ".rb", ".kt", ".sql",
+    }:
+        parser = "code" if path.endswith((".py", ".pyi", ".pyx")) else "text"
         raw_frontmatter = {}
         body = text
         headings = []
         title = Path(path).name
     else:
-        raise ValueError(f"unsupported file type for indexing: {path}")
+        # Suffixless files (Dockerfile, Makefile, etc.) and other text files
+        parser = "text"
+        raw_frontmatter = {}
+        body = text
+        headings = []
+        title = Path(path).name
 
     body = body.strip()
     normalized, warnings = normalize_frontmatter(raw_frontmatter, path=path, repo_role=repo_role)
