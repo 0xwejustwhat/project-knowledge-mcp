@@ -34,7 +34,7 @@ def _repo_config(
     role: str,
     path: Path,
     writable: bool,
-    include_globs: list[str],
+    include_globs: list[str] | None = None,
 ) -> dict[str, Any]:
     return {
         "id": repo_id,
@@ -42,8 +42,26 @@ def _repo_config(
         "path": path.as_posix(),
         "writable": writable,
         "source_mode": "workspace",
-        "include_globs": include_globs,
-        "exclude_globs": [".git/**", ".project-knowledge/**"],
+        "include_globs": include_globs or ["**/*"],
+        "exclude_globs": [
+            ".git/**",
+            ".project-knowledge/**",
+            ".codegraph/**",
+            ".venv/**",
+            "venv/**",
+            "__pycache__/**",
+            ".pytest_cache/**",
+            ".ruff_cache/**",
+            ".mypy_cache/**",
+            "node_modules/**",
+            ".tox/**",
+            "dist/**",
+            "build/**",
+            "*.egg-info/**",
+            ".coverage*",
+            "*.pyc",
+            "*.pyo",
+        ],
     }
 
 
@@ -87,7 +105,6 @@ def build_project_config(
             role="ops",
             path=ops_path,
             writable=True,
-            include_globs=["README.md", "docs/**/*.md", "*.md"],
         )
     ]
     for index, work_path in enumerate(work_paths, start=1):
@@ -99,13 +116,6 @@ def build_project_config(
                 role="work",
                 path=work_path,
                 writable=False,
-                include_globs=[
-                    "src/**/*.py",
-                    "tests/**/*.py",
-                    "docs/**/*.md",
-                    "*.md",
-                    "pyproject.toml",
-                ],
             )
         )
 
