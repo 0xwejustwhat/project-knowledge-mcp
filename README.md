@@ -81,6 +81,18 @@ poetry run project-knowledge index-project --config ./project.yaml
 
 The Docker example expects the config at `/workspace/project.yaml`; the included `project.example.yaml` is therefore written with `/workspace` container paths.
 
+## Searching
+
+CLI commands use hyphens, while MCP tools use underscores: for example, `search-code` on the command line corresponds to the `search_code` MCP tool.
+
+```bash
+poetry run project-knowledge search-ops "deployment doctrine" --config ./project.yaml
+poetry run project-knowledge search-code "HTTPS Caddy bridge" --config ./project.yaml
+poetry run project-knowledge search-decisions "remote bridge" --config ./project.yaml
+poetry run project-knowledge search-open-questions "release blocker" --config ./project.yaml
+poetry run project-knowledge search-index "raw lexical query" --config ./project.yaml
+```
+
 ## CLI setup/client bootstrap
 
 Use `setup` to preview or generate a local/no-LLM `project.yaml`, Docker mount guidance, and client snippets without manually assembling YAML:

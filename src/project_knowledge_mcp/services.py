@@ -15,6 +15,7 @@ import yaml
 
 from project_knowledge_mcp.code_context import (
     CodeGraphProvider,
+    CodeResult,
     TextFallbackCodeContextProvider,
 )
 from project_knowledge_mcp.config import (
@@ -785,9 +786,10 @@ def search_code_from_config(
     graph_health = graph_provider.health()
     warnings = list(graph_health.warnings)
     active_provider = graph_health.active_provider
+    graph_results: list[CodeResult] = []
     if graph_health.codegraph_healthy:
         try:
-            results = graph_provider.search_code(query, repo_id=repo_id, limit=result_limit)
+            graph_results = graph_provider.search_code(query, repo_id=repo_id, limit=result_limit)
         except RuntimeError:
             if not config.code_context.fallback_on_unhealthy:
                 return _provider_unavailable(
@@ -803,13 +805,34 @@ def search_code_from_config(
             warnings.append("CodeGraph search failed; using text fallback.")
             active_provider = config.code_context.fallback_provider
         else:
-            payload_results = [result.to_payload() for result in results]
+            try:
+                fts_results = _search_code_fts_results(
+                    config=config,
+                    query=query,
+                    repo_id=repo_id,
+                    limit=result_limit,
+                    include_ops=repo_id is None,
+                )
+            except (FileNotFoundError, sqlite3.Error, OSError):
+                warnings.append("SQLite FTS5 search is not ready; run index_project first.")
+                merged_results = graph_results
+                active_provider = "codegraph"
+            except ValueError as exc:
+                return _query_invalid(
+                    query,
+                    str(exc),
+                    details={"repo_id": repo_id, "limit": result_limit},
+                )
+            else:
+                merged_results = _merge_code_results([*graph_results, *fts_results], result_limit)
+                active_provider = "codegraph+fts5"
+            payload_results = [result.to_payload() for result in merged_results]
             return {
                 "tool": "search_code",
                 "query": query,
                 "project_id": config.project.id,
                 "configured_provider": graph_health.configured_provider,
-                "active_provider": "codegraph",
+                "active_provider": active_provider,
                 "results": payload_results,
                 "warnings": warnings,
                 "markdown": _render_code_markdown("Code Search Results", query, payload_results),
@@ -848,6 +871,78 @@ def search_code_from_config(
         "warnings": warnings,
         "markdown": _render_code_markdown("Code Search Results", query, payload_results),
     }
+
+
+def _search_code_fts_results(
+    *,
+    config: ProjectKnowledgeConfig,
+    query: str,
+    repo_id: str | None,
+    limit: int,
+    include_ops: bool,
+) -> list[CodeResult]:
+    provider = TextFallbackCodeContextProvider(config)
+    per_source_limit = max(limit * 3, 10)
+    work_repos = [repo for repo in config.repos if repo.role == "work"]
+    if repo_id is not None:
+        work_repos = [repo for repo in work_repos if repo.id == repo_id]
+    results = provider.search_repos(
+        query,
+        repos=work_repos,
+        limit=per_source_limit,
+        provider="fts5",
+        include_all_doc_types=True,
+    )
+    if include_ops:
+        results.extend(
+            provider.search_repos(
+                query,
+                repos=[config.ops_repo],
+                limit=per_source_limit,
+                provider="ops",
+                include_all_doc_types=True,
+            )
+        )
+    return _merge_code_results(results, per_source_limit)
+
+
+def _merge_code_results(results: list[CodeResult], limit: int) -> list[CodeResult]:
+    deduped: dict[tuple[str, str, int | None, int | None, str | None, str], CodeResult] = {}
+    for result in results:
+        key = (
+            result.repo_id,
+            result.path,
+            result.start_line,
+            result.end_line,
+            result.symbol,
+            result.provider,
+        )
+        existing = deduped.get(key)
+        if existing is None or result.score > existing.score:
+            deduped[key] = result
+    merged = list(deduped.values())
+    merged.sort(
+        key=lambda result: (
+            _code_result_kind_rank(result.kind),
+            -result.score,
+            result.path,
+            result.symbol or "",
+            result.provider,
+        )
+    )
+    return merged[:limit]
+
+
+def _code_result_kind_rank(kind: str) -> int:
+    return {
+        "class": 0,
+        "function": 0,
+        "method": 0,
+        "code": 1,
+        "schema": 2,
+        "test": 3,
+        "file": 4,
+    }.get(kind, 5)
 
 
 def get_code_context_from_config(

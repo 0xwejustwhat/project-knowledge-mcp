@@ -83,7 +83,21 @@ def configured_project(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     state_dir = tmp_path / ".project-knowledge"
     init_git_repo(ops_repo)
     init_git_repo(work_repo)
-    write_file(ops_repo, "docs/doctrine/context.md", "# Context\n\nOps doctrine.")
+    write_file(
+        ops_repo,
+        "docs/doctrine/context.md",
+        "# Context\n\nOps doctrine for the HTTPS Caddy bridge evidence packet.",
+    )
+    write_file(
+        ops_repo,
+        "docs/runbooks/bridge.md",
+        "# Bridge Runbook\n\nThe ops repo tracks HTTPS Caddy bridge rollout evidence.",
+    )
+    write_file(
+        work_repo,
+        "README.md",
+        "# App README\n\nThe work repo documents the HTTPS Caddy bridge for operators.",
+    )
     write_file(
         work_repo,
         "src/example.py",
@@ -431,7 +445,7 @@ def test_search_code_uses_text_fallback_for_indexed_work_repo(tmp_path: Path):
     assert payload["results"][0]["repo_id"] == "app"
     assert payload["results"][0]["path"] == "src/example.py"
     assert payload["results"][0]["kind"] == "code"
-    assert payload["results"][0]["provider"] == "text"
+    assert payload["results"][0]["provider"] == "fts5"
     assert payload["results"][0]["symbol"] == "ExampleService.compile_context"
     assert payload["results"][0]["start_line"] <= payload["results"][0]["end_line"]
     assert "compile_context" in payload["results"][0]["snippet"]
@@ -539,19 +553,17 @@ def test_search_code_prefers_codegraph_and_normalizes_public_results(tmp_path: P
     config_path, _ops_repo, _work_repo, _state_dir = configured_project(tmp_path)
     command = write_fake_codegraph(tmp_path)
     configure_codegraph_command(config_path, command)
+    index_project_from_config(config_path=config_path)
 
     payload = search_code_from_config(
         query="compile_context evidence", config_path=config_path, repo_id="app", limit=5
     )
 
     assert payload["tool"] == "search_code"
-    assert payload["active_provider"] == "codegraph"
+    assert payload["active_provider"] == "codegraph+fts5"
     assert payload["warnings"] == []
-    assert [result["provider"] for result in payload["results"]] == [
-        "codegraph",
-        "codegraph",
-        "codegraph",
-    ]
+    providers = {result["provider"] for result in payload["results"]}
+    assert {"codegraph", "fts5"}.issubset(providers)
     first = payload["results"][0]
     assert first == {
         "repo_id": "app",
@@ -571,6 +583,47 @@ def test_search_code_prefers_codegraph_and_normalizes_public_results(tmp_path: P
     }
     assert "raw" not in str(payload["results"]).lower()
     assert "## Exploration" not in str(payload["results"])
+
+
+def test_search_code_includes_work_repo_documentation_with_healthy_codegraph(tmp_path: Path):
+    config_path, _ops_repo, _work_repo, _state_dir = configured_project(tmp_path)
+    command = write_fake_codegraph(tmp_path)
+    configure_codegraph_command(config_path, command)
+    index_project_from_config(config_path=config_path)
+
+    payload = search_code_from_config(
+        query="HTTPS Caddy bridge", config_path=config_path, repo_id="app", limit=10
+    )
+
+    assert payload["active_provider"] == "codegraph+fts5"
+    work_docs = [
+        result
+        for result in payload["results"]
+        if result["repo_id"] == "app" and result["path"] == "README.md"
+    ]
+    assert work_docs
+    assert work_docs[0]["provider"] == "fts5"
+    assert work_docs[0]["kind"] == "unknown"
+    assert "Caddy bridge" in work_docs[0]["snippet"]
+    assert all(result["repo_id"] != "ops" for result in payload["results"])
+
+
+def test_search_code_includes_ops_docs_when_repo_scope_is_omitted(tmp_path: Path):
+    config_path, _ops_repo, _work_repo, _state_dir = configured_project(tmp_path)
+    command = write_fake_codegraph(tmp_path)
+    configure_codegraph_command(config_path, command)
+    index_project_from_config(config_path=config_path)
+
+    payload = search_code_from_config(query="HTTPS Caddy bridge", config_path=config_path, limit=10)
+
+    assert payload["active_provider"] == "codegraph+fts5"
+    providers_by_repo = {
+        (result["repo_id"], result["provider"])
+        for result in payload["results"]
+        if "Caddy bridge" in result["snippet"]
+    }
+    assert ("app", "fts5") in providers_by_repo
+    assert ("ops", "ops") in providers_by_repo
 
 
 def test_search_code_uses_repo_source_not_provider_fenced_text(tmp_path: Path):
@@ -647,18 +700,20 @@ def test_evidence_packet_includes_graph_backed_code_results(tmp_path: Path):
     config_path, _ops_repo, _work_repo, _state_dir = configured_project(tmp_path)
     command = write_fake_codegraph(tmp_path)
     configure_codegraph_command(config_path, command)
-    indexed = index_project_from_config(config_path=config_path, repo_id="ops")
+    indexed = index_project_from_config(config_path=config_path)
     assert indexed["status"] == "ok"
 
     packet = retrieve_ops_code_evidence_from_config(
-        topic="compile_context evidence", config_path=config_path, limit=3
+        topic="HTTPS Caddy bridge", config_path=config_path, limit=10
     )
 
     assert packet["tool"] == "retrieve_ops_code_evidence"
     assert packet["sections"]["code"]
-    assert packet["sections"]["code"][0]["provider"] == "codegraph"
+    providers = {result["provider"] for result in packet["sections"]["code"]}
+    assert {"codegraph", "fts5", "ops"}.issubset(providers)
     assert packet["gaps"] == []
-    assert "provider: `codegraph`" in packet["markdown"]
+    assert "provider: `fts5`" in packet["markdown"]
+    assert "provider: `ops`" in packet["markdown"]
 
 
 def test_codegraph_search_failure_falls_back_with_explicit_warning(tmp_path: Path):
@@ -672,7 +727,7 @@ def test_codegraph_search_failure_falls_back_with_explicit_warning(tmp_path: Pat
     )
 
     assert payload["active_provider"] == "text"
-    assert payload["results"][0]["provider"] == "text"
+    assert payload["results"][0]["provider"] == "fts5"
     assert any("CodeGraph search failed" in warning for warning in payload["warnings"])
     assert "explore failed" not in str(payload)
 
@@ -688,7 +743,7 @@ def test_unrecognized_codegraph_explore_output_falls_back_without_raw_provider_t
     )
 
     assert payload["active_provider"] == "text"
-    assert payload["results"][0]["provider"] == "text"
+    assert payload["results"][0]["provider"] == "fts5"
     assert any("CodeGraph search failed" in warning for warning in payload["warnings"])
     assert "Provider diagnostic" not in str(payload)
     assert "Raw provider internals" not in str(payload)
@@ -705,7 +760,7 @@ def test_unfenced_codegraph_explore_output_falls_back_without_raw_provider_text(
     )
 
     assert payload["active_provider"] == "text"
-    assert payload["results"][0]["provider"] == "text"
+    assert payload["results"][0]["provider"] == "fts5"
     assert any("CodeGraph search failed" in warning for warning in payload["warnings"])
     assert "Provider diagnostic" not in str(payload)
     assert "Raw provider internals" not in str(payload)
@@ -722,7 +777,7 @@ def test_malformed_codegraph_explore_fence_falls_back_without_raw_text(tmp_path:
     )
 
     assert payload["active_provider"] == "text"
-    assert payload["results"][0]["provider"] == "text"
+    assert payload["results"][0]["provider"] == "fts5"
     assert any("CodeGraph search failed" in warning for warning in payload["warnings"])
     assert "do-not-return" not in str(payload)
     assert "Provider diagnostic" not in str(payload)
@@ -739,7 +794,7 @@ def test_unnumbered_codegraph_explore_snippet_falls_back_without_raw_text(tmp_pa
     )
 
     assert payload["active_provider"] == "text"
-    assert payload["results"][0]["provider"] == "text"
+    assert payload["results"][0]["provider"] == "fts5"
     assert any("CodeGraph search failed" in warning for warning in payload["warnings"])
     assert "do-not-return" not in str(payload)
     assert "PLACEHOLDER" not in str(payload)
@@ -764,7 +819,7 @@ def test_codegraph_rejects_env_like_provider_paths(tmp_path: Path):
     )
 
     assert payload["active_provider"] == "text"
-    assert payload["results"][0]["provider"] == "text"
+    assert payload["results"][0]["provider"] == "fts5"
     assert ".env.py" not in str(payload)
     assert "do-not-return" not in str(payload)
 
@@ -788,7 +843,7 @@ def test_codegraph_rejects_env_directory_provider_paths(tmp_path: Path):
     )
 
     assert payload["active_provider"] == "text"
-    assert payload["results"][0]["provider"] == "text"
+    assert payload["results"][0]["provider"] == "fts5"
     assert "config/.env/settings.py" not in str(payload)
     assert "do-not-return" not in str(payload)
 
@@ -804,7 +859,7 @@ def test_codegraph_rejects_provider_paths_outside_repo_scope(tmp_path: Path):
     )
 
     assert payload["active_provider"] == "text"
-    assert payload["results"][0]["provider"] == "text"
+    assert payload["results"][0]["provider"] == "fts5"
     assert "../secret_config.py" not in str(payload)
     assert "do-not-return" not in str(payload)
 
@@ -821,7 +876,7 @@ def test_codegraph_rejects_symlinked_provider_paths_before_resolution(tmp_path: 
     )
 
     assert payload["active_provider"] == "text"
-    assert payload["results"][0]["provider"] == "text"
+    assert payload["results"][0]["provider"] == "fts5"
     assert "src/link.py" not in str(payload)
     assert "symlink target" not in str(payload)
 
@@ -838,7 +893,7 @@ def test_codegraph_rejects_symlinked_directory_provider_paths(tmp_path: Path):
     )
 
     assert payload["active_provider"] == "text"
-    assert payload["results"][0]["provider"] == "text"
+    assert payload["results"][0]["provider"] == "fts5"
     assert "src/alias/example.py" not in str(payload)
     assert "symlink directory target" not in str(payload)
 
@@ -943,7 +998,7 @@ def test_unrecognized_codegraph_node_output_falls_back_without_raw_provider_text
     )
 
     assert payload["active_provider"] == "text"
-    assert payload["results"][0]["provider"] == "text"
+    assert payload["results"][0]["provider"] == "fts5"
     assert any("CodeGraph context lookup failed" in warning for warning in payload["warnings"])
     assert "Provider diagnostic" not in str(payload)
     assert "Raw provider internals" not in str(payload)
@@ -960,7 +1015,7 @@ def test_empty_codegraph_node_snippet_falls_back_without_raw_provider_text(tmp_p
     )
 
     assert payload["active_provider"] == "text"
-    assert payload["results"][0]["provider"] == "text"
+    assert payload["results"][0]["provider"] == "fts5"
     assert any("CodeGraph context lookup failed" in warning for warning in payload["warnings"])
     assert "Provider diagnostic" not in str(payload)
     assert "no source should not leak" not in str(payload)

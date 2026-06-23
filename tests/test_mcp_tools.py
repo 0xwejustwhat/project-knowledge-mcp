@@ -685,7 +685,7 @@ def test_mcp_code_context_tools_return_text_fallback_results(tmp_path: Path):
     assert search["active_provider"] == "text"
     assert search["results"][0]["path"] == "src/example.py"
     assert search["results"][0]["kind"] == "code"
-    assert search["results"][0]["provider"] == "text"
+    assert search["results"][0]["provider"] == "fts5"
     assert search["warnings"]
 
     context = asyncio.run(

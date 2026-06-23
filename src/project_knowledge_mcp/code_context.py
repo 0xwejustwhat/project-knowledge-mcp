@@ -442,6 +442,23 @@ class TextFallbackCodeContextProvider:
 
     def search_code(self, query: str, repo_id: str | None, limit: int) -> list[CodeResult]:
         repos = self._selected_work_repos(repo_id)
+        return self.search_repos(
+            query,
+            repos=repos,
+            limit=limit,
+            provider="fts5",
+            include_all_doc_types=False,
+        )
+
+    def search_repos(
+        self,
+        query: str,
+        *,
+        repos: list[RepoConfig],
+        limit: int,
+        provider: str,
+        include_all_doc_types: bool,
+    ) -> list[CodeResult]:
         self._ensure_repos_match_index(repos)
         index = self.index
         collected: list[CodeResult] = []
@@ -449,9 +466,11 @@ class TextFallbackCodeContextProvider:
         for repo in repos:
             results = index.search(query, filters={"repo_id": repo.id}, limit=per_repo_limit)
             for result in results:
-                if result.doc_type not in _CODE_DOC_TYPES:
+                if not include_all_doc_types and result.doc_type not in _CODE_DOC_TYPES:
                     continue
-                collected.append(self._from_search_result(result, query=query, repo=repo))
+                collected.append(
+                    self._from_search_result(result, query=query, repo=repo, provider=provider)
+                )
         collected.sort(
             key=lambda result: (
                 _kind_sort_rank(result.kind),
@@ -539,7 +558,7 @@ class TextFallbackCodeContextProvider:
         return True
 
     def _from_search_result(
-        self, result: SearchResult, *, query: str, repo: RepoConfig
+        self, result: SearchResult, *, query: str, repo: RepoConfig, provider: str
     ) -> CodeResult:
         repo_path = repo.path / result.path
         snippet = result.snippet.replace("[", "").replace("]", "")
@@ -552,7 +571,7 @@ class TextFallbackCodeContextProvider:
             symbol=symbol,
             kind=_kind_from_doc_type(result.doc_type),
             snippet=snippet,
-            provider="text",
+            provider=provider,
             score=float(result.final_score),
             related=[],
         )
