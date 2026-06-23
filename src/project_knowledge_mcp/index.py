@@ -140,6 +140,7 @@ class IndexSummary:
     indexed_chunks: int
     warning_count: int
     skipped_documents: int = 0
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -549,6 +550,7 @@ def index_repo(
     indexed_chunks = 0
     warning_count = 0
     skipped_docs = 0
+    collected_warnings: list[str] = []
     for file_path in _iter_indexable_files(
         repo_path,
         state_dir=state_dir,
@@ -568,13 +570,17 @@ def index_repo(
         if max_file_bytes is not None and stat.st_size > max_file_bytes:
             skipped_docs += 1
             warning_count += 1
+            warning_msg = (
+                f"Skipped file larger than max_file_bytes ({stat.st_size} > {max_file_bytes})"
+            )
+            collected_warnings.append(f"[{relative_path}] {warning_msg}")
             _insert_index_event(
                 conn,
                 event_type="file_skipped",
                 repo_id=repo_id,
                 path=relative_path,
                 status="warning",
-                message=f"Skipped file larger than max_file_bytes ({stat.st_size} > {max_file_bytes})",
+                message=warning_msg,
                 created_at=now,
             )
             continue
@@ -588,6 +594,8 @@ def index_repo(
         indexed_docs += 1
         indexed_chunks += len(parsed.chunks)
         warning_count += len(parsed.warnings)
+        for w in parsed.warnings:
+            collected_warnings.append(f"[{w.path}] {w.message}")
 
     conn.commit()
     conn.close()
@@ -598,6 +606,7 @@ def index_repo(
         indexed_chunks=indexed_chunks,
         warning_count=warning_count,
         skipped_documents=skipped_docs,
+        warnings=tuple(collected_warnings),
     )
 
 

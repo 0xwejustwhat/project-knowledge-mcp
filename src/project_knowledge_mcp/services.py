@@ -76,7 +76,7 @@ def index_project_from_config(
         )
         repo_warnings: list[str] = []
         if summary.warning_count:
-            repo_warnings.append(f"{summary.warning_count} index warning(s) recorded")
+            repo_warnings = list(summary.warnings)
         repo_summaries.append(
             {
                 "repo_id": summary.repo_id,
@@ -1653,7 +1653,7 @@ def _index_written_document(
         return False, [f"single-document indexing failed: {exc}"]
     warnings = []
     if summary.warning_count:
-        warnings.append(f"{summary.warning_count} index warning(s) recorded")
+        warnings = list(summary.warnings)
     return True, warnings
 
 

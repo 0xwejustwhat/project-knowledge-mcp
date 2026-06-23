@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import typer
 from fastmcp import FastMCP
+from pydantic import Field
 
 from project_knowledge_mcp.index import ProjectIndex, index_repo
 from project_knowledge_mcp.setup import (
@@ -57,7 +58,10 @@ def create_mcp() -> FastMCP:
 
     @mcp.tool
     def validate_config(
-        config_path: str | None = None, config: dict[str, Any] | None = None
+        config_path: Annotated[str | None, Field(description="Path to project.yaml")] = None,
+        config: Annotated[
+            dict[str, Any] | None, Field(description="Inline config dict for legacy smoke testing")
+        ] = None,
     ) -> dict[str, Any]:
         """Validate real project config, with legacy inline smoke compatibility."""
         if config_path is None and config is not None and "schema_version" not in config:
@@ -74,7 +78,13 @@ def create_mcp() -> FastMCP:
 
     @mcp.tool
     def index_project(
-        config_path: str | None = None, repo_id: str | None = None, force: bool = False
+        config_path: Annotated[str | None, Field(description="Path to project.yaml")] = None,
+        repo_id: Annotated[
+            str | None, Field(description="Optional repo ID to index (indexes all if omitted)")
+        ] = None,
+        force: Annotated[
+            bool, Field(description="Force re-index even if index is current")
+        ] = False,
     ) -> dict[str, Any]:
         """Index configured repos into the authority-aware SQLite store."""
         try:
@@ -94,10 +104,13 @@ def create_mcp() -> FastMCP:
 
     @mcp.tool
     def search_ops(
-        query: str,
-        config_path: str | None = None,
-        filters: dict[str, Any] | None = None,
-        limit: int | None = None,
+        query: Annotated[str, Field(description="Lexical search query for ops documentation")],
+        config_path: Annotated[str | None, Field(description="Path to project.yaml")] = None,
+        filters: Annotated[
+            dict[str, Any] | None,
+            Field(description="Optional filters (include_superseded, doc_type, status, authority)"),
+        ] = None,
+        limit: Annotated[int | None, Field(description="Maximum results to return")] = None,
     ) -> dict[str, Any]:
         """Search configured ops repo docs with authority-aware ranking."""
         return search_ops_from_config(
@@ -109,10 +122,13 @@ def create_mcp() -> FastMCP:
 
     @mcp.tool
     def search_decisions(
-        query: str,
-        config_path: str | None = None,
-        filters: dict[str, Any] | None = None,
-        limit: int | None = None,
+        query: Annotated[str, Field(description="Lexical search query for decision documents")],
+        config_path: Annotated[str | None, Field(description="Path to project.yaml")] = None,
+        filters: Annotated[
+            dict[str, Any] | None,
+            Field(description="Optional filters (include_superseded, status, authority)"),
+        ] = None,
+        limit: Annotated[int | None, Field(description="Maximum results to return")] = None,
     ) -> dict[str, Any]:
         """Search accepted and draft decision docs with authority-aware ranking."""
         return search_decisions_from_config(
@@ -124,10 +140,14 @@ def create_mcp() -> FastMCP:
 
     @mcp.tool
     def get_current_doctrine(
-        topic: str,
-        config_path: str | None = None,
-        filters: dict[str, Any] | None = None,
-        limit: int | None = None,
+        topic: Annotated[
+            str, Field(description="Topic to retrieve current doctrine and decisions for")
+        ],
+        config_path: Annotated[str | None, Field(description="Path to project.yaml")] = None,
+        filters: Annotated[
+            dict[str, Any] | None, Field(description="Optional filters (include_superseded)")
+        ] = None,
+        limit: Annotated[int | None, Field(description="Maximum results per section")] = None,
     ) -> dict[str, Any]:
         """Return canonical/current doctrine and accepted decisions for a topic."""
         return get_current_doctrine_from_config(
@@ -139,10 +159,13 @@ def create_mcp() -> FastMCP:
 
     @mcp.tool
     def search_open_questions(
-        query: str,
-        config_path: str | None = None,
-        filters: dict[str, Any] | None = None,
-        limit: int | None = None,
+        query: Annotated[str, Field(description="Lexical search query for open questions")],
+        config_path: Annotated[str | None, Field(description="Path to project.yaml")] = None,
+        filters: Annotated[
+            dict[str, Any] | None,
+            Field(description="Optional filters (include_superseded, status)"),
+        ] = None,
+        limit: Annotated[int | None, Field(description="Maximum results to return")] = None,
     ) -> dict[str, Any]:
         """Search open questions with source and owner metadata."""
         return search_open_questions_from_config(
@@ -154,10 +177,12 @@ def create_mcp() -> FastMCP:
 
     @mcp.tool
     def search_code(
-        query: str,
-        config_path: str | None = None,
-        repo_id: str | None = None,
-        limit: int | None = None,
+        query: Annotated[str, Field(description="Lexical search query for code, tests, or schema")],
+        config_path: Annotated[str | None, Field(description="Path to project.yaml")] = None,
+        repo_id: Annotated[
+            str | None, Field(description="Optional work repo ID to scope search")
+        ] = None,
+        limit: Annotated[int | None, Field(description="Maximum results to return")] = None,
     ) -> dict[str, Any]:
         """Search configured work repo code/test/schema evidence."""
         return search_code_from_config(
@@ -166,10 +191,17 @@ def create_mcp() -> FastMCP:
 
     @mcp.tool
     def get_code_context(
-        symbol_or_file: str,
-        config_path: str | None = None,
-        repo_id: str | None = None,
-        limit: int | None = None,
+        symbol_or_file: Annotated[
+            str,
+            Field(
+                description="Symbol name (e.g. class/function) or repo-relative file path to retrieve context for"
+            ),
+        ],
+        config_path: Annotated[str | None, Field(description="Path to project.yaml")] = None,
+        repo_id: Annotated[
+            str | None, Field(description="Optional work repo ID to scope lookup")
+        ] = None,
+        limit: Annotated[int | None, Field(description="Maximum results to return")] = None,
     ) -> dict[str, Any]:
         """Return symbol or file context via CodeGraph when healthy, else text fallback."""
         return get_code_context_from_config(
@@ -180,15 +212,20 @@ def create_mcp() -> FastMCP:
         )
 
     @mcp.tool
-    def get_code_provider_status(config_path: str | None = None) -> dict[str, Any]:
+    def get_code_provider_status(
+        config_path: Annotated[str | None, Field(description="Path to project.yaml")] = None,
+    ) -> dict[str, Any]:
         """Return CodeGraph/text fallback provider health."""
         return get_code_provider_status_from_config(config_path=config_path)
 
     @mcp.tool
     def retrieve_ops_code_evidence(
-        topic: str,
-        config_path: str | None = None,
-        limit: int | None = None,
+        topic: Annotated[
+            str,
+            Field(description="Topic to retrieve grouped ops documentation and code evidence for"),
+        ],
+        config_path: Annotated[str | None, Field(description="Path to project.yaml")] = None,
+        limit: Annotated[int | None, Field(description="Maximum results per section")] = None,
     ) -> dict[str, Any]:
         """Retrieve grouped ops and code evidence for a task/topic."""
         return retrieve_ops_code_evidence_from_config(
@@ -197,10 +234,14 @@ def create_mcp() -> FastMCP:
 
     @mcp.tool
     def generate_session_brief(
-        task: str,
-        config_path: str | None = None,
-        since: str | None = None,
-        limit: int | None = None,
+        task: Annotated[
+            str, Field(description="Task or topic to compile a deterministic evidence packet for")
+        ],
+        config_path: Annotated[str | None, Field(description="Path to project.yaml")] = None,
+        since: Annotated[
+            str | None, Field(description="ISO date string to filter results (e.g. 2026-06-01)")
+        ] = None,
+        limit: Annotated[int | None, Field(description="Maximum results per section")] = None,
     ) -> dict[str, Any]:
         """Compile a deterministic evidence packet for assistant session context."""
         return generate_session_brief_from_config(
@@ -209,13 +250,20 @@ def create_mcp() -> FastMCP:
 
     @mcp.tool
     def add_project_note(
-        title: str,
-        body: str,
-        type: str = "note",
-        tags: list[str] | None = None,
-        source: str | None = None,
-        target: str | None = None,
-        config_path: str | None = None,
+        title: Annotated[str, Field(description="Note title (becomes the filename)")],
+        body: Annotated[str, Field(description="Note body content in markdown")],
+        type: Annotated[
+            str, Field(description="Document type for frontmatter (default: note)")
+        ] = "note",
+        tags: Annotated[list[str] | None, Field(description="Optional tags for the note")] = None,
+        source: Annotated[
+            str | None, Field(description="Optional source context (e.g. discussion URL)")
+        ] = None,
+        target: Annotated[
+            str | None,
+            Field(description="Optional target repo-relative directory under docs/notes"),
+        ] = None,
+        config_path: Annotated[str | None, Field(description="Path to project.yaml")] = None,
     ) -> dict[str, Any]:
         """Write a low-authority capture note and index only that document."""
         return add_project_note_from_config(
@@ -230,13 +278,22 @@ def create_mcp() -> FastMCP:
 
     @mcp.tool
     def create_draft_artifact(
-        kind: str,
-        title: str,
-        body: str,
-        source: str | None = None,
-        tags: list[str] | None = None,
-        target: str | None = None,
-        config_path: str | None = None,
+        kind: Annotated[
+            str,
+            Field(
+                description="Draft kind: open_question, doctrine_delta, adr_draft, decision_proposal, review_packet, or handover"
+            ),
+        ],
+        title: Annotated[str, Field(description="Draft title")],
+        body: Annotated[str, Field(description="Draft body content in markdown")],
+        source: Annotated[
+            str | None, Field(description="Optional source context (e.g. discussion URL)")
+        ] = None,
+        tags: Annotated[list[str] | None, Field(description="Optional tags for the draft")] = None,
+        target: Annotated[
+            str | None, Field(description="Optional target repo-relative directory")
+        ] = None,
+        config_path: Annotated[str | None, Field(description="Path to project.yaml")] = None,
     ) -> dict[str, Any]:
         """Create a non-canonical proposal/draft artifact."""
         return create_draft_artifact_from_config(
@@ -251,13 +308,26 @@ def create_mcp() -> FastMCP:
 
     @mcp.tool
     def propose_authority_change(
-        title: str,
-        rationale: str,
-        changes: list[dict[str, Any]],
-        source: str | None = None,
-        tags: list[str] | None = None,
-        branch_name: str | None = None,
-        config_path: str | None = None,
+        title: Annotated[str, Field(description="Title of the authority change proposal")],
+        rationale: Annotated[
+            str, Field(description="Rationale explaining why this change is needed")
+        ],
+        changes: Annotated[
+            list[dict[str, Any]],
+            Field(
+                description="List of change objects (each with action, path, body / old_body / new_body)"
+            ),
+        ],
+        source: Annotated[
+            str | None, Field(description="Optional source context (e.g. discussion URL)")
+        ] = None,
+        tags: Annotated[
+            list[str] | None, Field(description="Optional tags for the proposal")
+        ] = None,
+        branch_name: Annotated[
+            str | None, Field(description="Optional custom branch name (auto-generated if omitted)")
+        ] = None,
+        config_path: Annotated[str | None, Field(description="Path to project.yaml")] = None,
     ) -> dict[str, Any]:
         """Prepare a branch/commit/optional PR for caller-supplied authority changes."""
         return propose_authority_change_from_config(
@@ -271,7 +341,9 @@ def create_mcp() -> FastMCP:
         )
 
     @mcp.tool
-    def check_project_staleness(config_path: str | None = None) -> dict[str, Any]:
+    def check_project_staleness(
+        config_path: Annotated[str | None, Field(description="Path to project.yaml")] = None,
+    ) -> dict[str, Any]:
         """Report configured repo Git freshness and index staleness."""
         return check_project_staleness_from_config(config_path=config_path)
 
