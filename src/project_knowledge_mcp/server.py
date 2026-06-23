@@ -8,6 +8,7 @@ import typer
 from fastmcp import FastMCP
 from pydantic import Field
 
+from project_knowledge_mcp.config import load_project_config
 from project_knowledge_mcp.index import ProjectIndex, index_repo
 from project_knowledge_mcp.setup import (
     build_client_config,
@@ -815,14 +816,21 @@ def propose_authority_change_command(
 @app.command("search-index")
 def search_index_command(
     query: str = typer.Argument(..., help="Lexical query for the SQLite FTS5 index."),
-    state_dir: Path = typer.Option(..., help="Project Knowledge state directory."),
+    state_dir: Path | None = typer.Option(None, help="Project Knowledge state directory."),
+    config: Path | None = typer.Option(None, "--config", help="Project Knowledge config path."),
     limit: int = typer.Option(10, min=1, help="Maximum results to return."),
     include_superseded: bool = typer.Option(
         False, help="Include superseded/rejected content with visible authority labels."
     ),
 ) -> None:
     """Search the local index with authority-aware post-ranking."""
-    results = ProjectIndex.open(state_dir).search(
+    resolved_state_dir = state_dir
+    if resolved_state_dir is None and config is not None:
+        loaded_config = load_project_config(config)
+        resolved_state_dir = loaded_config.storage.state_dir
+    if resolved_state_dir is None:
+        raise typer.BadParameter("Provide --state-dir or --config.")
+    results = ProjectIndex.open(resolved_state_dir).search(
         query, include_superseded=include_superseded, limit=limit
     )
     typer.echo(

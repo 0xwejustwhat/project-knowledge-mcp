@@ -378,6 +378,7 @@ def test_setup_docker_guidance_starts_loopback_http_and_mounts_repo_paths(tmp_pa
 def test_cli_indexes_and_searches_project(tmp_path: Path):
     repo = tmp_path / "ops"
     state = tmp_path / "state"
+    config_path = write_project_config(tmp_path, repo=repo, state_dir=state)
     doc = repo / "docs" / "doctrine" / "context.md"
     doc.parent.mkdir(parents=True)
     doc.write_text(
@@ -431,6 +432,22 @@ Project Knowledge MCP returns evidence packets before synthesis.
     assert payload["query"] == "evidence packets synthesis"
     assert payload["results"][0]["path"] == "docs/doctrine/context.md"
     assert payload["results"][0]["authority"] == "canonical"
+
+    config_search_result = CliRunner().invoke(
+        app,
+        [
+            "search-index",
+            "evidence packets synthesis",
+            "--config",
+            str(config_path),
+            "--limit",
+            "3",
+        ],
+    )
+
+    assert config_search_result.exit_code == 0, config_search_result.output
+    config_payload = json.loads(config_search_result.output)
+    assert config_payload["results"][0]["path"] == "docs/doctrine/context.md"
 
 
 def test_cli_validate_config_index_project_and_search_ops_from_config(tmp_path: Path):
