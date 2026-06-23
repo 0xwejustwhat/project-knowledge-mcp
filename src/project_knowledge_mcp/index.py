@@ -784,13 +784,32 @@ def parse_document(path: str, text: str, *, repo_id: str, repo_role: str) -> Par
             :120
         ]
     elif suffix in {
-        ".py", ".pyi", ".pyx",
+        ".py",
+        ".pyi",
+        ".pyx",
         ".json",
-        ".yaml", ".yml", ".toml", ".cfg", ".ini", ".conf",
-        ".sh", ".bash", ".zsh",
-        ".js", ".jsx", ".ts", ".tsx",
-        ".css", ".html", ".xml",
-        ".go", ".rs", ".java", ".rb", ".kt", ".sql",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".cfg",
+        ".ini",
+        ".conf",
+        ".sh",
+        ".bash",
+        ".zsh",
+        ".js",
+        ".jsx",
+        ".ts",
+        ".tsx",
+        ".css",
+        ".html",
+        ".xml",
+        ".go",
+        ".rs",
+        ".java",
+        ".rb",
+        ".kt",
+        ".sql",
     }:
         parser = "code" if path.endswith((".py", ".pyi", ".pyx")) else "text"
         raw_frontmatter = {}
