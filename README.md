@@ -103,6 +103,10 @@ poetry run project-knowledge index-project --config ./project.yaml
 
 The Docker example expects the config at `/workspace/project.yaml`; the included `project.example.yaml` is therefore written with `/workspace` container paths.
 
+## Frontmatter Reference
+
+See [docs/frontmatter.md](docs/frontmatter.md) for valid `type`, `status`, and `authority` values, status-to-authority defaults, path inference rules, query-tool constraints, and the exact `propose_authority_change` change object schema.
+
 ## Searching
 
 CLI commands use hyphens, while MCP tools use underscores: for example, `search-code` on the command line corresponds to the `search_code` MCP tool.

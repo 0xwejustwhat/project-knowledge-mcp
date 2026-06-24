@@ -316,7 +316,7 @@ def create_mcp() -> FastMCP:
         changes: Annotated[
             list[dict[str, Any]],
             Field(
-                description="List of change objects (each with action, path, body / old_body / new_body)"
+                description="List of change objects (each with operation, path, and full-file content)"
             ),
         ],
         source: Annotated[
