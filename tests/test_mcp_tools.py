@@ -224,6 +224,16 @@ async def list_tool_names() -> set[str]:
         return {tool.name for tool in await client.list_tools()}
 
 
+async def tool_metadata(tool_name: str) -> dict:
+    async with Client(create_mcp()) as client:
+        for tool in await client.list_tools():
+            if tool.name == tool_name:
+                if hasattr(tool, "model_dump"):
+                    return tool.model_dump()
+                return dict(tool)
+    raise AssertionError(f"Tool {tool_name!r} was not registered")
+
+
 def test_mcp_tool_registry_matches_phase7_surface():
     import asyncio
 
@@ -235,6 +245,22 @@ def test_mcp_tool_registry_matches_phase7_surface():
         "llm_required": False,
         "default_network_exposure": "loopback_or_stdio_only",
     }
+
+
+def test_mcp_propose_authority_change_metadata_matches_change_schema():
+    import asyncio
+
+    metadata = asyncio.run(tool_metadata("propose_authority_change"))
+    schema = metadata.get("inputSchema") or metadata.get("input_schema")
+    assert schema is not None
+    changes_description = schema["properties"]["changes"]["description"]
+
+    assert "operation" in changes_description
+    assert "path" in changes_description
+    assert "content" in changes_description
+    assert "action" not in changes_description
+    assert "old_body" not in changes_description
+    assert "new_body" not in changes_description
 
 
 def test_mcp_step7_write_tools_are_client_callable(monkeypatch, tmp_path: Path):
