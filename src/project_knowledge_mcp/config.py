@@ -91,6 +91,9 @@ class WritePolicyConfig(BaseModel):
     default_capture_repo: str = "ops"
     default_capture_dir: str = "docs/notes"
     allow_direct_capture: bool = True
+    capture_git_mode: Literal["direct_push", "local_only"] = "direct_push"
+    capture_branch: str = "main"
+    capture_remote: str = "origin"
     blocked_direct_write_globs: list[str] = Field(default_factory=list)
     proposal_dirs: dict[str, str] = Field(default_factory=dict)
 
@@ -269,6 +272,23 @@ def validate_project_config(config_path: Path | str | None = None) -> dict[str, 
                     details={"field": field_name, "path": pattern},
                 )
             )
+
+    if not _is_safe_git_ref_name(config.write_policy.capture_branch):
+        errors.append(
+            _error(
+                "CONFIG_INVALID",
+                "write_policy.capture_branch must be a safe branch name",
+                details={"capture_branch": config.write_policy.capture_branch},
+            )
+        )
+    if not _is_safe_git_remote_name(config.write_policy.capture_remote):
+        errors.append(
+            _error(
+                "CONFIG_INVALID",
+                "write_policy.capture_remote must be a safe remote name",
+                details={"capture_remote": config.write_policy.capture_remote},
+            )
+        )
 
     if not _is_relative_to(config.storage.state_dir, config.storage.project_root):
         errors.append(
@@ -467,6 +487,23 @@ def _is_git_worktree(path: Path) -> bool:
 def _is_absolute_or_parent_glob(pattern: str) -> bool:
     path = Path(pattern)
     return path.is_absolute() or ".." in path.parts
+
+
+def _is_safe_git_ref_name(value: str) -> bool:
+    if (
+        not value
+        or value.startswith(("-", "/", "."))
+        or value.endswith(("/", ".", ".lock"))
+        or ".." in value
+        or "@{" in value
+        or "\\" in value
+    ):
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", value))
+
+
+def _is_safe_git_remote_name(value: str) -> bool:
+    return bool(value and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value))
 
 
 def _is_relative_to(child: Path | None, parent: Path) -> bool:

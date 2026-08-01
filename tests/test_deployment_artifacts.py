@@ -60,6 +60,9 @@ def test_project_example_is_local_no_key_workspace_config():
     assert config["retrieval"]["llm_enabled"] is False
     assert config["retrieval"]["embeddings_enabled"] is False
     assert config["retrieval"]["cloud_parsers_enabled"] is False
+    assert config["write_policy"]["capture_git_mode"] == "direct_push"
+    assert config["write_policy"]["capture_branch"] == "main"
+    assert config["write_policy"]["capture_remote"] == "origin"
     assert "docs/doctrine/**" in config["write_policy"]["blocked_direct_write_globs"]
 
 

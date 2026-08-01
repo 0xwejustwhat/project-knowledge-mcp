@@ -23,6 +23,7 @@ def write_project_config(
     default_limit: int = 7,
     writable: bool = True,
     default_capture_dir: str = "docs/notes",
+    write_policy_extra: str = "",
     repo_extra: str = "",
 ) -> Path:
     state_dir = state_dir or project_root / ".project-knowledge"
@@ -55,6 +56,7 @@ write_policy:
   default_capture_repo: ops
   default_capture_dir: {default_capture_dir}
   allow_direct_capture: true
+{write_policy_extra.rstrip()}
 """.strip()
         + "\n",
         encoding="utf-8",
@@ -76,6 +78,9 @@ def test_load_project_config_from_explicit_path(tmp_path: Path):
     assert config.ops_repo.id == "ops"
     assert config.ops_repo.role == "ops"
     assert config.retrieval.provider == "sqlite_fts5"
+    assert config.write_policy.capture_git_mode == "direct_push"
+    assert config.write_policy.capture_branch == "main"
+    assert config.write_policy.capture_remote == "origin"
 
 
 def test_validate_project_config_reports_missing_repo_path(tmp_path: Path):
@@ -139,6 +144,44 @@ def test_validate_project_config_rejects_invalid_limits_and_write_policy_paths(t
     messages = [error["message"] for error in result["errors"]]
     assert any("retrieval.default_limit" in message for message in messages)
     assert any("write_policy.default_capture_dir" in message for message in messages)
+
+
+def test_validate_project_config_rejects_invalid_capture_git_settings(tmp_path: Path):
+    repo = tmp_path / "ops"
+    init_git_repo(repo)
+    config_path = write_project_config(
+        tmp_path,
+        project_root=tmp_path,
+        ops_repo=repo,
+        write_policy_extra="""
+  capture_branch: ../main
+  capture_remote: origin/main
+""",
+    )
+
+    result = validate_project_config(config_path)
+
+    assert result["valid"] is False
+    messages = [error["message"] for error in result["errors"]]
+    assert any("write_policy.capture_branch" in message for message in messages)
+    assert any("write_policy.capture_remote" in message for message in messages)
+
+
+def test_load_project_config_rejects_invalid_capture_git_mode(tmp_path: Path):
+    repo = tmp_path / "ops"
+    init_git_repo(repo)
+    config_path = write_project_config(
+        tmp_path,
+        project_root=tmp_path,
+        ops_repo=repo,
+        write_policy_extra="  capture_git_mode: surprise",
+    )
+
+    result = validate_project_config(config_path)
+
+    assert result["valid"] is False
+    assert result["errors"][0]["code"] == "CONFIG_INVALID"
+    assert "capture_git_mode" in result["errors"][0]["message"]
 
 
 def test_validate_project_config_rejects_invalid_indexing_limits(tmp_path: Path):
