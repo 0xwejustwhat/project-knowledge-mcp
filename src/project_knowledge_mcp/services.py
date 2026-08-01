@@ -192,7 +192,9 @@ def add_project_note_from_config(
     content = _render_markdown(frontmatter=frontmatter, body=body)
     if config.write_policy.capture_git_mode == "local_only":
         return _write_local_capture(config, repo, normalized, content, authority=authority)
-    return _write_and_push_capture(config, repo, normalized, content, title=title, authority=authority)
+    return _write_and_push_capture(
+        config, repo, normalized, content, title=title, authority=authority
+    )
 
 
 def create_draft_artifact_from_config(
@@ -1987,15 +1989,19 @@ def _maybe_fast_forward_capture_workspace(
         ]
     porcelain = _git_status_porcelain(repo.path, state_dir=config.storage.state_dir)
     if porcelain is None or porcelain.strip():
-        return [
-            "active workspace has local changes; committed note was not checked out locally."
-        ]
+        return ["active workspace has local changes; committed note was not checked out locally."]
     fetched = _git_run(repo.path, "fetch", "--no-tags", remote, branch, check=False)
     if fetched.returncode != 0:
-        return ["capture pushed, but active workspace refresh failed; run index_project after pull."]
-    merged = _git_run(repo.path, "merge", "--ff-only", f"refs/remotes/{remote}/{branch}", check=False)
+        return [
+            "capture pushed, but active workspace refresh failed; run index_project after pull."
+        ]
+    merged = _git_run(
+        repo.path, "merge", "--ff-only", f"refs/remotes/{remote}/{branch}", check=False
+    )
     if merged.returncode != 0:
-        warnings.append("capture pushed, but active workspace fast-forward failed; run index_project after pull.")
+        warnings.append(
+            "capture pushed, but active workspace fast-forward failed; run index_project after pull."
+        )
     return warnings
 
 
@@ -2004,7 +2010,9 @@ def _capture_lock_path(
 ) -> Path:
     root = config.storage.lock_dir or config.storage.state_dir
     assert root is not None
-    return root / "locks" / f"capture-{_slugify(repo_id)}-{_slugify(remote)}-{_slugify(branch)}.lock"
+    return (
+        root / "locks" / f"capture-{_slugify(repo_id)}-{_slugify(remote)}-{_slugify(branch)}.lock"
+    )
 
 
 def _capture_temp_parent(config: ProjectKnowledgeConfig) -> Path:
@@ -2055,7 +2063,9 @@ def _is_push_rejection(result: dict[str, Any]) -> bool:
 
 def _capture_durable_url(remote_url: str, branch: str, relative_path: str) -> str:
     path = relative_path.replace("\\", "/")
-    github_match = re.match(r"(?:https://github\.com/|git@github\.com:)([^/]+)/([^/.]+)(?:\.git)?$", remote_url)
+    github_match = re.match(
+        r"(?:https://github\.com/|git@github\.com:)([^/]+)/([^/.]+)(?:\.git)?$", remote_url
+    )
     if github_match:
         owner, repo_name = github_match.groups()
         return f"https://github.com/{owner}/{repo_name}/blob/{branch}/{path}"
