@@ -5,6 +5,8 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import tempfile
+import time
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from fnmatch import fnmatch
@@ -187,20 +189,12 @@ def add_project_note_from_config(
         "created_at": now,
         "updated_at": now,
     }
-    write_error = _write_markdown_file(repo.path / normalized, frontmatter=frontmatter, body=body)
-    if write_error is not None:
-        return write_error
-    indexed, index_warnings = _index_written_document(config, repo, normalized)
-    return {
-        "status": "written",
-        "repo_id": repo.id,
-        "path": normalized,
-        "authority": authority,
-        "indexed": indexed,
-        "index_scope": "single_document" if indexed else None,
-        "full_reindex_required": not indexed,
-        "warnings": index_warnings,
-    }
+    content = _render_markdown(frontmatter=frontmatter, body=body)
+    if config.write_policy.capture_git_mode == "local_only":
+        return _write_local_capture(config, repo, normalized, content, authority=authority)
+    return _write_and_push_capture(
+        config, repo, normalized, content, title=title, authority=authority
+    )
 
 
 def create_draft_artifact_from_config(
@@ -1697,6 +1691,15 @@ def _path_is_inside_any(path: str, directories: list[str]) -> bool:
     return False
 
 
+def _render_markdown(*, frontmatter: dict[str, Any], body: str) -> str:
+    frontmatter_text = yaml.safe_dump(
+        {key: value for key, value in frontmatter.items() if value is not None},
+        sort_keys=False,
+        allow_unicode=True,
+    )
+    return f"---\n{frontmatter_text}---\n\n{body.rstrip()}\n"
+
+
 def _write_markdown_file(
     path: Path, *, frontmatter: dict[str, Any], body: str
 ) -> dict[str, Any] | None:
@@ -1704,15 +1707,369 @@ def _write_markdown_file(
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.parent.is_symlink() or path.is_symlink():
             return _write_error("INVALID_TARGET", "Refusing to write through symlink.")
-        frontmatter_text = yaml.safe_dump(
-            {key: value for key, value in frontmatter.items() if value is not None},
-            sort_keys=False,
-            allow_unicode=True,
-        )
-        path.write_text(f"---\n{frontmatter_text}---\n\n{body.rstrip()}\n", encoding="utf-8")
+        path.write_text(_render_markdown(frontmatter=frontmatter, body=body), encoding="utf-8")
     except OSError as exc:
         return _write_error("WRITE_FAILED", str(exc))
     return None
+
+
+def _write_local_capture(
+    config: ProjectKnowledgeConfig, repo, relative_path: str, content: str, *, authority: str
+) -> dict[str, Any]:
+    write_error = _write_text_file_no_symlink(repo.path / relative_path, content)
+    if write_error is not None:
+        return write_error
+    indexed, index_warnings = _index_written_document(config, repo, relative_path)
+    return {
+        "status": "local_only",
+        "repo_id": repo.id,
+        "path": relative_path,
+        "authority": authority,
+        "indexed": indexed,
+        "index_scope": "single_document" if indexed else None,
+        "full_reindex_required": not indexed,
+        "next_action": "commit and push the note manually, or use capture_git_mode: direct_push",
+        "warnings": index_warnings,
+    }
+
+
+def _write_and_push_capture(
+    config: ProjectKnowledgeConfig,
+    repo,
+    relative_path: str,
+    content: str,
+    *,
+    title: str,
+    authority: str,
+) -> dict[str, Any]:
+    if repo.source_mode != "workspace":
+        return _capture_persistence_failure(
+            "local_only",
+            repo_id=repo.id,
+            message="Capture repo is not workspace-backed; direct push is unavailable.",
+            next_action="Set write_policy.capture_git_mode: local_only or use a writable workspace repo.",
+        )
+    if _git_run(repo.path, "rev-parse", "--is-inside-work-tree", check=False).returncode != 0:
+        return _capture_persistence_failure(
+            "local_only",
+            repo_id=repo.id,
+            message="Capture repo is not a Git worktree; direct push is unavailable.",
+            next_action="Set write_policy.capture_git_mode: local_only or configure a Git repo.",
+        )
+
+    remote = config.write_policy.capture_remote
+    branch = config.write_policy.capture_branch
+    lock = _CaptureLock(_capture_lock_path(config, repo.id, remote, branch))
+    lock_error = lock.acquire()
+    if lock_error is not None:
+        return _capture_persistence_failure(
+            "push_failed",
+            repo_id=repo.id,
+            message=lock_error,
+            branch=branch,
+            remote=remote,
+            next_action="Retry after the in-progress capture completes.",
+        )
+    try:
+        last_push_failure: subprocess.CompletedProcess[str] | None = None
+        for attempt in range(2):
+            result = _write_and_push_capture_once(
+                config,
+                repo,
+                relative_path,
+                content,
+                title=title,
+                authority=authority,
+                remote=remote,
+                branch=branch,
+            )
+            if result["status"] == "written_and_pushed":
+                return result
+            if result["status"] != "push_failed" or not _is_push_rejection(result):
+                return result
+            last_push_failure = result.pop("_push_result", None)
+        details = {}
+        if last_push_failure is not None:
+            details["stderr"] = last_push_failure.stderr.strip()
+        return _capture_persistence_failure(
+            "sync_conflict",
+            repo_id=repo.id,
+            message="Remote branch advanced while writing the capture note.",
+            branch=branch,
+            remote=remote,
+            details=details,
+            next_action="Retry add_project_note after the remote branch settles.",
+        )
+    finally:
+        lock.release()
+
+
+def _write_and_push_capture_once(
+    config: ProjectKnowledgeConfig,
+    repo,
+    relative_path: str,
+    content: str,
+    *,
+    title: str,
+    authority: str,
+    remote: str,
+    branch: str,
+) -> dict[str, Any]:
+    remote_url = _git_output(repo.path, "remote", "get-url", remote, warn_on_failure=False)
+    if remote_url is None:
+        return _capture_persistence_failure(
+            "push_failed",
+            repo_id=repo.id,
+            message="Configured capture remote is not available.",
+            branch=branch,
+            remote=remote,
+            next_action="Configure the capture remote or set capture_git_mode: local_only.",
+        )
+    fetched = _git_run(repo.path, "fetch", "--no-tags", remote, branch, check=False)
+    if fetched.returncode != 0:
+        return _capture_persistence_failure(
+            "push_failed",
+            repo_id=repo.id,
+            message="Could not fetch configured capture branch.",
+            branch=branch,
+            remote=remote,
+            details={"stderr": fetched.stderr.strip()},
+            next_action="Fix remote access or set capture_git_mode: local_only.",
+        )
+    remote_ref = f"refs/remotes/{remote}/{branch}"
+    verified = _git_run(repo.path, "rev-parse", "--verify", remote_ref, check=False)
+    if verified.returncode != 0:
+        return _capture_persistence_failure(
+            "push_failed",
+            repo_id=repo.id,
+            message="Configured capture branch is not available on the remote.",
+            branch=branch,
+            remote=remote,
+            details={"remote_ref": remote_ref},
+            next_action="Create the capture branch or update write_policy.capture_branch.",
+        )
+
+    parent = Path(
+        tempfile.mkdtemp(
+            prefix=f"pkmcp-capture-{_slugify(repo.id)}-",
+            dir=str(_capture_temp_parent(config)),
+        )
+    )
+    worktree = parent / "worktree"
+    worktree_added = False
+    try:
+        added = _git_run(repo.path, "worktree", "add", "--detach", str(worktree), remote_ref)
+        if added.returncode != 0:
+            return _capture_persistence_failure(
+                "push_failed",
+                repo_id=repo.id,
+                message="Could not create isolated capture worktree.",
+                branch=branch,
+                remote=remote,
+                details={"stderr": added.stderr.strip()},
+                next_action="Retry after cleaning stale Git worktrees.",
+            )
+        worktree_added = True
+        normalized, error = _safe_repo_write_path(worktree, relative_path, state_dir=None)
+        if error is not None:
+            return error
+        write_error = _write_text_file_no_symlink(worktree / normalized, content)
+        if write_error is not None:
+            return write_error
+        added_note = _git_run(worktree, "add", "--", normalized, check=False)
+        if added_note.returncode != 0:
+            return _capture_persistence_failure(
+                "push_failed",
+                repo_id=repo.id,
+                message="Could not stage capture note.",
+                branch=branch,
+                remote=remote,
+                details={"stderr": added_note.stderr.strip()},
+                next_action="Retry after checking the capture target path.",
+            )
+        commit = _git_run(
+            worktree,
+            "commit",
+            "--no-verify",
+            "-m",
+            f"Capture project note: {title}",
+            check=False,
+        )
+        if commit.returncode != 0:
+            return _capture_persistence_failure(
+                "push_failed",
+                repo_id=repo.id,
+                message="Could not commit capture note.",
+                branch=branch,
+                remote=remote,
+                details={"stderr": commit.stderr.strip()},
+                next_action="Retry after checking Git author configuration.",
+            )
+        commit_sha = _git_output(worktree, "rev-parse", "HEAD") or ""
+        pushed = _git_run(worktree, "push", "--no-verify", remote, f"HEAD:{branch}", check=False)
+        if pushed.returncode != 0:
+            failure = _capture_persistence_failure(
+                "push_failed",
+                repo_id=repo.id,
+                message="Could not push capture note.",
+                branch=branch,
+                remote=remote,
+                details={"stderr": pushed.stderr.strip()},
+                next_action="Retry after resolving remote access or branch conflicts.",
+            )
+            failure["_push_result"] = pushed
+            return failure
+        workspace_warnings = _maybe_fast_forward_capture_workspace(
+            config, repo, remote=remote, branch=branch
+        )
+        if (repo.path / normalized).exists():
+            indexed, index_warnings = _index_written_document(config, repo, normalized)
+        else:
+            indexed = False
+            index_warnings = [
+                "committed note is not present in the active workspace; run index_project after updating the workspace."
+            ]
+        return {
+            "status": "written_and_pushed",
+            "repo_id": repo.id,
+            "path": normalized,
+            "authority": authority,
+            "branch": branch,
+            "remote": remote,
+            "commit": commit_sha,
+            "url": _capture_durable_url(remote_url, branch, normalized),
+            "indexed": indexed,
+            "index_scope": "single_document" if indexed else None,
+            "full_reindex_required": not indexed,
+            "warnings": [*workspace_warnings, *index_warnings],
+        }
+    finally:
+        if worktree_added:
+            _git_run(repo.path, "worktree", "remove", "--force", str(worktree), check=False)
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+def _capture_persistence_failure(
+    status: str,
+    *,
+    repo_id: str,
+    message: str,
+    next_action: str,
+    branch: str | None = None,
+    remote: str | None = None,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "status": status,
+        "repo_id": repo_id,
+        "reason": message,
+        "next_action": next_action,
+        "indexed": False,
+        "index_scope": None,
+        "full_reindex_required": True,
+        "warnings": [],
+    }
+    if branch is not None:
+        result["branch"] = branch
+    if remote is not None:
+        result["remote"] = remote
+    if details:
+        result["details"] = details
+    return result
+
+
+def _maybe_fast_forward_capture_workspace(
+    config: ProjectKnowledgeConfig, repo, *, remote: str, branch: str
+) -> list[str]:
+    warnings: list[str] = []
+    current_branch = _git_output(repo.path, "branch", "--show-current", warn_on_failure=False)
+    if current_branch != branch:
+        return [
+            "active workspace is not on the capture branch; run index_project after updating the workspace."
+        ]
+    porcelain = _git_status_porcelain(repo.path, state_dir=config.storage.state_dir)
+    if porcelain is None or porcelain.strip():
+        return ["active workspace has local changes; committed note was not checked out locally."]
+    fetched = _git_run(repo.path, "fetch", "--no-tags", remote, branch, check=False)
+    if fetched.returncode != 0:
+        return [
+            "capture pushed, but active workspace refresh failed; run index_project after pull."
+        ]
+    merged = _git_run(
+        repo.path, "merge", "--ff-only", f"refs/remotes/{remote}/{branch}", check=False
+    )
+    if merged.returncode != 0:
+        warnings.append(
+            "capture pushed, but active workspace fast-forward failed; run index_project after pull."
+        )
+    return warnings
+
+
+def _capture_lock_path(
+    config: ProjectKnowledgeConfig, repo_id: str, remote: str, branch: str
+) -> Path:
+    root = config.storage.lock_dir or config.storage.state_dir
+    assert root is not None
+    return (
+        root / "locks" / f"capture-{_slugify(repo_id)}-{_slugify(remote)}-{_slugify(branch)}.lock"
+    )
+
+
+def _capture_temp_parent(config: ProjectKnowledgeConfig) -> Path:
+    assert config.storage.state_dir is not None
+    parent = config.storage.state_dir / "tmp"
+    parent.mkdir(parents=True, exist_ok=True)
+    return parent
+
+
+class _CaptureLock:
+    def __init__(self, path: Path, *, timeout_seconds: float = 10.0) -> None:
+        self.path = path
+        self.timeout_seconds = timeout_seconds
+        self._fd: int | None = None
+
+    def acquire(self) -> str | None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + self.timeout_seconds
+        while True:
+            try:
+                self._fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                os.write(self._fd, str(os.getpid()).encode("ascii"))
+                return None
+            except FileExistsError:
+                if time.monotonic() >= deadline:
+                    return "Timed out waiting for capture persistence lock."
+                time.sleep(0.05)
+            except OSError as exc:
+                return f"Could not acquire capture persistence lock: {exc}"
+
+    def release(self) -> None:
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _is_push_rejection(result: dict[str, Any]) -> bool:
+    push_result = result.get("_push_result")
+    if not isinstance(push_result, subprocess.CompletedProcess):
+        return False
+    output = f"{push_result.stdout}\n{push_result.stderr}".casefold()
+    return "rejected" in output or "non-fast-forward" in output or "fetch first" in output
+
+
+def _capture_durable_url(remote_url: str, branch: str, relative_path: str) -> str:
+    path = relative_path.replace("\\", "/")
+    github_match = re.match(
+        r"(?:https://github\.com/|git@github\.com:)([^/]+)/([^/.]+)(?:\.git)?$", remote_url
+    )
+    if github_match:
+        owner, repo_name = github_match.groups()
+        return f"https://github.com/{owner}/{repo_name}/blob/{branch}/{path}"
+    return f"{remote_url.rstrip('/')}/blob/{branch}/{path}"
 
 
 def _write_text_file_no_symlink(path: Path, content: str) -> dict[str, Any] | None:

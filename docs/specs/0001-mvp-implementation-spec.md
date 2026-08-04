@@ -623,6 +623,9 @@ write_policy:
   default_capture_repo: ops
   default_capture_dir: docs/notes
   allow_direct_capture: true
+  capture_git_mode: direct_push
+  capture_branch: main
+  capture_remote: origin
   blocked_direct_write_globs:
     - "docs/doctrine/**"
     - "doctrine/**"
@@ -1461,10 +1464,14 @@ Output:
 
 ```json
 {
-  "status": "written",
+  "status": "written_and_pushed",
   "repo_id": "ops",
   "path": "docs/notes/2026-06-09-codegraph-mvp-boundary.md",
   "authority": "capture",
+  "branch": "main",
+  "remote": "origin",
+  "commit": "abc123...",
+  "url": "https://github.com/example/ops/blob/main/docs/notes/2026-06-09-codegraph-mvp-boundary.md",
   "indexed": true,
   "index_scope": "single_document",
   "full_reindex_required": false,
@@ -1475,6 +1482,8 @@ Output:
 Rules:
 
 - Default target is `write_policy.default_capture_dir`.
+- Default persistence is `write_policy.capture_git_mode: direct_push`, which commits and pushes only the generated note to the configured capture branch.
+- `capture_git_mode: local_only` is available for explicit manual commit/push workflows.
 - File name is date-prefixed and slugified.
 - Frontmatter is always added.
 - Authority is `capture` unless a safe working type like `open_question` is selected.
@@ -2133,7 +2142,7 @@ MVP is complete when:
 13. CodeGraphContext is spiked and either integrated as the preferred code context path or rejected with recorded evidence and replacement criteria; fallback works with status reporting in either case.
 14. Staleness checks report Git state.
 15. Session brief returns structured evidence packet plus Markdown.
-16. `add_project_note` writes low-authority capture docs and indexes only the newly written document synchronously.
+16. `add_project_note` durably commits and pushes low-authority capture docs by default, then indexes the newly written document when the active workspace can be refreshed safely.
 17. `create_draft_artifact` writes non-canonical proposal/draft docs and indexes only the newly written document synchronously.
 18. `propose_authority_change` can create a branch/commit/PR, or return structured manual PR instructions when GitHub auth is unavailable.
 19. Direct writes to canonical paths are blocked and return draft/PR proposal guidance.

@@ -33,7 +33,7 @@ EXPECTED_TOOL_NAMES = {
 
 def init_git_repo(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    subprocess.run(["git", "init", "-q", "--initial-branch", "main"], cwd=path, check=True)
     subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=path, check=True)
     subprocess.run(["git", "config", "user.name", "Test User"], cwd=path, check=True)
 
@@ -48,6 +48,31 @@ def commit_all(path: Path, message: str = "commit") -> str:
         capture_output=True,
         text=True,
     ).stdout.strip()
+
+
+def add_bare_remote(repo: Path, remote: Path) -> None:
+    subprocess.run(["git", "init", "--bare", "-q", "--initial-branch", "main", remote], check=True)
+    subprocess.run(["git", "remote", "add", "origin", remote.as_posix()], cwd=repo, check=True)
+    commit_all(repo, "initial")
+    subprocess.run(["git", "push", "-u", "origin", "main"], cwd=repo, check=True)
+
+
+def remote_file_text(remote: Path, relative_path: str) -> str:
+    return subprocess.run(
+        ["git", "--git-dir", remote.as_posix(), "show", f"main:{relative_path}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
+def require_symlink(path: Path, target: Path, *, target_is_directory: bool = False) -> None:
+    try:
+        path.symlink_to(target, target_is_directory=target_is_directory)
+    except OSError as exc:
+        import pytest
+
+        pytest.skip(f"symlink privilege unavailable: {exc}")
 
 
 def result_text(result) -> str:
@@ -265,10 +290,11 @@ def test_mcp_propose_authority_change_metadata_matches_change_schema():
 
 def test_mcp_step7_write_tools_are_client_callable(monkeypatch, tmp_path: Path):
     repo = tmp_path / "ops"
+    remote = tmp_path / "remote.git"
     state = tmp_path / ".project-knowledge"
     init_git_repo(repo)
     write_doc(repo, "README.md", "# Ops Repo\n\nInitial content.")
-    commit_all(repo, "initial")
+    add_bare_remote(repo, remote)
     config_path = write_project_config(tmp_path, repo=repo, state_dir=state)
     monkeypatch.setattr(services, "_command_exists", lambda _command: False)
 
@@ -286,10 +312,11 @@ def test_mcp_step7_write_tools_are_client_callable(monkeypatch, tmp_path: Path):
             },
         )
     )
-    assert note["status"] == "written"
+    assert note["status"] == "written_and_pushed"
     assert note["authority"] == "capture"
-    assert note["indexed"] is True
-    assert (repo / note["path"]).exists()
+    assert note["branch"] == "main"
+    assert note["remote"] == "origin"
+    assert "Client-callable safe capture note." in remote_file_text(remote, note["path"])
 
     draft = asyncio.run(
         call_tool(
@@ -517,7 +544,7 @@ def test_index_project_skips_binary_and_excludes_state_dir_and_symlink_escape(tm
     write_doc(state, "recursive.md", "# Recursive\n\nrecursive sqlite evidence must not index.")
     (repo / "docs" / "binary.md").write_bytes(b"\xff\xfe\x00not utf8")
     write_doc(outside, "escape.md", "# Outside\n\nsymlink escape evidence must not index.")
-    (repo / "docs" / "escape.md").symlink_to(outside / "escape.md")
+    require_symlink(repo / "docs" / "escape.md", outside / "escape.md")
     config_path = write_project_config(tmp_path, repo=repo, state_dir=state)
 
     import asyncio

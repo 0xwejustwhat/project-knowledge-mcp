@@ -126,5 +126,6 @@ Rules and constraints:
 - `content` is the full file content to write.
 - `add_file` fails if the target already exists.
 - `replace_file` fails if the target does not already exist as a file.
-- The configured writable capture repo must have a clean Git workspace before the tool runs.
+- Capture notes default to `write_policy.capture_git_mode: direct_push`, which commits and pushes only the generated note to the configured capture branch.
+- Set `write_policy.capture_git_mode: local_only` only when captures should remain in the local workspace for manual commit/push.
 - The tool prepares a branch, commit, and optional PR; it does not approve, merge, or promote authority by itself.

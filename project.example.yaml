@@ -59,6 +59,9 @@ write_policy:
   default_capture_repo: ops
   default_capture_dir: docs/notes
   allow_direct_capture: true
+  capture_git_mode: direct_push
+  capture_branch: main
+  capture_remote: origin
   blocked_direct_write_globs:
     - docs/doctrine/**
     - docs/decisions/accepted/**

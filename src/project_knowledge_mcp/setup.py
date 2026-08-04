@@ -151,6 +151,9 @@ def build_project_config(
             "default_capture_repo": "ops",
             "default_capture_dir": "docs/notes",
             "allow_direct_capture": True,
+            "capture_git_mode": "direct_push",
+            "capture_branch": "main",
+            "capture_remote": "origin",
         },
     }
 
