@@ -1,359 +1,282 @@
 ---
 name: pkmcp-codebase-questions
-description: Use when answering codebase, repository, project-memory, architecture, implementation-location, or evidence-gathering questions through a configured Project Knowledge MCP server. Guides when to call PKMCP tools, how to interpret evidence packets and CodeResult records, and when to verify with live file/git/test inspection.
-version: 1.0.0
-author: Project Knowledge MCP
+description: Use PKMCP for authority-aware project and code questions.
+version: 1.1.0
+author: Amin El-Gazzar (0xwejustwhat), Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
 metadata:
   hermes:
-    tags: [pkmcp, mcp, codebase-questions, project-memory, evidence, codegraph]
-    related_skills: [codegraph, native-mcp]
+    tags: [pkmcp, mcp, project-knowledge, authority, evidence]
+    related_skills: []
 ---
 
 # PKMCP Codebase Questions
 
-## Overview
+Use a configured Project Knowledge MCP (PKMCP) server to retrieve project
+knowledge and code evidence without confusing relevance with authority. PKMCP
+finds and classifies evidence; the assistant still owns query planning,
+synthesis, direct verification, and the final answer.
 
-Use this skill when an assistant has access to a configured Project Knowledge MCP
-(PKMCP) server and needs to answer questions from repo-grounded evidence. PKMCP is
-an MCP evidence layer: its tools return search results, code context, provider
-health, staleness metadata, and grouped evidence packets. The assistant still owns
-query planning, synthesis, verification, and the final user-facing answer.
-
-This skill assumes the harness exposes PKMCP's MCP tools directly. Some harnesses
-prefix tool names with the server name, for example `mcp_project_knowledge_search_code`.
-When that happens, map the tool names below to the harness-specific names and keep
-the same arguments and interpretation rules.
-
-If your harness also has a generic CodeGraph/codebase-question skill, use that
-skill's code-question heuristics for query planning and use this PKMCP skill for
-the actual MCP tool contract and result interpretation.
+Tool names may be prefixed by the client, for example
+`mcp_project_knowledge_get_project_state`. Map those names to the unprefixed
+names used here while preserving the same arguments and semantics.
 
 ## When to Use
 
-Use PKMCP for broad or evidence-seeking questions such as:
+Use this skill when the user asks:
 
-- "Where is this feature implemented?"
-- "How does this repo handle authentication/config/indexing/etc.?"
-- "Which files or symbols should I inspect before changing this?"
-- "Find related tests, schema, docs, decisions, or open questions."
-- "Give me the project context for this task."
-- "What does the project memory say about this decision?"
-- "Compile evidence before planning or implementing this change."
+- What the project currently says about a topic.
+- Where a feature is implemented or tested.
+- Which doctrine, decisions, proposals, discussions, or open questions apply.
+- What context should be loaded before planning or implementation.
+- Whether indexed project evidence is current and complete enough to trust.
 
-Use PKMCP before direct file spelunking when the user asks a broad codebase,
-architecture, or project-memory question and has not already named the precise file
-to inspect.
+Do not use for:
 
-Do **not** use PKMCP as the only source of truth when the task requires live state:
+- Reading an exact named file when no discovery is needed.
+- Reporting live git, service, process, test, or deployment state without direct
+  inspection.
+- Maintaining PKMCP itself; that requires a separate maintainer workflow,
+  repository conventions, implementation tests, and release procedures.
+- Writing project knowledge unless the user explicitly asks to capture, draft,
+  or propose a change.
 
-- The user asks for the current contents of a specific file.
-- You need exact git history, branch status, or uncommitted diff state.
-- You need to run tests, linters, type checks, builds, or the application.
-- You need to verify behavior that depends on generated files, runtime services, or
-  environment state.
+## Installation
 
-In those cases, PKMCP can still help locate the relevant area, but you must verify
-with live file/git/test tools before making final claims.
+Copy this complete skill directory into the skills directory used by the agent
+harness. Preserve the directory name and `SKILL.md` filename.
 
-## Available PKMCP Tools
+For Hermes Agent, from a checkout of the PKMCP repository, use `terminal` to run:
 
-Current PKMCP exposes these MCP tools:
+```bash
+mkdir -p "$HOME/.hermes/skills"
+cp -R samples/skills/pkmcp-codebase-questions "$HOME/.hermes/skills/"
+```
 
-| Tool | Use it for |
-| --- | --- |
-| `health` | Confirm the server is reachable. |
-| `validate_config` | Check that the project config is usable. |
-| `index_project` | Build/refresh the configured repo index. |
-| `check_project_staleness` | Check whether indexed evidence may be stale relative to repo state. |
-| `search_ops` | Search indexed ops/docs/project-memory content. |
-| `search_decisions` | Search accepted and draft decision docs. |
-| `get_project_state` | Retrieve an explicit doctrine-only or doctrine-plus-discussion project-state view. |
-| `search_open_questions` | Search open questions with source/owner metadata. |
-| `get_code_provider_status` | Check CodeGraph/text fallback provider health for code context. |
-| `search_code` | Search configured work repo code/test/schema evidence. |
-| `get_code_context` | Retrieve context for a symbol or repo-relative file path. |
-| `generate_session_brief` | Compile a task-oriented evidence packet using a required project-state view, optionally including recent indexed changes. |
-| `add_project_note` | Write a low-authority capture note. Do not use unless the user asked to record/capture something. |
-| `create_draft_artifact` | Create a non-canonical draft/proposal artifact. Do not use unless the user asked to draft/write. |
-| `propose_authority_change` | Prepare an authority-change branch/commit/PR flow. Do not use for normal question answering. |
+Start a new agent session after installation so the harness reloads its skill
+catalog. Other clients should use their documented Agent Skills directory while
+keeping this file unchanged.
 
-For codebase questions, the usual tools are `get_code_provider_status`,
-`search_code`, `get_code_context`, `get_project_state`, and
-`generate_session_brief`.
+## Prerequisites
+
+- A reachable PKMCP MCP server.
+- A valid project configuration with at least one configured repository.
+- An index for searches and project-state retrieval.
+- Direct file, git, test, and runtime tools when precise live verification is
+  required.
+
+Confirm setup with `health` and `validate_config`. Do not infer a valid project
+from the presence of MCP tools alone.
+
+## Authority and Retrieval Model
+
+PKMCP separates **what matched** from **whether retrieval ran successfully** and
+**whether its source is fresh**.
+
+For every project-state section, inspect:
+
+- `retrieval_state`: whether retrieval was `complete`, `partial`, `unavailable`,
+  or `not_run`.
+- `match_state`: whether it returned `with_results`, `no_match`, or
+  `indeterminate`.
+- `freshness_state`: whether indexed source evidence is current enough for the
+  claim.
+- `warnings` and `errors`: named limits that must remain visible in synthesis.
+
+Only `complete` retrieval can support a meaningful `no_match`. A `partial`,
+`unavailable`, or `not_run` section cannot prove absence; its match should be
+treated as `indeterminate`.
+
+Authority is explicit. Newer material does not silently supersede older accepted
+material. Current doctrine and accepted decisions govern unless explicit
+supersession or scope says otherwise.
+
+## Required Project-State View
+
+Every `get_project_state` and `generate_session_brief` call must explicitly
+choose one view; there is no default:
+
+- `doctrine`: authoritative doctrine, accepted decisions, and separately labeled
+  implementation evidence. Informal sections are not searched.
+- `doctrine_and_discussion`: the same authoritative baseline plus separately
+  labeled open questions, proposals/drafts, discussions, and captures.
+
+Use `doctrine` when the user asks what currently governs. Use
+`doctrine_and_discussion` when unresolved or proposed context could help, but
+never let informal material override doctrine.
+
+Stable project-state sections include:
+
+- `doctrine`
+- `accepted_decisions`
+- `implementation_evidence`
+- `open_questions`
+- `proposals_and_drafts`
+- `discussions_and_captures`
+- `superseded_and_rejected` only when explicitly requested
+
+`generate_session_brief` uses the same authority-separated compiler and may also
+include `recent_changes`. If no `since` value was supplied, recent changes should
+be `not_run` and `indeterminate`, not a false complete no-match.
 
 ## First-Move Workflow
 
-For a broad codebase/project-memory question:
+1. **Check availability.** Call `health`, then `validate_config` when configuration
+   correctness is relevant. Completion criterion: the server and project config
+   are usable, or the limitation is explicit.
 
-1. **Check freshness when reliability matters.**
-   - Call `check_project_staleness` if the answer depends on current repo state.
-   - If any returned repo has `reindex_needed: true`, treat indexed evidence as a
-     lead and verify with live repo tools. If the harness permits it and the user
-     asked for current indexed evidence, call `index_project` before searching.
+2. **Check staleness.** Call `check_project_staleness` before freshness-sensitive
+   retrieval. Completion criterion: each relevant repository is current or its
+   stale/unavailable state is carried into the answer.
 
-2. **Start with an evidence-packet tool for multi-source questions.**
-   - Call `get_project_state({"topic": "...", "view": "doctrine"})` for the authoritative baseline, or use `view: "doctrine_and_discussion"` when separately labeled informal context is needed.
-   - Call `generate_session_brief({"task": "...", "view": "doctrine"})` when beginning a coding task
-     or needing session context.
+3. **Select the epistemic view.** Call `get_project_state` with `view: doctrine`
+   for the governing baseline or `view: doctrine_and_discussion` for separately
+   labeled informal context. Completion criterion: no authority class is blended
+   with another.
 
-3. **Use code-specific tools for implementation questions.**
-   - Call `search_code({"query": "..."})` for conceptual code search.
-   - Call `get_code_context({"symbol_or_file": "..."})` after you have a likely
-     symbol, function, class, or file path.
-   - Use `repo_id` when the project has multiple work repos and the target repo is
-     known.
+4. **Retrieve code evidence when needed.** Check `get_code_provider_status`, then
+   use `search_code` and `get_code_context`. Set `repo_id` whenever the target
+   repository is known. Completion criterion: likely files or symbols are located
+   and provider limitations are recorded.
 
-4. **Inspect directly before precise claims or edits.**
-   - PKMCP snippets establish relevance, not complete semantics. They are bounded evidence — the snippet covers a few lines, not the full function.
-   - PKMCP can surface *what's there* (files, symbols, snippets) but it **cannot surface what's missing** (missing else-branches, control flow gaps, absent error handling).
-   - Before editing, citing exact behavior, or saying a test covers something, use `read_file` at the specific line range to see the complete logic. PKMCP → direct read is the intended two-step pattern, not a replacement decision.
+5. **Verify precise claims directly.** Read the complete file/function, inspect
+   live git state, or run tests as the task requires. Completion criterion: exact
+   behavior is supported by current source or execution, not only a bounded
+   snippet.
 
-5. **Synthesize with citations and uncertainty.**
-   - Cite paths, line ranges, symbols, doc titles, decision status, and warnings.
-   - Explicitly mention stale index warnings, fallback provider warnings, and gaps.
+6. **Synthesize.** State the answer, evidence, authority class, and caveats.
+   Completion criterion: incomplete retrieval is never described as absence of
+   project knowledge.
 
-## Query Patterns
+## Tool Guide
 
-Use natural-language queries first, then narrow:
+- `health`: confirm server reachability.
+- `validate_config`: validate project and repository configuration.
+- `index_project`: build or refresh configured indexes; use `repo_id` for a
+  targeted repository when supported by the client schema.
+- `check_project_staleness`: compare repository state with index metadata.
+- `get_project_state`: retrieve an explicit authority-separated project view.
+- `generate_session_brief`: compile task-oriented project state and optional
+  recent changes using the same required view.
+- `search_ops`: search indexed operational/project-memory material.
+- `search_decisions`: search decision records by status and authority.
+- `search_open_questions`: retrieve unresolved questions with source metadata.
+- `get_code_provider_status`: inspect CodeGraph and text-fallback readiness.
+- `search_code`: find conceptual code, test, and schema evidence.
+- `get_code_context`: retrieve context for a likely symbol or file.
+- `add_project_note`: write a low-authority capture.
+- `create_draft_artifact`: create a non-canonical proposal or draft.
+- `propose_authority_change`: prepare a review-gated authority change.
 
-```json
-{"query": "how authentication middleware validates bearer tokens", "limit": 5}
-```
+## Reindexing
 
-If results are too broad, add specific vocabulary:
+When staleness reports `reindex_needed: true`, call `index_project` before
+relying on indexed absence if indexing is in scope.
 
-```json
-{"query": "BearerAuth validate_authorization_header token expiry", "repo_id": "api", "limit": 5}
-```
+- Use the configured project mode so include/exclude globs, source mode, worktree
+  policy, and scope fingerprints remain consistent.
+- Pass `repo_id` to refresh only the affected repository when the exposed schema
+  supports targeted indexing.
+- Use a full configured reindex when several repositories or indexing settings
+  changed.
+- Run `check_project_staleness` again afterward. Successful indexing is not fully
+  verified until the relevant repository reports current with no scope mismatch.
 
-If a result names a symbol or file, pivot from search to context:
-
-```json
-{"symbol_or_file": "AuthMiddleware", "repo_id": "api", "limit": 5}
-```
-
-```json
-{"symbol_or_file": "src/auth/middleware.py", "repo_id": "api", "limit": 5}
-```
-
-For task kickoff, use a task-shaped query:
-
-```json
-{"task": "Implement bearer-token expiry validation", "view": "doctrine_and_discussion", "since": "2026-06-01", "limit": 5}
-```
+Index warnings do not automatically mean failure. Preserve warnings about
+unknown document types, normalization, skipped documents, or provider readiness
+and judge whether they affect the requested claim.
 
 ## Result Interpretation
 
-### Search/docs results
+For document evidence, retain:
 
-`search_ops`, `search_decisions`, `get_project_state`, and
-`search_open_questions` return project-memory evidence. Important fields include:
+- `repo_id`, `path`, and line range.
+- `type`, `authority`, and `status`.
+- `source_mode`, snapshot/worktree metadata, and warnings.
+- Ranking scores as relevance signals only, never authority.
 
-- `path`, `start_line`, `end_line`: where the indexed evidence came from.
-- `title`, `heading_path`, `excerpt`: human-readable context.
-- `repo_id`, `source_mode`, `snapshot_ref`, `snapshot_commit`,
-  `includes_uncommitted_changes`: provenance and freshness context.
-- `doc_type` / `type`: evidence class such as doctrine, decision, note, or open question.
-- `authority` and `status`: whether the result should be treated as current,
-  accepted, draft, capture, working, superseded, or rejected.
-- `warnings`: per-result cautions such as superseded/rejected content.
-- `score` and `bm25_score`: ranking signals, not proof.
+For code evidence, retain:
 
-Interpretation rules:
+- `path`, line range, symbol, and kind.
+- `provider`: `codegraph` or `text`.
+- Related symbols/files as leads, not a proven complete call graph.
 
-- Current doctrine and accepted decisions are stronger project-memory evidence than
-  notes, drafts, captures, or open questions.
-- Open questions indicate uncertainty or unresolved work, not settled truth.
-- Superseded/rejected results can explain history but must not be presented as
-  current state.
-- Docs/decisions explain intent; live code and tests still decide current behavior.
+A snippet shows what is present in a bounded range. It cannot prove the absence
+of an else branch, validation step, caller, error path, or test elsewhere. Read
+the complete live source before editing or making detailed behavioral claims.
 
-### Code results
+## Provider Recovery
 
-`search_code` and `get_code_context` return normalized `CodeResult` records. Public
-result fields are:
+If `get_code_provider_status` reports:
 
-- `repo_id`
-- `path`
-- `start_line`
-- `end_line`
-- `symbol`
-- `kind`
-- `snippet`
-- `provider`
-- `score`
-- `related`
+- `active_provider: codegraph`: use graph-backed results normally, then verify
+  exact source claims.
+- `active_provider: text`: treat results as search leads and verify more
+  aggressively with direct inspection.
+- `active_provider: unavailable`: do not claim code intelligence from PKMCP;
+  inspect the repository directly or repair the configured provider.
 
-Interpretation rules:
+If the configured CodeGraph executable is missing, rerun the supported PKMCP
+setup workflow rather than silently patching generated paths. If it exists but is
+unhealthy, inspect its status/index using the configured command and report the
+failure before falling back.
 
-- `provider: "codegraph"` means PKMCP used graph-backed code context.
-- `provider: "text"` means PKMCP used fallback indexed text search. Treat this as
-  useful but less structurally precise than graph-backed context.
-- `symbol` and `related` are leads to inspect; they are not a full call graph proof.
-- `snippet` is bounded evidence. Read the full file/function before editing or
-  making detailed behavioral claims.
-- `kind` distinguishes code/test/schema-style evidence when available.
-- `score` ranks likely relevance only.
+## Write Boundaries
 
-### Evidence packets
+Question-answering should normally remain read-only.
 
-`get_project_state` returns stable authority-separated sections:
+Use `add_project_note` only for an explicitly requested low-authority capture.
+Use `create_draft_artifact` only for an explicitly requested proposal, question,
+handover, or other non-canonical draft. Use `propose_authority_change` only when
+the user has approved preparing a review-gated change to authoritative material.
 
-- `sections.doctrine`
-- `sections.accepted_decisions`
-- `sections.implementation_evidence`
-- `sections.open_questions`
-- `sections.proposals_and_drafts`
-- `sections.discussions_and_captures`
-- `repositories`
-- `overall_retrieval_state`
-- `known_omissions`
-- `warnings`
-- `errors`
-- `markdown`
+Never bypass `WRITE_POLICY_DENIED` with arbitrary filesystem writes. A draft or
+proposal remains non-authoritative until the configured review and promotion
+workflow accepts it.
 
-`generate_session_brief` returns the same kind of packet with task framing, plus:
+## Error Recovery
 
-- `evidence_topic`
-- `repositories`
-- `sections.recent_changes` when `since` is provided
+- `INDEX_NOT_READY`: index the relevant configured repository if in scope;
+  otherwise use direct inspection and disclose the limitation.
+- `QUERY_INVALID`: correct the query, view, `repo_id`, filter, or limit. Do not
+  widen a restricted search silently.
+- `CONFIG_INVALID`: run `validate_config` and repair or report the named problem.
+- `PROVIDER_UNAVAILABLE`: use direct repository tools or repair the provider; do
+  not fabricate code context.
+- `WRITE_POLICY_DENIED`: stop the write and preserve the authority boundary.
 
-Interpretation rules:
-
-- Treat packet sections as an evidence bundle to synthesize, not as a final answer.
-- Read every section's `retrieval_state`, `match_state`, and `freshness_state`; never infer absence from `partial`, `unavailable`, or `not_run` retrieval.
-- If `errors` includes `INDEX_NOT_READY`, call `index_project` if appropriate or
-  fall back to direct live repo inspection.
-- If `warnings` mention reindexing, stale repos, fallback provider, or config
-  issues, surface the caveat before making claims.
-
-## Provider Health and Fallback
-
-Before relying on code intelligence, especially for architecture or symbol-level
-questions, call:
-
-```json
-{}
-```
-
-against `get_code_provider_status`.
-
-Read these fields:
-
-- `status`: should be `ok` for a normal health packet.
-- `configured_provider`: usually `codegraph`.
-- `active_provider`: `codegraph`, `text`, or `unavailable`.
-- `codegraph_enabled` and `codegraph_healthy`: whether graph-backed context is available.
-- `fallback_available`: whether text fallback can be used when graph context is unhealthy.
-- `work_repos`: configured code repo IDs.
-- `warnings`: setup/index/provider caveats.
-- `details`: sanitized provider/status details.
-
-Rules:
-
-- If `active_provider` is `codegraph`, proceed normally.
-- If `active_provider` is `text`, use results as retrieval leads and verify more
-  aggressively with direct file inspection.
-- If `active_provider` is `unavailable` or a tool returns `PROVIDER_UNAVAILABLE`,
-  do not claim code intelligence from PKMCP. Fall back to direct repo tools or ask
-  the user/operator to repair provider setup.
-
-### When CodeGraph is unhealthy
-
-If `codegraph_healthy: false` with a warning like `CodeGraph status failed for repo X`,
-first check whether the configured `codegraph.command` path actually exists on the
-filesystem:
-
-```bash
-ls -la /path/to/configured/codegraph/command
-```
-
-If the binary is missing:
-- The config has a stale path — likely the setup write phase was never run or the
-  `.project-knowledge/` directory was carried over from a previous version.
-- Run a fresh setup to re-install CodeGraph (see the guided-setup docs).
-
-If the binary exists but is unhealthy:
-- Try `codegraph init && codegraph index` from the repo root.
-- Check whether `codegraph status --json` can read the existing index.
-
-Do not try to patch the path in project.yaml manually — that addresses the symptom,
-not the root cause. A fresh `project-knowledge setup --non-interactive ...` (removing
-`--dry-run`) installs CodeGraph at the correct path and writes the verified command.
-
-## Error and Recovery Rules
-
-PKMCP errors are usually structured as `error: {code, message, details,
-recoverable}` and may also appear in packet-level `errors`.
-
-Common codes and actions:
-
-| Code | Meaning | Agent action |
-| --- | --- | --- |
-| `INDEX_NOT_READY` | The configured index does not exist or cannot be opened. | Call `index_project` if indexing is in scope; otherwise use live repo tools and report the limitation. |
-| `QUERY_INVALID` | Bad filter, invalid `repo_id`, invalid limit, or widened query outside the tool boundary. | Fix the argument and retry; do not widen restricted searches. |
-| `CONFIG_INVALID` | Project config cannot be loaded/validated. | Call `validate_config`; report the config problem if not repairable in this task. |
-| `PROVIDER_UNAVAILABLE` | CodeGraph failed and fallback is disabled/unavailable. | Use direct repo inspection or ask for provider repair; do not fabricate code context. |
-| `WRITE_POLICY_DENIED` | A requested write crosses configured policy. | Do not bypass with arbitrary filesystem writes unless the user explicitly changes scope and you have authority. |
-
-If a tool returns `warnings`, keep them attached to your reasoning. Do not hide
-warnings just because results are non-empty.
+Keep all packet-level and section-level warnings attached to the reasoning even
+when results are non-empty.
 
 ## Answer Format
 
-For codebase answers, prefer this structure:
+Prefer:
 
-1. **Short answer**: the direct answer in 1-3 sentences.
-2. **Evidence**: bullets with `path:start-end`, `symbol`, decision/doc status, and
-   provider where useful.
-3. **Caveats**: stale index, fallback provider, missing code evidence, or open questions.
-4. **Next action**: direct file inspection, run tests, reindex, or ask for decision.
+1. **Answer:** the direct synthesis.
+2. **Authoritative basis:** doctrine and accepted decisions with citations.
+3. **Additional context:** separately labeled proposals, discussions, captures,
+   open questions, or implementation evidence.
+4. **Retrieval caveats:** stale, partial, unavailable, excluded, or not-run
+   sections and provider limitations.
+5. **Verification:** direct files, git state, tests, or runtime evidence used for
+   precise claims.
 
-Example:
-
-```markdown
-Short answer: Token validation appears to live in `src/auth/middleware.py`, centered
-on `AuthMiddleware.validate_request`.
-
-Evidence:
-- `src/auth/middleware.py:42-88` — `AuthMiddleware.validate_request`, provider `codegraph`.
-- `tests/test_auth.py:15-67` — expiry and missing-header coverage, provider `codegraph`.
-- `docs/decisions/0007-auth.md:12-28` — accepted decision for bearer-token auth.
-
-Caveat: PKMCP reported repo `api` may need reindexing, so I verified the file directly
-before making this claim.
-```
-
-## Write Tools Boundary
-
-Question-answering tasks should normally avoid write tools. Only use the following
-when the user explicitly asks to capture, draft, or propose project-memory changes:
-
-- `add_project_note`: low-authority capture note; returns `status`, `repo_id`,
-  `path`, `authority`, `indexed`, `index_scope`, and warnings.
-- `create_draft_artifact`: non-canonical draft/proposal artifact; returns an
-  authority boundary and suggested next actions.
-- `propose_authority_change`: prepares a review-required authority-change flow;
-  can be blocked by uncommitted workspace changes.
-
-Do not use write tools to silently mutate doctrine, accepted decisions, project
-briefs, or canonical docs. If a write result says `authority_boundary:
-review_required_before_promotion`, treat it as not yet accepted.
+Do not dump the packet as the final answer. Explain what governs, what merely
+informs, and what could not be established.
 
 ## Verification Checklist
 
-Before finalizing a PKMCP-grounded answer:
+Before finalizing:
 
-- [ ] I used PKMCP for broad repo/project-memory discovery when appropriate.
-- [ ] I checked staleness or disclosed that I did not when freshness matters.
-- [ ] I interpreted `authority`, `status`, `warnings`, `gaps`, and `errors`.
-- [ ] I distinguished graph-backed `codegraph` evidence from `text` fallback.
-- [ ] I inspected live files at the specific line ranges PKMCP pointed at before making precise behavioral claims or edits — PKMCP found the *where*, I verified the *what*.
-- [ ] I did not ask PKMCP to do full logic tracing — it shows what's there, not what's missing.
-- [ ] When CodeGraph was unhealthy, I checked whether the binary actually exists at the configured path rather than patching project.yaml by hand.
-- [ ] I cited concrete paths, line ranges, symbols, or decision/doc statuses.
-- [ ] I did not present PKMCP evidence packets as final truth without synthesis.
-- [ ] I did not use write tools unless the user explicitly requested a capture,
-      draft, or proposal.
+- [ ] The server and configuration were usable, or failure was stated.
+- [ ] Relevant repository staleness was checked.
+- [ ] `doctrine` or `doctrine_and_discussion` was chosen explicitly.
+- [ ] Each section's `retrieval_state`, `match_state`, and `freshness_state` was
+      interpreted independently.
+- [ ] Informal material was kept separate from doctrine and accepted decisions.
+- [ ] `repo_id` constrained retrieval or indexing when the repository was known.
+- [ ] CodeGraph and text-fallback evidence were distinguished.
+- [ ] Precise code, git, test, and runtime claims were verified directly.
+- [ ] Warnings, errors, omissions, and unavailable sections remained visible.
+- [ ] Write tools were used only because the user explicitly asked for a write.
