@@ -13,12 +13,11 @@ Registered MCP tools:
 - `index_project`
 - `search_ops`
 - `search_decisions`
-- `get_current_doctrine`
+- `get_project_state`
 - `search_open_questions`
 - `search_code`
 - `get_code_context`
 - `get_code_provider_status`
-- `retrieve_ops_code_evidence`
 - `generate_session_brief`
 - `add_project_note`
 - `create_draft_artifact`
@@ -73,7 +72,7 @@ Developer/automation alternatives remain available below.
 
 PKMCP is designed for the **discovery → verify** two-step pattern:
 
-1. **PKMCP for discovery** — use `search_code`, `get_code_context`, `search_ops`, or `retrieve_ops_code_evidence` to find which files, symbols, and docs are relevant to a question. PKMCP returns bounded snippets with provenance metadata (authority, staleness, provider type).
+1. **PKMCP for discovery** — use `get_project_state`, `search_code`, `get_code_context`, or `search_ops` to find which files, symbols, and docs are relevant to a question. PKMCP returns bounded snippets with provenance metadata (authority, staleness, provider type).
 
 2. **Direct read for verification** — once PKMCP points you at a file and line range, use `read_file` or the equivalent to see the complete logic. PKMCP snippets are bounded and cannot show what's *missing* (control flow gaps, absent error handling, missing else-branches).
 
@@ -117,7 +116,16 @@ poetry run project-knowledge search-code "HTTPS Caddy bridge" --config ./project
 poetry run project-knowledge search-decisions "remote bridge" --config ./project.yaml
 poetry run project-knowledge search-open-questions "release blocker" --config ./project.yaml
 poetry run project-knowledge search-index "raw lexical query" --config ./project.yaml
+poetry run project-knowledge get-project-state "deployment doctrine" --view doctrine --config ./project.yaml
+poetry run project-knowledge get-project-state "deployment doctrine" --view doctrine_and_discussion --config ./project.yaml
 ```
+
+`get_project_state` requires an explicit view and has no default:
+
+- `doctrine` returns authoritative doctrine, accepted decisions, and implementation evidence. Informal sections are marked `not_run`.
+- `doctrine_and_discussion` adds separately labeled open questions, proposals/drafts, and discussions/captures. These sections remain non-authoritative.
+
+Each section reports `retrieval_state`, `match_state`, and `freshness_state` separately, so a stale, skipped, partial, or unavailable search cannot be mistaken for a trustworthy no-match result. `generate_session_brief` requires the same explicit `view` argument.
 
 ## CLI setup/client bootstrap
 

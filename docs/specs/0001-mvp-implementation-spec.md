@@ -44,7 +44,7 @@ The MVP should make the following workflow possible:
 4. Setup emits ready-to-use connection instructions/config for Hermes, Claude Desktop, Cursor, Codex/local CLIs, or any MCP-capable client on that host.
 5. Browser/mobile assistants such as ChatGPT, Gemini, or iPad workflows are not excluded by architecture; they connect through whatever MCP/connector/bridge the user authorizes. The MVP must not hardcode Hermes as the only client.
 6. User asks for a project brief or task context.
-7. Client calls `generate_session_brief(task)`.
+7. Client calls `generate_session_brief(task, view)` with an explicit `doctrine` or `doctrine_and_discussion` view.
 8. MCP returns a source-cited, authority-ranked, freshness-aware evidence packet.
 9. Connected assistant synthesizes the final answer from that packet.
 10. User can casually save low-authority notes with `add_project_note(...)`.
@@ -205,7 +205,7 @@ As a project owner, I want an AI assistant to request fresh project context befo
 Acceptance criteria:
 
 - Given a configured project with indexed ops/work repos;
-- when the assistant calls `generate_session_brief({ task })`;
+- when the assistant calls `generate_session_brief({ task, view })`;
 - then the server returns current doctrine, accepted decisions, relevant code evidence, open questions, and staleness warnings;
 - and every non-warning claim in the packet has source references.
 
@@ -215,7 +215,7 @@ As a project owner, I want to ask what is currently true about a topic, so that 
 
 Acceptance criteria:
 
-- `get_current_doctrine({ topic })` returns canonical/current doctrine first.
+- `get_project_state({ topic, view: "doctrine" })` returns canonical/current doctrine first.
 - Accepted decisions are included when relevant.
 - Superseded/rejected documents are excluded by default.
 - Results include authority labels and source paths.
@@ -247,7 +247,7 @@ As a project owner, I want a reorientation packet after time away, so that I can
 
 Acceptance criteria:
 
-- `generate_session_brief({ task: "reorient me", since })` includes recent indexed docs/code changes when `since` is provided.
+- `generate_session_brief({ task: "reorient me", view, since })` includes recent indexed docs/code changes when `since` is provided.
 - Packet reports local/remote Git freshness.
 - Packet separates accepted changes from raw captures.
 
@@ -259,7 +259,7 @@ As a developer, I want task context that includes both doctrine and code evidenc
 
 Acceptance criteria:
 
-- `retrieve_ops_code_evidence({ topic })` returns ops and code evidence grouped separately.
+- `get_project_state({ topic, view })` returns doctrine, decisions, implementation evidence, and—when explicitly selected—separate informal context.
 - Code results include file paths and line ranges/snippets where available.
 - Doctrine and ADR results include authority and freshness.
 - Packet includes gaps when code evidence is missing.
@@ -334,7 +334,7 @@ As a human collaborator, I want a project overview packet, so that I can underst
 
 Acceptance criteria:
 
-- `generate_session_brief({ task: "project overview" })` includes project summary, canonical docs, key decisions, open questions, configured repos, and warnings.
+- `generate_session_brief({ task: "project overview", view: "doctrine_and_discussion" })` includes canonical docs, key decisions, open questions, configured repos, and warnings.
 - Packet excludes low-authority raw discussion unless relevant.
 
 #### Story 14: Find Open Questions
@@ -366,7 +366,7 @@ As a Ghost Mesh operator, I want ops/code evidence for a topic, so that possible
 
 Acceptance criteria:
 
-- `retrieve_ops_code_evidence({ topic })` returns doctrine, decisions, code/schema/test evidence, and gaps.
+- `get_project_state({ topic, view })` returns doctrine, decisions, code/schema/test evidence, explicit retrieval state, and known omissions.
 - The server does not claim final alignment/misalignment unless a deterministic missing/stale condition is observed.
 - Connected LLM or governance process performs adjudication.
 
@@ -1360,9 +1360,16 @@ Output:
 
 Searches docs with decision/ADR path/type/status.
 
-### 10.6 `get_current_doctrine(topic?, limit?)`
+### 10.6 `get_project_state(topic, view, include_superseded=false, limit?)`
 
-Returns canonical/current doctrine and accepted decisions relevant to `topic`.
+Returns one authority-aware project-state packet. `view` is required and has no default:
+
+- `doctrine` searches authoritative doctrine, accepted decisions, and implementation evidence; informal sections are represented as `not_run`.
+- `doctrine_and_discussion` adds separately labeled `open_questions`, `proposals_and_drafts`, and `discussions_and_captures` sections.
+
+Every section includes `id`, `label`, `authority_class`, `retrieval_state`, `match_state`, `freshness_state`, `results`, `warnings`, and `errors`. Retrieval, matching, and freshness are independent dimensions. An unavailable, partial, stale, or skipped search must not be represented as a trustworthy no-match result.
+
+When `include_superseded=true`, superseded and rejected material appears only in a separate `superseded_and_rejected` section.
 
 ### 10.7 `search_open_questions(query?, limit?)`
 
@@ -1380,39 +1387,18 @@ Returns symbol/file context via CodeGraph if healthy, else text fallback.
 
 Returns provider health as described in section 8.5.
 
-### 10.11 `retrieve_ops_code_evidence(topic, limit?)`
+### 10.11 Removed redundant surface
 
-Input:
+The former `retrieve_ops_code_evidence` surface is removed. Multi-source retrieval belongs to `get_project_state` and `generate_session_brief`; no alias or legacy response schema is retained.
 
-```json
-{
-  "topic": "workers are pipe-aware",
-  "limit": 8
-}
-```
-
-Output sections:
-
-- `doctrine_evidence`
-- `decision_evidence`
-- `open_questions`
-- `capture_context`
-- `code_evidence`
-- `test_evidence`
-- `schema_evidence`
-- `gaps`
-- `warnings`
-- `markdown`
-
-This tool retrieves and organizes evidence. It does not adjudicate final truth beyond deterministic warnings such as missing code evidence, stale repo, or superseded docs.
-
-### 10.12 `get_project_brief_evidence(task, since?, limit?)` / `generate_session_brief(...)`
+### 10.12 `generate_session_brief(task, view, since?, limit?)`
 
 Input:
 
 ```json
 {
   "task": "Draft a project brief for Project Knowledge MCP MVP",
+  "view": "doctrine_and_discussion",
   "since": null,
   "limit": 8
 }
@@ -1422,26 +1408,29 @@ Output:
 
 ```json
 {
-  "brief_type": "evidence_packet",
-  "synthesis_required": true,
-  "project": { "id": "project-knowledge-mcp", "name": "Project Knowledge MCP" },
+  "tool": "generate_session_brief",
+  "project_id": "project-knowledge-mcp",
   "task": "Draft a project brief for Project Knowledge MCP MVP",
+  "view": "doctrine_and_discussion",
   "generated_at": "2026-06-09T00:00:00Z",
-  "staleness": { "repos": [], "warnings": [] },
-  "sections": [
-    { "id": "canonical_context", "title": "Canonical Context", "items": [] },
-    { "id": "accepted_decisions", "title": "Accepted Decisions", "items": [] },
-    { "id": "implementation_evidence", "title": "Implementation Evidence", "items": [] },
-    { "id": "open_questions", "title": "Open Questions", "items": [] },
-    { "id": "lower_authority_context", "title": "Lower-Authority Context", "items": [] },
-    { "id": "warnings", "title": "Warnings", "items": [] }
-  ],
+  "repositories": [],
+  "overall_retrieval_state": "complete",
+  "known_omissions": [],
+  "sections": {
+    "doctrine": { "retrieval_state": "complete", "match_state": "with_results", "freshness_state": "current", "results": [] },
+    "accepted_decisions": { "retrieval_state": "complete", "match_state": "with_results", "freshness_state": "current", "results": [] },
+    "implementation_evidence": { "retrieval_state": "complete", "match_state": "with_results", "freshness_state": "current", "results": [] },
+    "open_questions": { "retrieval_state": "complete", "match_state": "no_match", "freshness_state": "current", "results": [] },
+    "proposals_and_drafts": { "retrieval_state": "complete", "match_state": "no_match", "freshness_state": "current", "results": [] },
+    "discussions_and_captures": { "retrieval_state": "complete", "match_state": "no_match", "freshness_state": "current", "results": [] },
+    "recent_changes": { "retrieval_state": "complete", "match_state": "no_match", "freshness_state": "current", "results": [] }
+  },
   "warnings": [],
-  "markdown": "# Session Context Packet..."
+  "markdown": "## Session brief..."
 }
 ```
 
-`generate_session_brief` may remain as a friendly alias, but the canonical semantics are evidence compilation, not prose generation.
+`generate_session_brief` uses the same project-state compiler and requires the same explicit view. Its canonical semantics are evidence compilation, not prose generation.
 
 ### 10.13 `add_project_note(title, body, type?, tags?, source?, target?)`
 
@@ -1989,7 +1978,7 @@ Deliver:
 
 - `search_ops`.
 - `search_decisions`.
-- `get_current_doctrine`.
+- `get_project_state` with required explicit views and section-level retrieval/match/freshness state.
 - `search_open_questions`.
 - Provider relevance normalization for SQLite FTS5/BM25 results.
 - Ranking tests proving authority ordering.
@@ -2022,8 +2011,8 @@ If the selected CodeGraph-style tool cannot be installed in CI, tests must mock 
 
 Deliver:
 
-- `retrieve_ops_code_evidence`.
-- `generate_session_brief`.
+- Shared project-state compiler used by `get_project_state` and `generate_session_brief`.
+- `generate_session_brief` with a required explicit view.
 - Markdown renderer.
 - Staleness warnings included in packets.
 
@@ -2161,7 +2150,7 @@ These are explicitly non-blocking for the MVP draft unless reviewers decide othe
 2. Is `CodeGraphContext` reliable enough on Python 3.12 after the spike, or must the implementation move to the next named CodeGraph-style candidate?
 3. Should the default capture directory be `docs/notes/` or `inbox/`?
 4. Should project config support multiple ops repos in v1, or exactly one ops repo?
-5. Should MCP expose `generate_session_brief` or rename it to `compile_session_context` while preserving an alias?
+5. Which task-specific context compiler should complement `get_project_state`? Resolved: keep `generate_session_brief` as the sole friendly name and require the same explicit view; do not retain aliases.
 6. Should line ranges be best-effort in MVP or strict for Markdown docs?
 7. Should a Git remote fetch be attempted during staleness checks, or should remote comparison use existing refs only by default?
 

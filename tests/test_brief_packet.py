@@ -6,8 +6,8 @@ from textwrap import dedent
 
 from project_knowledge_mcp.services import (
     generate_session_brief_from_config,
+    get_project_state_from_config,
     index_project_from_config,
-    retrieve_ops_code_evidence_from_config,
 )
 
 
@@ -194,50 +194,51 @@ def build_indexed_project(
     return ops_repo, state, work_repo, config_path
 
 
-def test_retrieve_ops_code_evidence_groups_cited_ops_and_code_results(tmp_path: Path):
+def test_project_state_groups_cited_ops_and_code_results(tmp_path: Path):
     _, _, _, config_path = build_indexed_project(tmp_path, include_work=True)
 
-    packet = retrieve_ops_code_evidence_from_config(
-        topic="evidence packet context", config_path=config_path, limit=3
+    packet = get_project_state_from_config(
+        topic="evidence packet context",
+        view="doctrine_and_discussion",
+        config_path=config_path,
+        limit=3,
     )
 
-    assert packet["tool"] == "retrieve_ops_code_evidence"
+    assert packet["tool"] == "get_project_state"
     assert packet["topic"] == "evidence packet context"
     assert packet["project_id"] == "project-knowledge-mcp"
-    assert packet["sections"]["doctrine"][0]["path"] == "docs/doctrine/context.md"
-    assert packet["sections"]["doctrine"][0]["authority"] == "canonical"
-    assert packet["sections"]["decisions"][0]["path"] == "docs/decisions/accepted/0001-briefs.md"
-    assert packet["sections"]["open_questions"][0]["owner"] == "Amin"
-    assert packet["sections"]["code"][0]["repo_id"] == "app"
-    assert packet["sections"]["code"][0]["path"] == "src/example.py"
-    assert packet["sections"]["code"][0]["start_line"] >= 1
-    assert packet["gaps"] == []
-    assert "## Ops + Code Evidence" in packet["markdown"]
+    assert packet["sections"]["doctrine"]["results"][0]["path"] == "docs/doctrine/context.md"
+    assert packet["sections"]["doctrine"]["results"][0]["authority"] == "canonical"
+    assert packet["sections"]["accepted_decisions"]["results"][0]["path"] == (
+        "docs/decisions/accepted/0001-briefs.md"
+    )
+    assert packet["sections"]["open_questions"]["results"][0]["owner"] == "Amin"
+    code = packet["sections"]["implementation_evidence"]["results"][0]
+    assert code["repo_id"] == "app"
+    assert code["path"] == "src/example.py"
+    assert code["start_line"] >= 1
+    assert packet["overall_retrieval_state"] == "complete"
+    assert "## Authoritative doctrine" in packet["markdown"]
     assert "docs/doctrine/context.md" in packet["markdown"]
     assert "src/example.py" in packet["markdown"]
 
 
-def test_retrieve_ops_code_evidence_reports_code_gap_without_work_repo(tmp_path: Path):
+def test_project_state_reports_unavailable_implementation_without_work_repo(tmp_path: Path):
     _, _, _, config_path = build_indexed_project(tmp_path, include_work=False)
 
-    packet = retrieve_ops_code_evidence_from_config(
-        topic="evidence packet context", config_path=config_path, limit=3
+    packet = get_project_state_from_config(
+        topic="evidence packet context", view="doctrine", config_path=config_path, limit=3
     )
 
-    assert packet["sections"]["code"] == []
-    assert packet["gaps"] == [
-        {
-            "code": "CODE_EVIDENCE_UNAVAILABLE",
-            "message": "Code evidence search could not run for this topic.",
-            "recoverable": True,
-        }
-    ]
-    assert packet["errors"][0]["source"] == "code"
-    assert packet["errors"][0]["code"] == "QUERY_INVALID"
-    assert "CODE_EVIDENCE_UNAVAILABLE" in packet["markdown"]
+    section = packet["sections"]["implementation_evidence"]
+    assert section["results"] == []
+    assert section["retrieval_state"] == "unavailable"
+    assert section["match_state"] == "indeterminate"
+    assert section["errors"][0]["code"] == "QUERY_INVALID"
+    assert "absence cannot be inferred" in packet["markdown"]
 
 
-def test_retrieve_ops_code_evidence_preserves_underlying_errors(tmp_path: Path):
+def test_project_state_preserves_underlying_errors(tmp_path: Path):
     ops_repo = tmp_path / "ops"
     work_repo = tmp_path / "work"
     state = tmp_path / ".project-knowledge"
@@ -272,37 +273,34 @@ def test_retrieve_ops_code_evidence_preserves_underlying_errors(tmp_path: Path):
         tmp_path, ops_repo=ops_repo, work_repo=work_repo, state_dir=state
     )
 
-    packet = retrieve_ops_code_evidence_from_config(
-        topic="evidence packet context", config_path=config_path, limit=3
+    packet = get_project_state_from_config(
+        topic="evidence packet context",
+        view="doctrine_and_discussion",
+        config_path=config_path,
+        limit=3,
     )
 
-    assert packet["sections"]["code"] == []
-    assert packet["gaps"] == [
-        {
-            "code": "CODE_EVIDENCE_UNAVAILABLE",
-            "message": "Code evidence search could not run for this topic.",
-            "recoverable": True,
-        }
-    ]
+    assert packet["sections"]["implementation_evidence"]["results"] == []
+    assert packet["sections"]["implementation_evidence"]["retrieval_state"] == "unavailable"
     assert {error["source"] for error in packet["errors"]} >= {
         "doctrine",
         "open_questions",
-        "code",
+        "implementation_evidence",
     }
     assert {error["code"] for error in packet["errors"]} == {"INDEX_NOT_READY"}
     assert any("Index is not ready" in warning for warning in packet["warnings"])
 
 
-def test_retrieve_ops_code_evidence_uses_brief_limit_when_omitted(tmp_path: Path):
+def test_project_state_uses_brief_limit_when_omitted(tmp_path: Path):
     _, _, _, config_path = build_indexed_project(
         tmp_path, include_work=True, brief_max_results_per_section=1
     )
 
-    packet = retrieve_ops_code_evidence_from_config(
-        topic="evidence packet", config_path=config_path
+    packet = get_project_state_from_config(
+        topic="evidence packet", view="doctrine", config_path=config_path
     )
 
-    assert len(packet["sections"]["code"]) == 1
+    assert len(packet["sections"]["implementation_evidence"]["results"]) == 1
 
 
 def test_generate_session_brief_includes_staleness_warnings_and_markdown(tmp_path: Path):
@@ -315,6 +313,7 @@ def test_generate_session_brief_includes_staleness_warnings_and_markdown(tmp_pat
 
     brief = generate_session_brief_from_config(
         task="Implement evidence packet context",
+        view="doctrine_and_discussion",
         config_path=config_path,
         since="2026-06-01",
         limit=10,
@@ -326,13 +325,37 @@ def test_generate_session_brief_includes_staleness_warnings_and_markdown(tmp_pat
     assert brief["since"] == "2026-06-01"
     assert brief["project_id"] == "project-knowledge-mcp"
     assert brief["generated_at"]
-    assert brief["repo_staleness"][0]["repo_id"] == "ops"
-    assert brief["repo_staleness"][0]["reindex_needed"] is True
+    assert brief["repositories"][0]["repo_id"] == "ops"
+    assert brief["repositories"][0]["reindex_needed"] is True
     assert any("reindex" in warning.lower() for warning in brief["warnings"])
-    assert brief["sections"]["doctrine"][0]["path"] == "docs/doctrine/context.md"
-    assert brief["sections"]["code"][0]["path"] == "src/example.py"
-    assert brief["sections"]["recent_changes"]
-    assert {change["repo_id"] for change in brief["sections"]["recent_changes"]} >= {"ops", "app"}
-    assert "## Session Brief" in brief["markdown"]
-    assert "### Recent Indexed Changes" in brief["markdown"]
+    assert brief["sections"]["doctrine"]["results"][0]["path"] == (
+        "docs/doctrine/context.md"
+    )
+    assert brief["sections"]["implementation_evidence"]["results"][0]["path"] == (
+        "src/example.py"
+    )
+    recent = brief["sections"]["recent_changes"]["results"]
+    assert recent
+    assert {change["repo_id"] for change in recent} >= {"ops", "app"}
+    assert "## Session brief" in brief["markdown"]
+    assert "## Recent indexed changes" in brief["markdown"]
     assert "Connected assistant should synthesize" in brief["markdown"]
+
+
+def test_session_brief_without_since_marks_recent_changes_not_run(tmp_path: Path):
+    _, _, _, config_path = build_indexed_project(tmp_path, include_work=True)
+
+    brief = generate_session_brief_from_config(
+        task="Implement evidence packet context",
+        view="doctrine",
+        config_path=config_path,
+        limit=5,
+    )
+
+    recent = brief["sections"]["recent_changes"]
+    assert recent["retrieval_state"] == "not_run"
+    assert recent["match_state"] == "indeterminate"
+    assert recent["results"] == []
+    assert {item["section"] for item in brief["known_omissions"]} >= {"recent_changes"}
+    assert "## Recent indexed changes" in brief["markdown"]
+    assert "Not searched because this section was not requested." in brief["markdown"]

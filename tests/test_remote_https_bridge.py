@@ -77,11 +77,14 @@ def wait_for_401(port: int) -> None:
     raise AssertionError(f"Bearer-gated MCP server did not become ready: {last_error!r}")
 
 
-async def list_remote_tools_with_token(port: int, token: str) -> tuple[set[str], dict]:
+async def list_remote_tools_with_token(port: int, token: str) -> tuple[set[str], dict, dict]:
     async with Client(f"http://127.0.0.1:{port}/mcp", auth=token) as client:
-        tools = {tool.name for tool in await client.list_tools()}
+        registered = await client.list_tools()
+        tools = {tool.name for tool in registered}
+        project_state = next(tool for tool in registered if tool.name == "get_project_state")
+        metadata = project_state.model_dump() if hasattr(project_state, "model_dump") else dict(project_state)
         health = json.loads(result_text(await client.call_tool("health")))
-        return tools, health
+        return tools, metadata, health
 
 
 def test_caddy_bearer_gate_semantics_and_remote_tool_parity():
@@ -101,8 +104,19 @@ def test_caddy_bearer_gate_semantics_and_remote_tool_parity():
         )
         assert wrong_auth.status_code == 401
 
-        remote_tools, health = asyncio.run(list_remote_tools_with_token(port, token))
+        remote_tools, project_state_metadata, health = asyncio.run(
+            list_remote_tools_with_token(port, token)
+        )
         assert remote_tools == EXPECTED_TOOL_NAMES
+        schema = project_state_metadata.get("inputSchema") or project_state_metadata.get(
+            "input_schema"
+        )
+        assert schema is not None
+        assert "view" in schema["required"]
+        assert schema["properties"]["view"]["enum"] == [
+            "doctrine",
+            "doctrine_and_discussion",
+        ]
         assert "shell" not in remote_tools
         assert "merge" not in " ".join(sorted(remote_tools))
         assert health["status"] == "ok"

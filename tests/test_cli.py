@@ -17,16 +17,24 @@ def test_cli_help_lists_step1_index_commands():
     assert "index-project" in result.output
     assert "search-index" in result.output
     assert "search-decisions" in result.output
-    assert "get-current-doctrine" in result.output
+    assert "get-project-state" in result.output
     assert "search-open-questions" in result.output
     assert "search-code" in result.output
     assert "get-code-context" in result.output
     assert "get-code-provider-status" in result.output
-    assert "retrieve-ops-code-evidence" in result.output
+    assert "get-current-doctrine" not in result.output
+    assert "retrieve-ops-code-evidence" not in result.output
     assert "generate-session-brief" in result.output
     assert "setup" in result.output
     assert "status" in result.output
     assert "print-client-config" in result.output
+
+
+def test_cli_requires_explicit_project_state_view():
+    result = CliRunner().invoke(app, ["get-project-state", "context"])
+
+    assert result.exit_code != 0
+    assert "view" in result.output.lower()
 
 
 def init_git_repo(path: Path) -> None:
@@ -576,12 +584,24 @@ Context retrieval unresolved question.
     assert "markdown" in decisions
 
     doctrine_result = CliRunner().invoke(
-        app, ["get-current-doctrine", "context retrieval", "--config", str(config_path)]
+        app,
+        [
+            "get-project-state",
+            "context retrieval",
+            "--view",
+            "doctrine",
+            "--config",
+            str(config_path),
+        ],
     )
     assert doctrine_result.exit_code == 0, doctrine_result.output
     doctrine = json.loads(doctrine_result.output)
-    assert doctrine["doctrine"][0]["path"] == "docs/doctrine/context.md"
-    assert doctrine["decisions"][0]["path"] == "docs/decisions/accepted/0001-context.md"
+    assert doctrine["sections"]["doctrine"]["results"][0]["path"] == (
+        "docs/doctrine/context.md"
+    )
+    assert doctrine["sections"]["accepted_decisions"]["results"][0]["path"] == (
+        "docs/decisions/accepted/0001-context.md"
+    )
 
     question_result = CliRunner().invoke(
         app,
@@ -703,8 +723,10 @@ class ExampleService:
     evidence_result = CliRunner().invoke(
         app,
         [
-            "retrieve-ops-code-evidence",
+            "get-project-state",
             "compile_context evidence",
+            "--view",
+            "doctrine_and_discussion",
             "--config",
             str(config_path),
             "--limit",
@@ -713,15 +735,18 @@ class ExampleService:
     )
     assert evidence_result.exit_code == 0, evidence_result.output
     evidence = json.loads(evidence_result.output)
-    assert evidence["tool"] == "retrieve_ops_code_evidence"
-    assert sorted(evidence["sections"]) == ["code", "decisions", "doctrine", "open_questions"]
-    assert evidence["sections"]["code"][0]["path"] == "src/example.py"
+    assert evidence["tool"] == "get_project_state"
+    assert evidence["sections"]["implementation_evidence"]["results"][0]["path"] == (
+        "src/example.py"
+    )
 
     brief_result = CliRunner().invoke(
         app,
         [
             "generate-session-brief",
             "Implement compile_context evidence",
+            "--view",
+            "doctrine_and_discussion",
             "--config",
             str(config_path),
             "--since",
@@ -734,8 +759,10 @@ class ExampleService:
     brief = json.loads(brief_result.output)
     assert brief["tool"] == "generate_session_brief"
     assert brief["since"] == "2026-06-01"
-    assert brief["sections"]["code"][0]["path"] == "src/example.py"
-    assert "## Session Brief" in brief["markdown"]
+    assert brief["sections"]["implementation_evidence"]["results"][0]["path"] == (
+        "src/example.py"
+    )
+    assert "## Session brief" in brief["markdown"]
 
 
 def test_cli_check_project_staleness_from_config(tmp_path: Path):
