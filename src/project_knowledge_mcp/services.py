@@ -11,7 +11,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 
@@ -634,50 +634,301 @@ def search_open_questions_from_config(
     return result
 
 
-def get_current_doctrine_from_config(
+ProjectStateView = Literal["doctrine", "doctrine_and_discussion"]
+_PROJECT_STATE_VIEWS = {"doctrine", "doctrine_and_discussion"}
+
+
+def get_project_state_from_config(
     *,
     topic: str,
+    view: ProjectStateView,
     config_path: Path | str | None = None,
-    filters: dict[str, Any] | None = None,
+    include_superseded: bool = False,
     limit: int | None = None,
 ) -> dict[str, Any]:
-    doctrine_filters, error = _filters_with_required_doc_type(
-        topic, filters, required_doc_type="doctrine", default_status="current"
-    )
-    if error is not None:
-        return error
-    decision_filters, error = _filters_with_required_doc_type(
-        topic, filters, required_doc_type="decision", default_status="accepted"
-    )
-    if error is not None:
-        return error
+    """Compile one authority-aware project-state packet.
 
-    doctrine = search_ops_from_config(
-        query=topic, config_path=config_path, filters=doctrine_filters, limit=limit
-    )
-    if doctrine.get("error"):
-        doctrine["topic"] = topic
-        return doctrine
-    decisions = search_ops_from_config(
-        query=topic, config_path=config_path, filters=decision_filters, limit=limit
-    )
-    if decisions.get("error"):
-        decisions["topic"] = topic
-        return decisions
+    Retrieval execution, match outcome, and source freshness are separate so
+    an empty result cannot hide an unavailable or stale retrieval path.
+    """
+    if view not in _PROJECT_STATE_VIEWS:
+        invalid = _query_invalid(
+            topic,
+            "view must be one of: doctrine, doctrine_and_discussion",
+            details={"view": view, "allowed_views": sorted(_PROJECT_STATE_VIEWS)},
+        )
+        return {
+            "tool": "get_project_state",
+            "topic": topic,
+            "view": view,
+            "sections": {},
+            **invalid,
+        }
 
-    doctrine_results = doctrine.get("results", [])
-    decision_results = decisions.get("results", [])
-    warnings = [*doctrine.get("warnings", []), *decisions.get("warnings", [])]
-    return {
-        "tool": "get_current_doctrine",
-        "topic": topic,
-        "project_id": doctrine.get("project_id") or decisions.get("project_id"),
-        "doctrine": doctrine_results,
-        "decisions": decision_results,
-        "results": [*doctrine_results, *decision_results],
-        "warnings": warnings,
-        "markdown": _render_current_doctrine_markdown(topic, doctrine_results, decision_results),
+    result_limit = _brief_result_limit(config_path=config_path, limit=limit)
+    staleness_packet = check_project_staleness_from_config(config_path=config_path)
+    staleness = list(staleness_packet.get("repos", []))
+
+    doctrine_filters, doctrine_filter_error = _filters_with_required_doc_type(
+        topic, None, required_doc_type="doctrine", default_status="current"
+    )
+    decision_filters, decision_filter_error = _filters_with_required_doc_type(
+        topic, None, required_doc_type="decision", default_status="accepted"
+    )
+    if doctrine_filter_error is not None or decision_filter_error is not None:
+        raise RuntimeError("internal project-state filters are invalid")
+    doctrine_packet = search_ops_from_config(
+        query=topic, config_path=config_path, filters=doctrine_filters, limit=result_limit
+    )
+    decision_packet = search_ops_from_config(
+        query=topic, config_path=config_path, filters=decision_filters, limit=result_limit
+    )
+    code_packet = search_code_from_config(query=topic, config_path=config_path, limit=result_limit)
+
+    packets: dict[str, dict[str, Any] | None] = {
+        "doctrine": doctrine_packet,
+        "accepted_decisions": decision_packet,
+        "implementation_evidence": code_packet,
     }
+    if view == "doctrine_and_discussion":
+        packets["open_questions"] = search_open_questions_from_config(
+            query=topic, config_path=config_path, limit=result_limit
+        )
+        packets["proposals_and_drafts"] = _search_project_state_doc_types(
+            topic=topic,
+            doc_types=(
+                "proposal",
+                "doctrine_delta",
+                "adr_draft",
+                "decision_proposal",
+                "review_packet",
+                "handover",
+            ),
+            statuses=("draft", "captured", "open", "active", "current", "proposed"),
+            config_path=config_path,
+            limit=result_limit,
+        )
+        packets["discussions_and_captures"] = _search_project_state_doc_types(
+            topic=topic,
+            doc_types=("discussion", "note", "capture", "project_brief"),
+            statuses=("captured", "draft", "open", "active", "current"),
+            config_path=config_path,
+            limit=result_limit,
+        )
+    else:
+        packets["open_questions"] = None
+        packets["proposals_and_drafts"] = None
+        packets["discussions_and_captures"] = None
+
+    if include_superseded:
+        packets["superseded_and_rejected"] = search_ops_from_config(
+            query=topic,
+            config_path=config_path,
+            filters={
+                "include_superseded": True,
+                "_allowed_statuses": ["superseded", "rejected"],
+            },
+            limit=result_limit,
+        )
+
+    ops_stale = _role_is_stale(staleness, "ops")
+    work_stale = _role_is_stale(staleness, "work")
+    sections: dict[str, dict[str, Any]] = {}
+    section_metadata = {
+        "doctrine": ("Authoritative doctrine", "canonical"),
+        "accepted_decisions": ("Accepted decisions", "accepted_decision"),
+        "implementation_evidence": ("Implementation evidence", "implementation"),
+        "open_questions": ("Open questions", "non_authoritative"),
+        "proposals_and_drafts": ("Proposals and drafts", "non_authoritative"),
+        "discussions_and_captures": ("Discussions and captures", "non_authoritative"),
+        "superseded_and_rejected": ("Superseded and rejected", "superseded"),
+    }
+    for name, source_packet in packets.items():
+        label, authority_class = section_metadata[name]
+        if source_packet is None:
+            sections[name] = _project_state_section_not_run(
+                section_id=name, label=label, authority_class=authority_class
+            )
+        else:
+            sections[name] = _project_state_section(
+                source_packet,
+                section_id=name,
+                label=label,
+                authority_class=authority_class,
+                stale=work_stale if name == "implementation_evidence" else ops_stale,
+            )
+
+    errors = _packet_errors(
+        *((name, packet) for name, packet in packets.items() if packet is not None),
+        ("staleness", staleness_packet),
+    )
+    warnings = _merge_unique_warnings(
+        *(packet.get("warnings", []) for packet in packets.values() if packet is not None),
+        staleness_packet.get("warnings", []),
+        _packet_staleness_warnings(staleness),
+        _packet_error_warnings(
+            *(packet for packet in packets.values() if packet is not None), staleness_packet
+        ),
+    )
+    project_id = next(
+        (
+            packet.get("project_id")
+            for packet in [*packets.values(), staleness_packet]
+            if packet is not None and packet.get("project_id")
+        ),
+        None,
+    )
+    packet = {
+        "tool": "get_project_state",
+        "topic": topic,
+        "view": view,
+        "include_superseded": include_superseded,
+        "project_id": project_id,
+        "generated_at": _now(),
+        "sections": sections,
+        "repositories": staleness,
+        "warnings": warnings,
+        "errors": errors,
+    }
+    packet["overall_retrieval_state"] = _project_state_packet_status(sections)
+    packet["known_omissions"] = _project_state_known_omissions(sections)
+    packet["markdown"] = _render_project_state_markdown(packet)
+    return packet
+
+
+def _search_project_state_doc_types(
+    *,
+    topic: str,
+    doc_types: tuple[str, ...],
+    statuses: tuple[str, ...],
+    config_path: Path | str | None,
+    limit: Any,
+) -> dict[str, Any]:
+    packets: list[dict[str, Any]] = []
+    for doc_type in doc_types:
+        filters, error = _filters_with_required_doc_type(
+            topic, None, required_doc_type=doc_type, default_statuses=statuses
+        )
+        if error is not None:
+            return error
+        packets.append(
+            search_ops_from_config(
+                query=topic, config_path=config_path, filters=filters, limit=limit
+            )
+        )
+
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for result in sorted(
+        (item for packet in packets for item in packet.get("results", [])),
+        key=lambda item: float(item.get("score", 0.0)),
+        reverse=True,
+    ):
+        key = (str(result.get("repo_id", "")), str(result.get("chunk_id") or result.get("path")))
+        if key not in seen:
+            seen.add(key)
+            merged.append(result)
+        if len(merged) >= int(limit):
+            break
+    return {
+        "query": topic,
+        "project_id": next(
+            (packet.get("project_id") for packet in packets if packet.get("project_id")), None
+        ),
+        "results": merged,
+        "warnings": _merge_unique_warnings(*(packet.get("warnings", []) for packet in packets)),
+        "errors": _packet_errors(
+            *((doc_type, packet) for doc_type, packet in zip(doc_types, packets))
+        ),
+        "error": next((packet.get("error") for packet in packets if packet.get("error")), None),
+    }
+
+
+def _role_is_stale(repos: list[dict[str, Any]], role: str) -> bool:
+    return any(repo.get("role") == role and repo.get("reindex_needed") for repo in repos)
+
+
+def _project_state_section_not_run(
+    *, section_id: str, label: str, authority_class: str
+) -> dict[str, Any]:
+    return {
+        "id": section_id,
+        "label": label,
+        "authority_class": authority_class,
+        "retrieval_state": "not_run",
+        "match_state": "indeterminate",
+        "freshness_state": "unknown",
+        "results": [],
+        "warnings": [],
+        "errors": [],
+    }
+
+
+def _project_state_section(
+    packet: dict[str, Any],
+    *,
+    section_id: str,
+    label: str,
+    authority_class: str,
+    stale: bool,
+) -> dict[str, Any]:
+    results = list(packet.get("results", []))
+    packet_errors = _packet_errors((section_id, packet))
+    error = packet.get("error")
+    if error:
+        retrieval_state = "unavailable"
+        match_state = "indeterminate"
+    elif stale:
+        retrieval_state = "partial"
+        match_state = "with_results" if results else "indeterminate"
+    else:
+        retrieval_state = "complete"
+        match_state = "with_results" if results else "no_match"
+    return {
+        "id": section_id,
+        "label": label,
+        "authority_class": authority_class,
+        "retrieval_state": retrieval_state,
+        "match_state": match_state,
+        "freshness_state": "stale" if stale else ("unknown" if error else "current"),
+        "results": results,
+        "warnings": list(packet.get("warnings", [])),
+        "errors": packet_errors,
+    }
+
+
+def _project_state_packet_status(sections: dict[str, dict[str, Any]]) -> str:
+    states = [
+        section["retrieval_state"]
+        for section in sections.values()
+        if section["retrieval_state"] != "not_run"
+    ]
+    if states and all(state == "unavailable" for state in states):
+        return "unavailable"
+    if any(state in {"partial", "unavailable"} for state in states):
+        return "partial"
+    return "complete"
+
+
+def _project_state_known_omissions(sections: dict[str, dict[str, Any]]) -> list[dict[str, str]]:
+    omissions: list[dict[str, str]] = []
+    for section in sections.values():
+        state = section["retrieval_state"]
+        if state == "not_run":
+            omissions.append(
+                {
+                    "section": section["id"],
+                    "reason": "excluded_by_selected_view",
+                }
+            )
+        elif state in {"partial", "unavailable"}:
+            omissions.append(
+                {
+                    "section": section["id"],
+                    "reason": "retrieval_incomplete",
+                }
+            )
+    return omissions
 
 
 def check_project_staleness_from_config(
@@ -1026,107 +1277,61 @@ def get_code_context_from_config(
     }
 
 
-def retrieve_ops_code_evidence_from_config(
-    *,
-    topic: str,
-    config_path: Path | str | None = None,
-    limit: int | None = None,
-) -> dict[str, Any]:
-    result_limit = _brief_result_limit(config_path=config_path, limit=limit)
-    doctrine_packet = get_current_doctrine_from_config(
-        topic=topic, config_path=config_path, limit=result_limit
-    )
-    open_questions_packet = search_open_questions_from_config(
-        query=topic, config_path=config_path, limit=result_limit
-    )
-    code_packet = search_code_from_config(query=topic, config_path=config_path, limit=result_limit)
-    staleness_packet = check_project_staleness_from_config(config_path=config_path)
-
-    doctrine_results = list(doctrine_packet.get("doctrine", []))
-    decision_results = list(doctrine_packet.get("decisions", []))
-    open_question_results = (
-        [] if open_questions_packet.get("error") else list(open_questions_packet.get("results", []))
-    )
-    code_results = [] if code_packet.get("error") else list(code_packet.get("results", []))
-    sections = {
-        "doctrine": doctrine_results,
-        "decisions": decision_results,
-        "open_questions": open_question_results,
-        "code": code_results,
-    }
-    gaps = _packet_gaps(code_results, code_packet=code_packet)
-    errors = _packet_errors(
-        ("doctrine", doctrine_packet),
-        ("open_questions", open_questions_packet),
-        ("code", code_packet),
-        ("staleness", staleness_packet),
-    )
-    warnings = _merge_unique_warnings(
-        doctrine_packet.get("warnings", []),
-        open_questions_packet.get("warnings", []),
-        code_packet.get("warnings", []),
-        staleness_packet.get("warnings", []),
-        _packet_staleness_warnings(staleness_packet.get("repos", [])),
-        _packet_error_warnings(
-            doctrine_packet, open_questions_packet, code_packet, staleness_packet
-        ),
-    )
-    project_id = (
-        doctrine_packet.get("project_id")
-        or open_questions_packet.get("project_id")
-        or code_packet.get("project_id")
-        or staleness_packet.get("project_id")
-    )
-    packet = {
-        "tool": "retrieve_ops_code_evidence",
-        "topic": topic,
-        "project_id": project_id,
-        "generated_at": _now(),
-        "sections": sections,
-        "staleness": staleness_packet.get("repos", []),
-        "warnings": warnings,
-        "gaps": gaps,
-        "errors": errors,
-    }
-    packet["markdown"] = _render_ops_code_evidence_markdown(packet)
-    return packet
-
-
 def generate_session_brief_from_config(
     *,
     task: str,
+    view: ProjectStateView,
     config_path: Path | str | None = None,
     since: str | None = None,
     limit: int | None = None,
 ) -> dict[str, Any]:
     topic = _topic_from_task(task)
     result_limit = _brief_result_limit(config_path=config_path, limit=limit)
-    evidence = retrieve_ops_code_evidence_from_config(
-        topic=topic, config_path=config_path, limit=result_limit
+    project_state = get_project_state_from_config(
+        topic=topic,
+        view=view,
+        config_path=config_path,
+        limit=result_limit,
     )
-    recent_changes = _recent_indexed_changes_from_config(
-        config_path=config_path, since=since, limit=result_limit
-    )
-    repo_staleness = list(evidence.get("staleness", []))
-    sections = dict(evidence.get("sections", {}))
-    sections["recent_changes"] = recent_changes.get("results", [])
-    warnings = _merge_unique_warnings(
-        evidence.get("warnings", []), recent_changes.get("warnings", [])
-    )
-    errors = [*list(evidence.get("errors", [])), *list(recent_changes.get("errors", []))]
+    if project_state.get("error"):
+        return {**project_state, "tool": "generate_session_brief", "task": task, "since": since}
+    if since is None:
+        recent_changes = {"results": [], "warnings": [], "errors": []}
+        recent_section = _project_state_section_not_run(
+            section_id="recent_changes",
+            label="Recent indexed changes",
+            authority_class="implementation",
+        )
+    else:
+        recent_changes = _recent_indexed_changes_from_config(
+            config_path=config_path, since=since, limit=result_limit
+        )
+        recent_section = _project_state_section(
+            recent_changes,
+            section_id="recent_changes",
+            label="Recent indexed changes",
+            authority_class="implementation",
+            stale=False,
+        )
+    sections = dict(project_state["sections"])
+    sections["recent_changes"] = recent_section
     brief = {
+        **project_state,
         "tool": "generate_session_brief",
         "task": task,
         "evidence_topic": topic,
         "since": since,
-        "project_id": evidence.get("project_id"),
-        "generated_at": _now(),
-        "repo_staleness": repo_staleness,
         "sections": sections,
-        "warnings": warnings,
-        "gaps": list(evidence.get("gaps", [])),
-        "errors": errors,
+        "warnings": _merge_unique_warnings(
+            project_state.get("warnings", []), recent_changes.get("warnings", [])
+        ),
+        "errors": [
+            *list(project_state.get("errors", [])),
+            *list(recent_changes.get("errors", [])),
+        ],
     }
+    brief["overall_retrieval_state"] = _project_state_packet_status(sections)
+    brief["known_omissions"] = _project_state_known_omissions(sections)
     brief["markdown"] = _render_session_brief_markdown(brief)
     return brief
 
@@ -1352,31 +1557,36 @@ def _render_ops_code_evidence_markdown(packet: dict[str, Any]) -> str:
 
 
 def _render_session_brief_markdown(brief: dict[str, Any]) -> str:
-    lines = ["## Session Brief", "", f"Task: `{brief['task']}`"]
+    lines = [
+        "## Session brief",
+        "",
+        f"Task: `{brief['task']}`",
+        f"View: `{brief['view']}`",
+    ]
     if brief.get("since"):
         lines.append(f"Since: `{brief['since']}`")
     lines.append("")
-    if brief.get("repo_staleness"):
-        lines.extend(["### Repo Freshness", ""])
-        for repo in brief["repo_staleness"]:
-            freshness = "reindex needed" if repo.get("reindex_needed") else "current"
-            lines.append(
-                f"- `{repo.get('repo_id')}`: **{freshness}** @ `{repo.get('head_commit')}`"
-            )
+    for section_id in ("doctrine", "accepted_decisions", "implementation_evidence"):
+        _append_project_state_section(lines, brief["sections"][section_id], level=2)
+    if brief["view"] == "doctrine_and_discussion":
+        for section_id in (
+            "open_questions",
+            "proposals_and_drafts",
+            "discussions_and_captures",
+        ):
+            _append_project_state_section(lines, brief["sections"][section_id], level=2)
+    _append_project_state_section(lines, brief["sections"]["recent_changes"], level=2)
+    lines.extend(["## Retrieval limitations and omissions", ""])
+    if brief["known_omissions"]:
+        for omission in brief["known_omissions"]:
+            lines.append(f"- `{omission['section']}`: {omission['reason']}")
         lines.append("")
-    _append_packet_section(lines, "Doctrine", brief["sections"].get("doctrine", []))
-    _append_packet_section(lines, "Accepted Decisions", brief["sections"].get("decisions", []))
-    _append_packet_section(lines, "Open Questions", brief["sections"].get("open_questions", []))
-    _append_packet_section(lines, "Code Evidence", brief["sections"].get("code", []))
-    if brief.get("since"):
-        _append_packet_section(
-            lines, "Recent Indexed Changes", brief["sections"].get("recent_changes", [])
-        )
-    _append_packet_gaps(lines, brief.get("gaps", []))
+    else:
+        lines.extend(["No known omissions.", ""])
     _append_packet_warnings(lines, brief.get("warnings", []))
     lines.extend(
         [
-            "### Boundary",
+            "## Boundary",
             "",
             "Connected assistant should synthesize the user-facing answer from this packet and cite sources where making project claims.",
         ]
@@ -2418,6 +2628,101 @@ def _render_search_markdown(query: str, results: list[dict[str, Any]]) -> str:
             lines.append(f"Warnings: {'; '.join(result['warnings'])}")
         lines.extend(["", f"> {result['excerpt']}", ""])
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_project_state_markdown(packet: dict[str, Any]) -> str:
+    lines = [
+        "## Project state",
+        "",
+        f"Topic: `{packet['topic']}`",
+        f"View: `{packet['view']}`",
+        f"Overall retrieval state: `{packet['overall_retrieval_state']}`",
+        "",
+    ]
+    _append_project_state_section(lines, packet["sections"]["doctrine"], level=2)
+    _append_project_state_section(lines, packet["sections"]["accepted_decisions"], level=2)
+    _append_project_state_section(lines, packet["sections"]["implementation_evidence"], level=2)
+
+    doctrine_results = packet["sections"]["doctrine"]["results"]
+    decision_results = packet["sections"]["accepted_decisions"]["results"]
+    informal_results = any(
+        packet["sections"][name]["results"]
+        for name in ("open_questions", "proposals_and_drafts", "discussions_and_captures")
+    )
+    if not doctrine_results and not decision_results and informal_results:
+        lines.extend(
+            [
+                "No matching doctrine or accepted decision was found. Relevant non-authoritative "
+                "project context exists below; it has not undergone an authority transition.",
+                "",
+            ]
+        )
+
+    if packet["view"] == "doctrine_and_discussion":
+        _append_project_state_section(lines, packet["sections"]["open_questions"], level=2)
+        _append_project_state_section(lines, packet["sections"]["proposals_and_drafts"], level=2)
+        _append_project_state_section(
+            lines, packet["sections"]["discussions_and_captures"], level=2
+        )
+    if "superseded_and_rejected" in packet["sections"]:
+        _append_project_state_section(lines, packet["sections"]["superseded_and_rejected"], level=2)
+
+    lines.extend(["## Retrieval limitations and omissions", ""])
+    if packet["known_omissions"]:
+        for omission in packet["known_omissions"]:
+            lines.append(f"- `{omission['section']}`: {omission['reason']}")
+        lines.append("")
+    else:
+        lines.extend(["No known omissions.", ""])
+    _append_packet_warnings(lines, packet.get("warnings", []))
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _append_project_state_section(lines: list[str], section: dict[str, Any], *, level: int) -> None:
+    heading = section["label"]
+    if section["authority_class"] in {"non_authoritative", "superseded"}:
+        heading += " — not authoritative"
+    lines.extend(
+        [
+            f"{'#' * level} {heading}",
+            "",
+            (
+                f"Retrieval: `{section['retrieval_state']}`; match: `{section['match_state']}`; "
+                f"freshness: `{section['freshness_state']}`; authority class: "
+                f"`{section['authority_class']}`"
+            ),
+            "",
+        ]
+    )
+    if not section["results"]:
+        if section["retrieval_state"] == "not_run":
+            lines.extend(["Not searched because this section was not requested.", ""])
+        elif section["match_state"] == "indeterminate":
+            lines.extend(["Retrieval is incomplete; absence cannot be inferred.", ""])
+        else:
+            lines.extend(["Search completed with no matching evidence.", ""])
+        return
+    for index, result in enumerate(section["results"], start=1):
+        source = _packet_source_label(result)
+        title = result.get("title") or result.get("symbol") or result.get("path") or "Untitled"
+        labels = " / ".join(
+            str(value) for value in (result.get("authority"), result.get("status")) if value
+        )
+        suffix = f" — `{labels}`" if labels else ""
+        lines.extend(
+            [
+                f"{index}. **{title}**{suffix}",
+                f"   Source: `{source}`",
+            ]
+        )
+        if result.get("provider"):
+            lines.append(f"   provider: `{result['provider']}`")
+        lines.extend(
+            [
+                f"   Excerpt: {result.get('excerpt') or result.get('snippet') or ''}",
+                "",
+            ]
+        )
 
 
 def _render_current_doctrine_markdown(

@@ -69,19 +69,18 @@ Current PKMCP exposes these MCP tools:
 | `check_project_staleness` | Check whether indexed evidence may be stale relative to repo state. |
 | `search_ops` | Search indexed ops/docs/project-memory content. |
 | `search_decisions` | Search accepted and draft decision docs. |
-| `get_current_doctrine` | Retrieve current doctrine plus accepted decisions for a topic. |
+| `get_project_state` | Retrieve an explicit doctrine-only or doctrine-plus-discussion project-state view. |
 | `search_open_questions` | Search open questions with source/owner metadata. |
 | `get_code_provider_status` | Check CodeGraph/text fallback provider health for code context. |
 | `search_code` | Search configured work repo code/test/schema evidence. |
 | `get_code_context` | Retrieve context for a symbol or repo-relative file path. |
-| `retrieve_ops_code_evidence` | Retrieve grouped doctrine, decisions, open questions, code, and staleness for a topic. |
-| `generate_session_brief` | Compile a task-oriented evidence packet, optionally including recent indexed changes. |
+| `generate_session_brief` | Compile a task-oriented evidence packet using a required project-state view, optionally including recent indexed changes. |
 | `add_project_note` | Write a low-authority capture note. Do not use unless the user asked to record/capture something. |
 | `create_draft_artifact` | Create a non-canonical draft/proposal artifact. Do not use unless the user asked to draft/write. |
 | `propose_authority_change` | Prepare an authority-change branch/commit/PR flow. Do not use for normal question answering. |
 
 For codebase questions, the usual tools are `get_code_provider_status`,
-`search_code`, `get_code_context`, `retrieve_ops_code_evidence`, and
+`search_code`, `get_code_context`, `get_project_state`, and
 `generate_session_brief`.
 
 ## First-Move Workflow
@@ -95,9 +94,8 @@ For a broad codebase/project-memory question:
      asked for current indexed evidence, call `index_project` before searching.
 
 2. **Start with an evidence-packet tool for multi-source questions.**
-   - Call `retrieve_ops_code_evidence({"topic": "..."})` when the question mixes
-     docs, decisions, open questions, and code.
-   - Call `generate_session_brief({"task": "..."})` when beginning a coding task
+   - Call `get_project_state({"topic": "...", "view": "doctrine"})` for the authoritative baseline, or use `view: "doctrine_and_discussion"` when separately labeled informal context is needed.
+   - Call `generate_session_brief({"task": "...", "view": "doctrine"})` when beginning a coding task
      or needing session context.
 
 3. **Use code-specific tools for implementation questions.**
@@ -143,14 +141,14 @@ If a result names a symbol or file, pivot from search to context:
 For task kickoff, use a task-shaped query:
 
 ```json
-{"task": "Implement bearer-token expiry validation", "since": "2026-06-01", "limit": 5}
+{"task": "Implement bearer-token expiry validation", "view": "doctrine_and_discussion", "since": "2026-06-01", "limit": 5}
 ```
 
 ## Result Interpretation
 
 ### Search/docs results
 
-`search_ops`, `search_decisions`, `get_current_doctrine`, and
+`search_ops`, `search_decisions`, `get_project_state`, and
 `search_open_questions` return project-memory evidence. Important fields include:
 
 - `path`, `start_line`, `end_line`: where the indexed evidence came from.
@@ -201,29 +199,31 @@ Interpretation rules:
 
 ### Evidence packets
 
-`retrieve_ops_code_evidence` returns:
+`get_project_state` returns stable authority-separated sections:
 
 - `sections.doctrine`
-- `sections.decisions`
+- `sections.accepted_decisions`
+- `sections.implementation_evidence`
 - `sections.open_questions`
-- `sections.code`
-- `staleness`
+- `sections.proposals_and_drafts`
+- `sections.discussions_and_captures`
+- `repositories`
+- `overall_retrieval_state`
+- `known_omissions`
 - `warnings`
-- `gaps`
 - `errors`
 - `markdown`
 
 `generate_session_brief` returns the same kind of packet with task framing, plus:
 
 - `evidence_topic`
-- `repo_staleness`
+- `repositories`
 - `sections.recent_changes` when `since` is provided
 
 Interpretation rules:
 
 - Treat packet sections as an evidence bundle to synthesize, not as a final answer.
-- If `gaps` includes `CODE_EVIDENCE_MISSING`, say no code evidence was found and
-  try a narrower query or direct repository search.
+- Read every section's `retrieval_state`, `match_state`, and `freshness_state`; never infer absence from `partial`, `unavailable`, or `not_run` retrieval.
 - If `errors` includes `INDEX_NOT_READY`, call `index_project` if appropriate or
   fall back to direct live repo inspection.
 - If `warnings` mention reindexing, stale repos, fallback provider, or config

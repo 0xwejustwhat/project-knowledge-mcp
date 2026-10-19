@@ -102,10 +102,10 @@ authority: accepted_decision
 
 - `search_ops` searches ops docs and accepts filters for `doc_type`, `status`, `authority`, and `include_superseded`.
 - `search_decisions` scopes results to decision documents and accepted/draft decision status rules.
-- `get_current_doctrine` returns only `type: doctrine` with `status: current` and `type: decision` with `status: accepted`.
+- `get_project_state(..., view="doctrine")` returns only current doctrine, accepted decisions, and implementation evidence. `view="doctrine_and_discussion"` adds separately labeled non-authoritative sections.
 - `search_open_questions` returns `type: open_question` docs and defaults to `status: open`.
 
-If a document has no frontmatter and path inference classifies it as `note`, content search may find it through `search_ops`, but scoped tools such as `get_current_doctrine` will not include it.
+If a document has no frontmatter and path inference classifies it as `note`, content search may find it through `search_ops`; `get_project_state` includes it only in `discussions_and_captures` when the caller explicitly selects `doctrine_and_discussion`.
 
 ## Authority Proposal Tool
 

@@ -23,10 +23,9 @@ from project_knowledge_mcp.services import (
     generate_session_brief_from_config,
     get_code_context_from_config,
     get_code_provider_status_from_config,
-    get_current_doctrine_from_config,
+    get_project_state_from_config,
     index_project_from_config,
     propose_authority_change_from_config,
-    retrieve_ops_code_evidence_from_config,
     search_code_from_config,
     search_decisions_from_config,
     search_open_questions_from_config,
@@ -140,21 +139,32 @@ def create_mcp() -> FastMCP:
         )
 
     @mcp.tool
-    def get_current_doctrine(
+    def get_project_state(
         topic: Annotated[
-            str, Field(description="Topic to retrieve current doctrine and decisions for")
+            str, Field(description="Topic to retrieve authority-aware project state for")
+        ],
+        view: Annotated[
+            Literal["doctrine", "doctrine_and_discussion"],
+            Field(
+                description=(
+                    "Required epistemic view: authoritative baseline only, or the same baseline "
+                    "plus separately labeled non-authoritative project context"
+                )
+            ),
         ],
         config_path: Annotated[str | None, Field(description="Path to project.yaml")] = None,
-        filters: Annotated[
-            dict[str, Any] | None, Field(description="Optional filters (include_superseded)")
-        ] = None,
+        include_superseded: Annotated[
+            bool,
+            Field(description="Add superseded/rejected material in a separate non-current section"),
+        ] = False,
         limit: Annotated[int | None, Field(description="Maximum results per section")] = None,
     ) -> dict[str, Any]:
-        """Return canonical/current doctrine and accepted decisions for a topic."""
-        return get_current_doctrine_from_config(
+        """Return project state with explicit authority, retrieval, match, and freshness states."""
+        return get_project_state_from_config(
             topic=topic,
+            view=view,
             config_path=config_path,
-            filters=filters,
+            include_superseded=include_superseded,
             limit=limit,
         )
 
@@ -220,23 +230,13 @@ def create_mcp() -> FastMCP:
         return get_code_provider_status_from_config(config_path=config_path)
 
     @mcp.tool
-    def retrieve_ops_code_evidence(
-        topic: Annotated[
-            str,
-            Field(description="Topic to retrieve grouped ops documentation and code evidence for"),
-        ],
-        config_path: Annotated[str | None, Field(description="Path to project.yaml")] = None,
-        limit: Annotated[int | None, Field(description="Maximum results per section")] = None,
-    ) -> dict[str, Any]:
-        """Retrieve grouped ops and code evidence for a task/topic."""
-        return retrieve_ops_code_evidence_from_config(
-            topic=topic, config_path=config_path, limit=limit
-        )
-
-    @mcp.tool
     def generate_session_brief(
         task: Annotated[
             str, Field(description="Task or topic to compile a deterministic evidence packet for")
+        ],
+        view: Annotated[
+            Literal["doctrine", "doctrine_and_discussion"],
+            Field(description="Required epistemic view for the underlying project-state packet"),
         ],
         config_path: Annotated[str | None, Field(description="Path to project.yaml")] = None,
         since: Annotated[
@@ -246,7 +246,7 @@ def create_mcp() -> FastMCP:
     ) -> dict[str, Any]:
         """Compile a deterministic evidence packet for assistant session context."""
         return generate_session_brief_from_config(
-            task=task, config_path=config_path, since=since, limit=limit
+            task=task, view=view, config_path=config_path, since=since, limit=limit
         )
 
     @mcp.tool
@@ -480,21 +480,27 @@ def search_decisions_command(
     )
 
 
-@app.command("get-current-doctrine")
-def get_current_doctrine_command(
-    topic: str = typer.Argument(..., help="Topic to retrieve current doctrine for."),
+@app.command("get-project-state")
+def get_project_state_command(
+    topic: str = typer.Argument(..., help="Topic to retrieve authority-aware project state for."),
+    view: Literal["doctrine", "doctrine_and_discussion"] = typer.Option(
+        ..., "--view", help="Required epistemic view."
+    ),
     config: Path | None = typer.Option(None, "--config", help="Project Knowledge config path."),
     limit: int | None = typer.Option(None, help="Maximum results per section."),
     include_superseded: bool = typer.Option(
-        False, help="Include superseded/rejected results with visible authority labels."
+        False, help="Add superseded/rejected material in a separate section."
     ),
 ) -> None:
-    """Return canonical/current doctrine and accepted decisions for a topic."""
-    filters: dict[str, Any] = {"include_superseded": include_superseded}
+    """Return project state with explicit authority and retrieval boundaries."""
     typer.echo(
         json.dumps(
-            get_current_doctrine_from_config(
-                topic=topic, config_path=config, filters=filters, limit=limit
+            get_project_state_from_config(
+                topic=topic,
+                view=view,
+                config_path=config,
+                include_superseded=include_superseded,
+                limit=limit,
             ),
             sort_keys=True,
         )
@@ -567,24 +573,12 @@ def get_code_provider_status_command(
     typer.echo(json.dumps(get_code_provider_status_from_config(config_path=config), sort_keys=True))
 
 
-@app.command("retrieve-ops-code-evidence")
-def retrieve_ops_code_evidence_command(
-    topic: str = typer.Argument(..., help="Topic to retrieve ops and code evidence for."),
-    config: Path | None = typer.Option(None, "--config", help="Project Knowledge config path."),
-    limit: int | None = typer.Option(None, help="Maximum results per section."),
-) -> None:
-    """Retrieve grouped ops and code evidence for a task/topic."""
-    typer.echo(
-        json.dumps(
-            retrieve_ops_code_evidence_from_config(topic=topic, config_path=config, limit=limit),
-            sort_keys=True,
-        )
-    )
-
-
 @app.command("generate-session-brief")
 def generate_session_brief_command(
     task: str = typer.Argument(..., help="Task to compile deterministic session context for."),
+    view: Literal["doctrine", "doctrine_and_discussion"] = typer.Option(
+        ..., "--view", help="Required epistemic view."
+    ),
     config: Path | None = typer.Option(None, "--config", help="Project Knowledge config path."),
     since: str | None = typer.Option(
         None, "--since", help="Optional user-provided recency marker."
@@ -595,7 +589,7 @@ def generate_session_brief_command(
     typer.echo(
         json.dumps(
             generate_session_brief_from_config(
-                task=task, config_path=config, since=since, limit=limit
+                task=task, view=view, config_path=config, since=since, limit=limit
             ),
             sort_keys=True,
         )

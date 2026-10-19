@@ -17,12 +17,11 @@ EXPECTED_TOOL_NAMES = {
     "index_project",
     "search_ops",
     "search_decisions",
-    "get_current_doctrine",
+    "get_project_state",
     "search_open_questions",
     "search_code",
     "get_code_context",
     "get_code_provider_status",
-    "retrieve_ops_code_evidence",
     "generate_session_brief",
     "add_project_note",
     "create_draft_artifact",
@@ -270,6 +269,24 @@ def test_mcp_tool_registry_matches_phase7_surface():
         "llm_required": False,
         "default_network_exposure": "loopback_or_stdio_only",
     }
+
+
+def test_mcp_project_state_requires_explicit_view():
+    import asyncio
+
+    metadata = asyncio.run(tool_metadata("get_project_state"))
+    schema = metadata.get("inputSchema") or metadata.get("input_schema")
+    assert schema is not None
+    assert "view" in schema["required"]
+    assert schema["properties"]["view"]["enum"] == [
+        "doctrine",
+        "doctrine_and_discussion",
+    ]
+
+    brief_metadata = asyncio.run(tool_metadata("generate_session_brief"))
+    brief_schema = brief_metadata.get("inputSchema") or brief_metadata.get("input_schema")
+    assert brief_schema is not None
+    assert "view" in brief_schema["required"]
 
 
 def test_mcp_propose_authority_change_metadata_matches_change_schema():
@@ -628,11 +645,18 @@ def test_mcp_phase4_search_tools_return_typed_results(tmp_path: Path):
 
     doctrine = asyncio.run(
         call_tool(
-            "get_current_doctrine", {"config_path": str(config_path), "topic": "context retrieval"}
+            "get_project_state",
+            {
+                "config_path": str(config_path),
+                "topic": "context retrieval",
+                "view": "doctrine",
+            },
         )
     )
-    assert doctrine["doctrine"][0]["path"] == "docs/doctrine/context.md"
-    assert doctrine["decisions"][0]["path"] == "docs/decisions/accepted/0001-context.md"
+    assert doctrine["sections"]["doctrine"]["results"][0]["path"] == ("docs/doctrine/context.md")
+    assert doctrine["sections"]["accepted_decisions"]["results"][0]["path"] == (
+        "docs/decisions/accepted/0001-context.md"
+    )
 
     questions = asyncio.run(
         call_tool(
@@ -753,13 +777,27 @@ def test_mcp_code_context_tools_return_text_fallback_results(tmp_path: Path):
 
     evidence = asyncio.run(
         call_tool(
-            "retrieve_ops_code_evidence",
-            {"config_path": str(config_path), "topic": "compile_context evidence", "limit": 3},
+            "get_project_state",
+            {
+                "config_path": str(config_path),
+                "topic": "compile_context evidence",
+                "view": "doctrine_and_discussion",
+                "limit": 3,
+            },
         )
     )
-    assert evidence["tool"] == "retrieve_ops_code_evidence"
-    assert sorted(evidence["sections"]) == ["code", "decisions", "doctrine", "open_questions"]
-    assert evidence["sections"]["code"][0]["path"] == "src/example.py"
+    assert evidence["tool"] == "get_project_state"
+    assert sorted(evidence["sections"]) == [
+        "accepted_decisions",
+        "discussions_and_captures",
+        "doctrine",
+        "implementation_evidence",
+        "open_questions",
+        "proposals_and_drafts",
+    ]
+    assert evidence["sections"]["implementation_evidence"]["results"][0]["path"] == (
+        "src/example.py"
+    )
 
     brief = asyncio.run(
         call_tool(
@@ -767,6 +805,7 @@ def test_mcp_code_context_tools_return_text_fallback_results(tmp_path: Path):
             {
                 "config_path": str(config_path),
                 "task": "Implement compile_context evidence",
+                "view": "doctrine_and_discussion",
                 "since": "2026-06-01",
                 "limit": 3,
             },
@@ -774,8 +813,8 @@ def test_mcp_code_context_tools_return_text_fallback_results(tmp_path: Path):
     )
     assert brief["tool"] == "generate_session_brief"
     assert brief["since"] == "2026-06-01"
-    assert brief["sections"]["code"][0]["path"] == "src/example.py"
-    assert "## Session Brief" in brief["markdown"]
+    assert brief["sections"]["implementation_evidence"]["results"][0]["path"] == ("src/example.py")
+    assert "## Session brief" in brief["markdown"]
 
     widened = asyncio.run(
         call_tool(

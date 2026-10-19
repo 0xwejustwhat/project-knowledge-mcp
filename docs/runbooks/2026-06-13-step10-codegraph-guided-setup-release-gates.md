@@ -171,8 +171,8 @@ Step 10A is complete only when all of the following are true:
 
 ### Task 10A.5: Integrate with evidence packets
 
-- Ensure `retrieve_ops_code_evidence` and `generate_session_brief` use graph-backed code evidence when available.
-- Preserve explicit gaps when code evidence is missing.
+- Ensure `get_project_state` and `generate_session_brief` use graph-backed code evidence when available.
+- Preserve explicit partial/unavailable retrieval state when code evidence is missing.
 
 ### Task 10A.6: Verify Docker path
 

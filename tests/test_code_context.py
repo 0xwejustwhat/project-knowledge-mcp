@@ -11,7 +11,7 @@ from project_knowledge_mcp.services import (
     get_code_context_from_config,
     get_code_provider_status_from_config,
     index_project_from_config,
-    retrieve_ops_code_evidence_from_config,
+    get_project_state_from_config,
     search_code_from_config,
 )
 
@@ -703,15 +703,17 @@ def test_evidence_packet_includes_graph_backed_code_results(tmp_path: Path):
     indexed = index_project_from_config(config_path=config_path)
     assert indexed["status"] == "ok"
 
-    packet = retrieve_ops_code_evidence_from_config(
-        topic="HTTPS Caddy bridge", config_path=config_path, limit=10
+    packet = get_project_state_from_config(
+        topic="HTTPS Caddy bridge", view="doctrine", config_path=config_path, limit=10
     )
 
-    assert packet["tool"] == "retrieve_ops_code_evidence"
-    assert packet["sections"]["code"]
-    providers = {result["provider"] for result in packet["sections"]["code"]}
+    assert packet["tool"] == "get_project_state"
+    code_results = packet["sections"]["implementation_evidence"]["results"]
+    assert code_results
+    providers = {result["provider"] for result in code_results}
     assert {"codegraph", "fts5", "ops"}.issubset(providers)
-    assert packet["gaps"] == []
+    assert packet["sections"]["implementation_evidence"]["retrieval_state"] == "partial"
+    assert packet["sections"]["implementation_evidence"]["freshness_state"] == "stale"
     assert "provider: `fts5`" in packet["markdown"]
     assert "provider: `ops`" in packet["markdown"]
 
