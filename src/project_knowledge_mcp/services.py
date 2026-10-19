@@ -2665,9 +2665,7 @@ def _render_project_state_markdown(packet: dict[str, Any]) -> str:
             lines, packet["sections"]["discussions_and_captures"], level=2
         )
     if "superseded_and_rejected" in packet["sections"]:
-        _append_project_state_section(
-            lines, packet["sections"]["superseded_and_rejected"], level=2
-        )
+        _append_project_state_section(lines, packet["sections"]["superseded_and_rejected"], level=2)
 
     lines.extend(["## Retrieval limitations and omissions", ""])
     if packet["known_omissions"]:
@@ -2680,9 +2678,7 @@ def _render_project_state_markdown(packet: dict[str, Any]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _append_project_state_section(
-    lines: list[str], section: dict[str, Any], *, level: int
-) -> None:
+def _append_project_state_section(lines: list[str], section: dict[str, Any], *, level: int) -> None:
     heading = section["label"]
     if section["authority_class"] in {"non_authoritative", "superseded"}:
         heading += " — not authoritative"

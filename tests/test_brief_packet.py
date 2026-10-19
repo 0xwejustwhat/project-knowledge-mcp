@@ -328,12 +328,8 @@ def test_generate_session_brief_includes_staleness_warnings_and_markdown(tmp_pat
     assert brief["repositories"][0]["repo_id"] == "ops"
     assert brief["repositories"][0]["reindex_needed"] is True
     assert any("reindex" in warning.lower() for warning in brief["warnings"])
-    assert brief["sections"]["doctrine"]["results"][0]["path"] == (
-        "docs/doctrine/context.md"
-    )
-    assert brief["sections"]["implementation_evidence"]["results"][0]["path"] == (
-        "src/example.py"
-    )
+    assert brief["sections"]["doctrine"]["results"][0]["path"] == ("docs/doctrine/context.md")
+    assert brief["sections"]["implementation_evidence"]["results"][0]["path"] == ("src/example.py")
     recent = brief["sections"]["recent_changes"]["results"]
     assert recent
     assert {change["repo_id"] for change in recent} >= {"ops", "app"}

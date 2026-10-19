@@ -438,9 +438,7 @@ def test_phase4_service_tools_scope_and_rank_typed_results(tmp_path: Path):
         topic="context retrieval", view="doctrine", config_path=config_path
     )
     assert doctrine["topic"] == "context retrieval"
-    assert doctrine["sections"]["doctrine"]["results"][0]["path"] == (
-        "docs/doctrine/context.md"
-    )
+    assert doctrine["sections"]["doctrine"]["results"][0]["path"] == ("docs/doctrine/context.md")
     assert doctrine["sections"]["doctrine"]["results"][0]["authority"] == "canonical"
     assert doctrine["sections"]["accepted_decisions"]["results"][0]["path"] == (
         "docs/decisions/accepted/0001-context.md"
@@ -514,7 +512,9 @@ def test_phase4_service_tools_scope_and_rank_typed_results(tmp_path: Path):
     assert invalid_decision_status["error"]["code"] == "QUERY_INVALID"
 
     invalid_doctrine_status = get_project_state_from_config(
-        topic="context", view="invalid", config_path=config_path  # type: ignore[arg-type]
+        topic="context",
+        view="invalid",
+        config_path=config_path,  # type: ignore[arg-type]
     )
     assert invalid_doctrine_status["sections"] == {}
     assert invalid_doctrine_status["error"]["code"] == "QUERY_INVALID"

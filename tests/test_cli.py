@@ -596,9 +596,7 @@ Context retrieval unresolved question.
     )
     assert doctrine_result.exit_code == 0, doctrine_result.output
     doctrine = json.loads(doctrine_result.output)
-    assert doctrine["sections"]["doctrine"]["results"][0]["path"] == (
-        "docs/doctrine/context.md"
-    )
+    assert doctrine["sections"]["doctrine"]["results"][0]["path"] == ("docs/doctrine/context.md")
     assert doctrine["sections"]["accepted_decisions"]["results"][0]["path"] == (
         "docs/decisions/accepted/0001-context.md"
     )
@@ -759,9 +757,7 @@ class ExampleService:
     brief = json.loads(brief_result.output)
     assert brief["tool"] == "generate_session_brief"
     assert brief["since"] == "2026-06-01"
-    assert brief["sections"]["implementation_evidence"]["results"][0]["path"] == (
-        "src/example.py"
-    )
+    assert brief["sections"]["implementation_evidence"]["results"][0]["path"] == ("src/example.py")
     assert "## Session brief" in brief["markdown"]
 
 

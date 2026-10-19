@@ -653,9 +653,7 @@ def test_mcp_phase4_search_tools_return_typed_results(tmp_path: Path):
             },
         )
     )
-    assert doctrine["sections"]["doctrine"]["results"][0]["path"] == (
-        "docs/doctrine/context.md"
-    )
+    assert doctrine["sections"]["doctrine"]["results"][0]["path"] == ("docs/doctrine/context.md")
     assert doctrine["sections"]["accepted_decisions"]["results"][0]["path"] == (
         "docs/decisions/accepted/0001-context.md"
     )
@@ -815,9 +813,7 @@ def test_mcp_code_context_tools_return_text_fallback_results(tmp_path: Path):
     )
     assert brief["tool"] == "generate_session_brief"
     assert brief["since"] == "2026-06-01"
-    assert brief["sections"]["implementation_evidence"]["results"][0]["path"] == (
-        "src/example.py"
-    )
+    assert brief["sections"]["implementation_evidence"]["results"][0]["path"] == ("src/example.py")
     assert "## Session brief" in brief["markdown"]
 
     widened = asyncio.run(

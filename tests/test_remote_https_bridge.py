@@ -82,7 +82,11 @@ async def list_remote_tools_with_token(port: int, token: str) -> tuple[set[str],
         registered = await client.list_tools()
         tools = {tool.name for tool in registered}
         project_state = next(tool for tool in registered if tool.name == "get_project_state")
-        metadata = project_state.model_dump() if hasattr(project_state, "model_dump") else dict(project_state)
+        metadata = (
+            project_state.model_dump()
+            if hasattr(project_state, "model_dump")
+            else dict(project_state)
+        )
         health = json.loads(result_text(await client.call_tool("health")))
         return tools, metadata, health
 

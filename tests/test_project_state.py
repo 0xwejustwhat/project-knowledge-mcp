@@ -198,8 +198,7 @@ def test_doctrine_view_excludes_informal_sections(tmp_path: Path) -> None:
     assert packet["sections"]["discussions_and_captures"]["retrieval_state"] == "not_run"
     assert packet["sections"]["implementation_evidence"]["results"]
     assert all(
-        item["authority"] == "canonical"
-        for item in packet["sections"]["doctrine"]["results"]
+        item["authority"] == "canonical" for item in packet["sections"]["doctrine"]["results"]
     )
     assert "## Open questions" not in packet["markdown"]
 
@@ -212,14 +211,15 @@ def test_doctrine_and_discussion_keeps_authority_classes_separate(tmp_path: Path
     )
 
     assert packet["sections"]["open_questions"]["results"][0]["doc_type"] == "open_question"
-    assert packet["sections"]["proposals_and_drafts"]["results"][0]["authority"] == (
-        "proposal"
-    )
-    assert {
-        item["doc_type"] for item in packet["sections"]["proposals_and_drafts"]["results"]
-    } >= {"proposal", "decision_proposal"}
+    assert packet["sections"]["proposals_and_drafts"]["results"][0]["authority"] == ("proposal")
+    assert {item["doc_type"] for item in packet["sections"]["proposals_and_drafts"]["results"]} >= {
+        "proposal",
+        "decision_proposal",
+    }
     captures = packet["sections"]["discussions_and_captures"]["results"]
-    assert captures and all(item["authority"] not in {"canonical", "accepted_decision"} for item in captures)
+    assert captures and all(
+        item["authority"] not in {"canonical", "accepted_decision"} for item in captures
+    )
     assert "## Proposals and drafts — not authoritative" in packet["markdown"]
 
 
@@ -253,7 +253,9 @@ def test_invalid_view_is_rejected(tmp_path: Path) -> None:
     config = project_fixture(tmp_path)
 
     packet = get_project_state_from_config(
-        topic="project state retrieval", view="everything", config_path=config  # type: ignore[arg-type]
+        topic="project state retrieval",
+        view="everything",
+        config_path=config,  # type: ignore[arg-type]
     )
 
     assert packet["error"]["code"] == "QUERY_INVALID"
