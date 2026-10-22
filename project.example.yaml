@@ -70,3 +70,12 @@ write_policy:
     doctrine_delta: docs/proposals/doctrine-deltas
     decision: docs/proposals/decisions
     spec_change: docs/proposals/specs
+
+# Canonical services can replace a repo's path/source fields with:
+#   source_mode: remote
+#   remote_url: git@github.com:owner/repository.git
+#   canonical_branch: main
+# The service derives <state_dir>/repositories/<repo-id>; do not supply a path.
+# Remote clones synchronize before readiness and periodically, excluding local changes.
+# synchronization:
+#   interval_seconds: 60

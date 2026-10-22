@@ -256,3 +256,36 @@ def test_validate_project_config_rejects_snapshot_without_provenance(tmp_path: P
 
     assert result["valid"] is False
     assert any("snapshot" in error["message"] for error in result["errors"])
+
+
+def test_remote_config_derives_managed_path_before_clone(tmp_path: Path):
+    config_path = write_project_config(
+        tmp_path,
+        project_root=tmp_path,
+        ops_repo=tmp_path / "ignored",
+        repo_extra="    source_mode: remote\n    remote_url: /tmp/canonical.git\n    canonical_branch: main",
+    )
+    config = load_project_config(config_path)
+    assert config.ops_repo.path == tmp_path / ".project-knowledge/repositories/ops"
+    assert config.ops_repo.includes_uncommitted_changes is False
+    assert config.synchronization.interval_seconds == 60
+    assert validate_project_config(config_path)["valid"] is True
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        'remote_url: ""\n    canonical_branch: main',
+        "remote_url: /tmp/remote\n    canonical_branch: ../main",
+        "remote_url: /tmp/remote\n    canonical_branch: refs//bad",
+        "remote_url: /tmp/remote\n    canonical_branch: main\n    id: ../escape",
+    ],
+)
+def test_invalid_remote_source_is_rejected(tmp_path, extra):
+    path = write_project_config(
+        tmp_path,
+        project_root=tmp_path,
+        ops_repo=tmp_path / "unused",
+        repo_extra="    source_mode: remote\n    " + extra,
+    )
+    assert not validate_project_config(path)["valid"]

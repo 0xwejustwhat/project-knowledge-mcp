@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 CONFIG_ENV_VAR = "PROJECT_KNOWLEDGE_CONFIG"
 DEFAULT_CONTAINER_CONFIG = Path("/workspace/project.yaml")
@@ -33,9 +33,11 @@ class StorageConfig(BaseModel):
 class RepoConfig(BaseModel):
     id: str
     role: Literal["ops", "work", "artifact"]
-    path: Path
+    path: Path = Path(".")
     name: str | None = None
-    source_mode: Literal["workspace", "snapshot"] = "workspace"
+    source_mode: Literal["workspace", "snapshot", "remote"] = "workspace"
+    remote_url: str | None = None
+    canonical_branch: str | None = None
     source_mode_defaulted: bool = False
     host_path: Path | None = None
     includes_uncommitted_changes: bool | None = None
@@ -45,6 +47,35 @@ class RepoConfig(BaseModel):
     canonical_priority: str | None = None
     include_globs: list[str] = Field(default_factory=list)
     exclude_globs: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_source(cls, data):
+        if isinstance(data, dict):
+            if data.get("source_mode") == "remote":
+                if not _PROJECT_ID_RE.fullmatch(str(data.get("id", ""))):
+                    raise ValueError("remote repo id must be path safe")
+                url = data.get("remote_url")
+                branch = data.get("canonical_branch")
+                if not isinstance(url, str) or not url.strip() or url.startswith("-"):
+                    raise ValueError("remote_url must be non-empty")
+                if not isinstance(branch, str) or not _is_safe_git_ref_name(branch):
+                    raise ValueError("canonical_branch must be a safe Git branch")
+                result = subprocess.run(
+                    ["git", "check-ref-format", "refs/heads/" + branch],
+                    capture_output=True,
+                    timeout=5,
+                )
+                if result.returncode:
+                    raise ValueError("canonical_branch must be a valid Git branch")
+                data = {**data, "includes_uncommitted_changes": False}
+            elif "path" not in data:
+                raise ValueError("workspace and snapshot require path")
+        return data
+
+
+class SynchronizationConfig(BaseModel):
+    interval_seconds: float = Field(default=60, gt=0)
 
 
 class RetrievalConfig(BaseModel):
@@ -107,6 +138,7 @@ class ProjectKnowledgeConfig(BaseModel):
     retrieval: RetrievalConfig = Field(default_factory=RetrievalConfig)
     code_context: CodeContextConfig = Field(default_factory=CodeContextConfig)
     write_policy: WritePolicyConfig = Field(default_factory=WritePolicyConfig)
+    synchronization: SynchronizationConfig = Field(default_factory=SynchronizationConfig)
     config_path: Path | None = None
 
     @property
@@ -188,7 +220,7 @@ def validate_project_config(config_path: Path | str | None = None) -> dict[str, 
         errors.append(_error("CONFIG_INVALID", "Exactly one repo must have role: ops"))
 
     for repo, report in zip(config.repos, repo_reports, strict=True):
-        if not report["exists"]:
+        if not report["exists"] and repo.source_mode != "remote":
             errors.append(
                 _error(
                     "CONFIG_INVALID",
@@ -196,7 +228,7 @@ def validate_project_config(config_path: Path | str | None = None) -> dict[str, 
                     details={"repo_id": repo.id, "path": str(repo.path)},
                 )
             )
-        elif not report["is_git_repo"]:
+        elif report["exists"] and not report["is_git_repo"]:
             errors.append(
                 _error(
                     "REPO_NOT_GIT",
@@ -438,9 +470,19 @@ def _resolve_paths(config: ProjectKnowledgeConfig, *, base_dir: Path) -> None:
             config.code_context.codegraph.index_dir, base_dir=project_root
         )
     for repo in config.repos:
-        repo.path = _resolve_path(repo.path, base_dir=project_root)
+        if repo.source_mode == "remote":
+            repo.path = config.storage.state_dir / "repositories" / repo.id
+        else:
+            repo.path = _resolve_path(repo.path, base_dir=project_root)
         if repo.host_path is not None:
             repo.host_path = _resolve_path(repo.host_path, base_dir=project_root)
+
+    if len({repo.id for repo in config.repos}) != len(config.repos):
+        raise ValueError("repository ids must be unique")
+    for remote in (repo for repo in config.repos if repo.source_mode == "remote"):
+        for local in (repo for repo in config.repos if repo.source_mode != "remote"):
+            if remote.path.is_relative_to(local.path) or local.path.is_relative_to(remote.path):
+                raise ValueError("managed repository path overlaps configured local root")
 
 
 def _resolve_path(path: Path, *, base_dir: Path) -> Path:

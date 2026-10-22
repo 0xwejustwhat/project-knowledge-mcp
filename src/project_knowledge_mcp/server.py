@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -8,7 +10,7 @@ import typer
 from fastmcp import FastMCP
 from pydantic import Field
 
-from project_knowledge_mcp.config import load_project_config
+from project_knowledge_mcp.config import load_project_config, resolve_config_path
 from project_knowledge_mcp.index import ProjectIndex, index_repo
 from project_knowledge_mcp.setup import (
     build_client_config,
@@ -31,15 +33,49 @@ from project_knowledge_mcp.services import (
     search_open_questions_from_config,
     search_ops_from_config,
     validate_config_service,
+    sync_project,
 )
 
 app = typer.Typer(add_completion=False, help="Project Knowledge MCP local tooling.")
+
+
+@asynccontextmanager
+async def _synchronization_lifespan(server):
+    # Registry/health smoke clients may intentionally start without a project.
+    if not resolve_config_path().exists():
+        yield
+        return
+    config = load_project_config()
+    if not any(repo.source_mode == "remote" for repo in config.repos):
+        yield
+        return
+    await asyncio.to_thread(sync_project, config)
+
+    async def periodic():
+        while True:
+            await asyncio.sleep(config.synchronization.interval_seconds)
+            # Shield the worker so shutdown waits for restoration before exiting.
+            worker = asyncio.create_task(asyncio.to_thread(sync_project, config, skip_if_busy=True))
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                await worker
+                raise
+
+    task = asyncio.create_task(periodic())
+    try:
+        yield
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
 
 
 def create_mcp() -> FastMCP:
     """Create the minimal Project Knowledge MCP server."""
     mcp = FastMCP(
         "Project Knowledge MCP",
+        lifespan=_synchronization_lifespan,
         instructions=(
             "Deterministic project-context access layer. Returns evidence and health metadata; "
             "the client assistant performs synthesis."
@@ -48,9 +84,16 @@ def create_mcp() -> FastMCP:
 
     @mcp.tool
     def health() -> dict[str, Any]:
-        """Return server health."""
+        """Return service readiness separately from canonical freshness."""
+        ready = True
+        if resolve_config_path().exists():
+            state = check_project_staleness_from_config()
+            ready = not state.get("error") and all(
+                repo.get("retrieval_available", True) for repo in state.get("repos", [])
+            )
         return {
-            "status": "ok",
+            "status": "ok" if ready else "error",
+            "ready": ready,
             "phase": "step2_config_backed_mcp_tools",
             "llm_required": False,
             "default_network_exposure": "loopback_or_stdio_only",

@@ -150,7 +150,10 @@ class CodeGraphProvider:
                         "pending_changes": _safe_pending_changes(status.get("pendingChanges")),
                     }
                 )
-                if initialized and index_present and status_matches_repo:
+                canonical_ready = repo.source_mode != "remote" or self.canonical_status_ready(
+                    status, repo
+                )
+                if initialized and index_present and status_matches_repo and canonical_ready:
                     indexed_repos.append(repo)
                 else:
                     warnings.append(
@@ -320,7 +323,19 @@ class CodeGraphProvider:
         except ValueError:
             pass
         else:
-            return False
+            if resolved_root.parent != self.config.storage.state_dir.resolve() / "repositories":
+                return False
+        if repo.source_mode == "remote":
+            try:
+                tracked = subprocess.run(
+                    ["git", "-C", str(repo.path), "ls-files", "--error-unmatch", "--", relative],
+                    capture_output=True,
+                    timeout=60,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                return False
+            if tracked.returncode:
+                return False
         if self.config.indexing.max_file_bytes is not None:
             try:
                 if resolved_path.stat().st_size > self.config.indexing.max_file_bytes:
@@ -359,6 +374,17 @@ class CodeGraphProvider:
         if repo.exclude_globs and _provider_matches_any(relative, repo.exclude_globs):
             return False
         return True
+
+    def canonical_status_ready(self, status: dict[str, Any], repo: RepoConfig) -> bool:
+        pending = status.get("pendingChanges")
+        return (
+            status.get("initialized") is True
+            and _status_index_present(status)
+            and self._status_matches_repo(status, repo)
+            and status.get("worktreeMismatch") in (None, False)
+            and isinstance(pending, dict)
+            and all(pending.get(key) == 0 for key in ("added", "modified", "removed"))
+        )
 
     def _status_matches_repo(self, status: dict[str, Any], repo: RepoConfig) -> bool:
         project_path = status.get("projectPath")
