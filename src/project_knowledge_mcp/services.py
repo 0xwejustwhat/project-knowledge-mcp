@@ -17,6 +17,7 @@ from functools import wraps
 from inspect import signature
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit, urlunsplit
 
 import yaml
 
@@ -449,7 +450,9 @@ def add_project_note_from_config(
     if blocked is not None:
         return blocked
     normalized, error = _safe_repo_write_path(
-        repo.path, relative_target, state_dir=config.storage.state_dir
+        repo.path,
+        relative_target,
+        state_dir=None if repo.source_mode == "remote" else config.storage.state_dir,
     )
     if error is not None:
         return error
@@ -519,7 +522,9 @@ def create_draft_artifact_from_config(
     if blocked is not None:
         return blocked
     normalized, error = _safe_repo_write_path(
-        repo.path, relative_target, state_dir=config.storage.state_dir
+        repo.path,
+        relative_target,
+        state_dir=None if repo.source_mode == "remote" else config.storage.state_dir,
     )
     if error is not None:
         return error
@@ -535,6 +540,20 @@ def create_draft_artifact_from_config(
         "created_at": now,
         "updated_at": now,
     }
+    if repo.source_mode == "remote":
+        result = _write_and_push_capture(
+            config,
+            repo,
+            normalized,
+            _render_markdown(frontmatter=frontmatter, body=body),
+            title=title,
+            authority="proposal",
+        )
+        result.update(
+            suggested_actions=["propose_authority_change"],
+            authority_boundary="review_required_before_promotion",
+        )
+        return result
     write_error = _write_markdown_file(repo.path / normalized, frontmatter=frontmatter, body=body)
     if write_error is not None:
         return write_error
@@ -572,6 +591,73 @@ def propose_authority_change_from_config(
     if not isinstance(changes, list) or not changes:
         return _write_error("INVALID_CHANGES", "changes must be a non-empty array")
 
+    prepare = (
+        _prepare_remote_authority_change
+        if repo.source_mode == "remote"
+        else _prepare_authority_change
+    )
+    return prepare(config, repo, title, rationale, changes, source, tags, branch_name)
+
+
+def _prepare_remote_authority_change(
+    config, repo, title, rationale, changes, source, tags, branch_name
+):
+    branch = _authority_branch_name(title, branch_name)
+    if branch is None:
+        return _write_error("INVALID_BRANCH", "branch_name contains unsafe characters")
+    lock = _CaptureLock(_capture_lock_path(config, repo.id, "origin", repo.canonical_branch))
+    error = lock.acquire()
+    if error:
+        return _write_error("GIT_LOCK_FAILED", error)
+    parent = None
+    worktree = None
+    try:
+        if _git_run(repo.path, "rev-parse", "--verify", branch).returncode == 0:
+            return _write_error("BRANCH_EXISTS", "Authority proposal branch already exists")
+        fetched = _git_run(repo.path, "fetch", "--no-tags", "origin", repo.canonical_branch)
+        if fetched.returncode != 0:
+            return _write_error("GIT_FETCH_FAILED", "Could not fetch canonical branch")
+        parent = Path(
+            tempfile.mkdtemp(
+                prefix=f"pkmcp-authority-{_slugify(repo.id)}-",
+                dir=str(_capture_temp_parent(config)),
+            )
+        )
+        worktree = parent / "worktree"
+        added = _git_run(
+            repo.path,
+            "worktree",
+            "add",
+            "--detach",
+            str(worktree),
+            f"refs/remotes/origin/{repo.canonical_branch}",
+        )
+        if added.returncode != 0:
+            return _write_error("GIT_WORKTREE_FAILED", "Could not create authority worktree")
+        return _prepare_authority_change(
+            config,
+            repo.model_copy(update={"path": worktree}),
+            title,
+            rationale,
+            changes,
+            source,
+            tags,
+            branch,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return _write_error("GIT_PROPOSAL_FAILED", "Isolated authority proposal failed")
+    finally:
+        try:
+            if worktree is not None:
+                _git_run(repo.path, "worktree", "remove", "--force", str(worktree))
+                _git_run(repo.path, "branch", "-D", branch)
+            if parent is not None:
+                shutil.rmtree(parent, ignore_errors=True)
+        finally:
+            lock.release()
+
+
+def _prepare_authority_change(config, repo, title, rationale, changes, source, tags, branch_name):
     porcelain = _git_status_porcelain(repo.path, state_dir=config.storage.state_dir)
     if porcelain is None:
         return _write_error("GIT_STATUS_FAILED", "Could not determine Git workspace status.")
@@ -609,7 +695,7 @@ def propose_authority_change_from_config(
         normalized, error = _safe_repo_write_path(
             repo.path,
             str(change.get("path") or ""),
-            state_dir=config.storage.state_dir,
+            state_dir=None if repo.source_mode == "remote" else config.storage.state_dir,
             allow_existing=True,
         )
         if error is not None:
@@ -648,7 +734,9 @@ def propose_authority_change_from_config(
         return _write_error(
             "GIT_BRANCH_FAILED",
             "Could not create authority proposal branch",
-            details={"branch": branch, "stderr": created.stderr.strip()},
+            details={"branch": branch}
+            if repo.source_mode == "remote"
+            else {"branch": branch, "stderr": created.stderr.strip()},
         )
 
     changed_paths = [change["path"] for change in normalized_changes]
@@ -681,7 +769,9 @@ def propose_authority_change_from_config(
             return _write_error(
                 "GIT_COMMIT_FAILED",
                 "Could not commit authority proposal changes",
-                details={"stderr": commit_result.stderr.strip()},
+                details=None
+                if repo.source_mode == "remote"
+                else {"stderr": commit_result.stderr.strip()},
             )
     except OSError as exc:
         _cleanup_failed_authority_branch(
@@ -704,11 +794,14 @@ def propose_authority_change_from_config(
         if _command_exists("gh")
         else None
     )
-    if gh_auth is not None and gh_auth.returncode == 0:
+    authenticated = gh_auth is not None and gh_auth.returncode == 0
+    if authenticated or repo.source_mode == "remote":
         pushed = _git_run(
             repo.path, "push", "--no-verify", "--set-upstream", "origin", branch, check=False
         )
-        if pushed.returncode == 0:
+        if pushed.returncode != 0 and repo.source_mode == "remote":
+            return _write_error("GIT_PUSH_FAILED", "Could not push authority proposal branch")
+        if pushed.returncode == 0 and authenticated:
             pr_body = _authority_pr_body(rationale, source, tags, changed_paths)
             pr = subprocess.run(
                 ["gh", "pr", "create", "--title", title, "--body", pr_body, "--head", branch],
@@ -723,8 +816,10 @@ def propose_authority_change_from_config(
                 pr_url = pr.stdout.strip().splitlines()[-1] if pr.stdout.strip() else None
             else:
                 warnings.append("GitHub PR creation failed; branch and commit were prepared.")
-        else:
+        elif pushed.returncode != 0:
             warnings.append("Git push failed; branch and commit were prepared locally.")
+        else:
+            warnings.append("GitHub authentication unavailable; no PR was opened.")
     else:
         warnings.append("GitHub authentication unavailable; no PR was opened.")
 
@@ -741,7 +836,11 @@ def propose_authority_change_from_config(
     if pr_url:
         result["pr_url"] = pr_url
     else:
-        result["next_action"] = "push branch and open PR manually"
+        result["next_action"] = (
+            "open PR manually"
+            if repo.source_mode == "remote"
+            else "push branch and open PR manually"
+        )
     return result
 
 
@@ -2104,6 +2203,15 @@ def _load_validated_config_for_write(
         )
     config = load_project_config(config_path)
     assert config.storage.state_dir is not None
+    repo = _writable_capture_repo(config)
+    if (
+        repo is not None
+        and repo.source_mode == "remote"
+        and config.write_policy.capture_git_mode == "local_only"
+    ):
+        return _write_error(
+            "WRITE_POLICY_DENIED", "capture_git_mode: local_only is unavailable for remote repos."
+        ), None
     return validation, config
 
 
@@ -2279,7 +2387,7 @@ def _write_and_push_capture(
     title: str,
     authority: str,
 ) -> dict[str, Any]:
-    if repo.source_mode != "workspace":
+    if repo.source_mode not in {"workspace", "remote"}:
         return _capture_persistence_failure(
             "local_only",
             repo_id=repo.id,
@@ -2294,8 +2402,12 @@ def _write_and_push_capture(
             next_action="Set write_policy.capture_git_mode: local_only or configure a Git repo.",
         )
 
-    remote = config.write_policy.capture_remote
-    branch = config.write_policy.capture_branch
+    remote = "origin" if repo.source_mode == "remote" else config.write_policy.capture_remote
+    branch = (
+        repo.canonical_branch
+        if repo.source_mode == "remote"
+        else config.write_policy.capture_branch
+    )
     lock = _CaptureLock(_capture_lock_path(config, repo.id, remote, branch))
     lock_error = lock.acquire()
     if lock_error is not None:
@@ -2321,12 +2433,45 @@ def _write_and_push_capture(
                 branch=branch,
             )
             if result["status"] == "written_and_pushed":
+                # sync_project acquires this same file lock. Release it first.
+                lock.release()
+                if repo.source_mode == "remote":
+                    freshness = next(
+                        item
+                        for item in sync_project(config, repo_id=repo.id)["repos"]
+                        if item["repo_id"] == repo.id
+                    )
+                    indexed = (
+                        not freshness["reindex_needed"]
+                        and freshness["last_indexed_commit"] == result["commit"]
+                        and bool(
+                            ProjectIndex.open(config.storage.state_dir).document_chunks(
+                                repo_id=repo.id, path=result["path"]
+                            )
+                        )
+                    )
+                    warnings = list(freshness["warnings"])
+                    if not indexed:
+                        warnings.append(
+                            "Capture was pushed but is not confirmed indexed; check synchronization and index scope/size limits."
+                        )
+                    result.update(
+                        indexed=indexed,
+                        index_scope="repository" if indexed else None,
+                        full_reindex_required=not indexed,
+                        freshness=freshness,
+                        warnings=warnings,
+                    )
                 return result
+            if repo.source_mode == "remote":
+                # Remote Git diagnostics may contain authentication material.
+                result.pop("details", None)
             if result["status"] != "push_failed" or not _is_push_rejection(result):
+                result.pop("_push_result", None)
                 return result
             last_push_failure = result.pop("_push_result", None)
         details = {}
-        if last_push_failure is not None:
+        if last_push_failure is not None and repo.source_mode != "remote":
             details["stderr"] = last_push_failure.stderr.strip()
         return _capture_persistence_failure(
             "sync_conflict",
@@ -2456,16 +2601,20 @@ def _write_and_push_capture_once(
             )
             failure["_push_result"] = pushed
             return failure
-        workspace_warnings = _maybe_fast_forward_capture_workspace(
-            config, repo, remote=remote, branch=branch
-        )
-        if (repo.path / normalized).exists():
-            indexed, index_warnings = _index_written_document(config, repo, normalized)
-        else:
-            indexed = False
-            index_warnings = [
-                "committed note is not present in the active workspace; run index_project after updating the workspace."
-            ]
+        workspace_warnings = []
+        index_warnings = []
+        indexed = False
+        if repo.source_mode == "workspace":
+            workspace_warnings = _maybe_fast_forward_capture_workspace(
+                config, repo, remote=remote, branch=branch
+            )
+            if (repo.path / normalized).exists():
+                indexed, index_warnings = _index_written_document(config, repo, normalized)
+            else:
+                indexed = False
+                index_warnings = [
+                    "committed note is not present in the active workspace; run index_project after updating the workspace."
+                ]
         return {
             "status": "written_and_pushed",
             "repo_id": repo.id,
@@ -2626,6 +2775,11 @@ def _is_push_rejection(result: dict[str, Any]) -> bool:
 
 
 def _capture_durable_url(remote_url: str, branch: str, relative_path: str) -> str:
+    if "://" in remote_url:
+        parsed = urlsplit(remote_url)
+        remote_url = urlunsplit(
+            (parsed.scheme, parsed.netloc.rsplit("@", 1)[-1], parsed.path, "", "")
+        )
     path = relative_path.replace("\\", "/")
     github_match = re.match(
         r"(?:https://github\.com/|git@github\.com:)([^/]+)/([^/.]+)(?:\.git)?$", remote_url
