@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta
 from pathlib import Path
 import subprocess
 
@@ -488,10 +489,17 @@ def test_remote_index_excludes_ignored_content_even_after_native_refresh(tmp_pat
 def test_stale_brief_recent_changes_cannot_claim_current_absence(tmp_path):
     config, origin = remote_project(tmp_path)
     services.sync_project(config)
+    since = (
+        datetime.fromisoformat(git(origin, "show", "-s", "--format=%cI", "HEAD"))
+        + timedelta(days=1)
+    ).isoformat()
     origin.rename(origin.with_name("offline"))
     services.sync_project(config)
     brief = services.generate_session_brief_from_config(
-        config_path=config.config_path, task="missing", view="doctrine", since="tomorrow"
+        config_path=config.config_path,
+        task="missing",
+        view="doctrine",
+        since=since,
     )
     recent = brief["sections"]["recent_changes"]
     assert recent["freshness_state"] == "stale"
