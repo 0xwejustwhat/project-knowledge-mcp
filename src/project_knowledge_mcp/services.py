@@ -91,6 +91,15 @@ def _refresh_graph(config, repo):
         raise RuntimeError("Required CodeGraph is not aligned after refresh")
 
 
+def _exclude_managed_codegraph_metadata(repo) -> None:
+    exclude = repo.path / ".git" / "info" / "exclude"
+    marker = "/.codegraph/"
+    current = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+    if marker not in current.splitlines():
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        exclude.write_text(f"{current.rstrip()}\n{marker}\n", encoding="utf-8")
+
+
 def _serialized(function):
     parameters = signature(function)
 
@@ -230,6 +239,7 @@ def sync_project(
                     raise RuntimeError("Managed repository ownership does not match configuration")
                 if _sync_git(repo.path, "remote", "get-url", "origin") != repo.remote_url:
                     raise RuntimeError("Managed repository origin does not match configuration")
+                _exclude_managed_codegraph_metadata(repo)
                 owned = True
                 _sync_git(
                     repo.path,
@@ -252,7 +262,7 @@ def sync_project(
                 _sync_git(
                     repo.path, "branch", "--set-upstream-to", f"origin/{repo.canonical_branch}"
                 )
-                _sync_git(repo.path, "clean", "-ffdx")
+                _sync_git(repo.path, "clean", "-ffdx", "-e", "/.codegraph/")
                 indexed = _load_indexed_repo_metadata(config.storage.state_dir).get(repo.id)
                 status = _repo_staleness_status(
                     repo,
@@ -284,7 +294,7 @@ def sync_project(
                 if advanced and previous_commit and backup is not None:
                     try:
                         _sync_git(repo.path, "reset", "--hard", previous_commit)
-                        _sync_git(repo.path, "clean", "-ffdx")
+                        _sync_git(repo.path, "clean", "-ffdx", "-e", "/.codegraph/")
                         _refresh_graph(config, repo)
                         with sqlite3.connect(config.storage.state_dir / INDEX_DB_NAME) as database:
                             backup.backup(database)
