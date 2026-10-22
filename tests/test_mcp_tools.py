@@ -266,6 +266,7 @@ def test_mcp_tool_registry_matches_phase7_surface():
     assert health == {
         "status": "ok",
         "phase": "step2_config_backed_mcp_tools",
+        "ready": True,
         "llm_required": False,
         "default_network_exposure": "loopback_or_stdio_only",
     }

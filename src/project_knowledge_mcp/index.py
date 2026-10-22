@@ -6,12 +6,32 @@ import json
 import re
 import sqlite3
 import subprocess
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+# One process-local publication boundary for synchronization, reads, and writes.
+_project_locks: dict[str, Any] = {}
+
+
+def project_lock(state_dir: Path):
+    return _project_locks.setdefault(str(state_dir.resolve()), threading.RLock())
+
+
+def _serialized_index(function):
+    @wraps(function)
+    def wrapped(repo_path, *args, **kwargs):
+        state_dir = kwargs.get("state_dir") or repo_path / STATE_DIR_NAME
+        with project_lock(state_dir):
+            return function(repo_path, *args, **kwargs)
+
+    return wrapped
+
 
 STATE_DIR_NAME = ".project-knowledge"
 INDEX_DB_NAME = "index.sqlite3"
@@ -220,14 +240,15 @@ class ProjectIndex:
 
     @classmethod
     def open(cls, state_dir: Path) -> "ProjectIndex":
-        db_path = _db_path(state_dir)
-        if not db_path.exists():
-            raise FileNotFoundError(f"Project index does not exist: {db_path}")
-        conn = _connect(db_path)
-        _ensure_repo_source_columns(conn)
-        conn.commit()
-        conn.close()
-        return cls(db_path)
+        with project_lock(state_dir):
+            db_path = _db_path(state_dir)
+            if not db_path.exists():
+                raise FileNotFoundError(f"Project index does not exist: {db_path}")
+            conn = _connect(db_path)
+            _ensure_repo_source_columns(conn)
+            conn.commit()
+            conn.close()
+            return cls(db_path)
 
     def search(
         self,
@@ -466,6 +487,7 @@ class ProjectIndex:
         return [StoredIndexEvent(*row) for row in rows]
 
 
+@_serialized_index
 def index_repo(
     repo_path: Path,
     *,
@@ -491,150 +513,166 @@ def index_repo(
     state_dir.mkdir(parents=True, exist_ok=True)
 
     conn = _connect(db_path)
-    _create_schema(conn)
-    _clear_repo(conn, repo_id)
+    try:
+        _create_schema(conn)
+        _clear_repo(conn, repo_id)
 
-    now = _now()
-    head_commit = _git_output(repo_path, "rev-parse", "HEAD")
-    worktree_status = (
-        _git_status_porcelain_strict(repo_path, state_dir=state_dir)
-        if source_mode == "snapshot"
-        else _git_status_porcelain(repo_path, state_dir=state_dir)
-    )
-    indexed_worktree_fingerprint = worktree_fingerprint(repo_path, worktree_status)
-    scope_fingerprint = index_scope_fingerprint(
-        role=role,
-        include_globs=include_globs,
-        exclude_globs=exclude_globs,
-        max_file_bytes=max_file_bytes,
-    )
-    status_lines = [line for line in worktree_status.splitlines() if line]
-    untracked_count = sum(1 for line in status_lines if line.startswith("??"))
-    dirty = any(not line.startswith("??") for line in status_lines)
-    effective_includes_uncommitted_changes = bool(
-        includes_uncommitted_changes
-        if includes_uncommitted_changes is not None
-        else source_mode == "workspace"
-    )
-    if (
-        source_mode != "snapshot"
-        and not effective_includes_uncommitted_changes
-        and (dirty or untracked_count)
-    ):
-        raise ValueError(
-            f"repo {repo_id} has uncommitted changes but includes_uncommitted_changes is false"
+        now = _now()
+        head_commit = _git_output(repo_path, "rev-parse", "HEAD")
+        worktree_status = (
+            _git_status_porcelain_strict(repo_path, state_dir=state_dir)
+            if source_mode == "snapshot"
+            else _git_status_porcelain(repo_path, state_dir=state_dir)
         )
-    if source_mode == "snapshot":
-        if snapshot_commit and head_commit != snapshot_commit:
+        indexed_worktree_fingerprint = worktree_fingerprint(repo_path, worktree_status)
+        scope_fingerprint = index_scope_fingerprint(
+            role=role,
+            include_globs=include_globs,
+            exclude_globs=exclude_globs,
+            max_file_bytes=max_file_bytes,
+        )
+        status_lines = [line for line in worktree_status.splitlines() if line]
+        untracked_count = sum(1 for line in status_lines if line.startswith("??"))
+        dirty = any(not line.startswith("??") for line in status_lines)
+        effective_includes_uncommitted_changes = bool(
+            includes_uncommitted_changes
+            if includes_uncommitted_changes is not None
+            else source_mode == "workspace"
+        )
+        if (
+            source_mode != "snapshot"
+            and not effective_includes_uncommitted_changes
+            and (dirty or untracked_count)
+        ):
             raise ValueError(
-                f"snapshot repo {repo_id} HEAD does not match snapshot_commit "
-                f"({head_commit} != {snapshot_commit})"
+                f"repo {repo_id} has uncommitted changes but includes_uncommitted_changes is false"
             )
-        if dirty or untracked_count:
-            raise ValueError(f"snapshot repo {repo_id} must have a clean worktree before indexing")
-    conn.execute(
-        """
-        INSERT INTO repos(
-          id, role, name, source_mode, host_path, path, writable,
-          current_branch, head_commit, dirty, untracked_count, includes_uncommitted_changes,
-          snapshot_ref, snapshot_commit, last_indexed_at, last_indexed_commit,
-          last_indexed_worktree_fingerprint, index_scope_fingerprint
+        if source_mode == "snapshot":
+            if snapshot_commit and head_commit != snapshot_commit:
+                raise ValueError(
+                    f"snapshot repo {repo_id} HEAD does not match snapshot_commit "
+                    f"({head_commit} != {snapshot_commit})"
+                )
+            if dirty or untracked_count:
+                raise ValueError(
+                    f"snapshot repo {repo_id} must have a clean worktree before indexing"
+                )
+        conn.execute(
+            """
+            INSERT INTO repos(
+              id, role, name, source_mode, host_path, path, writable,
+              current_branch, head_commit, dirty, untracked_count, includes_uncommitted_changes,
+              snapshot_ref, snapshot_commit, last_indexed_at, last_indexed_commit,
+              last_indexed_worktree_fingerprint, index_scope_fingerprint
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              role = excluded.role,
+              name = excluded.name,
+              source_mode = excluded.source_mode,
+              host_path = excluded.host_path,
+              path = excluded.path,
+              writable = excluded.writable,
+              current_branch = excluded.current_branch,
+              head_commit = excluded.head_commit,
+              dirty = excluded.dirty,
+              untracked_count = excluded.untracked_count,
+              includes_uncommitted_changes = excluded.includes_uncommitted_changes,
+              snapshot_ref = excluded.snapshot_ref,
+              snapshot_commit = excluded.snapshot_commit,
+              last_indexed_at = excluded.last_indexed_at,
+              last_indexed_commit = excluded.last_indexed_commit,
+              last_indexed_worktree_fingerprint = excluded.last_indexed_worktree_fingerprint,
+              index_scope_fingerprint = excluded.index_scope_fingerprint
+            """,
+            (
+                repo_id,
+                role,
+                repo_path.name,
+                source_mode,
+                str(host_path) if host_path is not None else None,
+                str(repo_path),
+                int(writable),
+                _git_output(repo_path, "rev-parse", "--abbrev-ref", "HEAD"),
+                head_commit,
+                int(dirty),
+                untracked_count,
+                int(effective_includes_uncommitted_changes),
+                snapshot_ref,
+                snapshot_commit,
+                now,
+                head_commit,
+                indexed_worktree_fingerprint,
+                scope_fingerprint,
+            ),
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-          role = excluded.role,
-          name = excluded.name,
-          source_mode = excluded.source_mode,
-          host_path = excluded.host_path,
-          path = excluded.path,
-          writable = excluded.writable,
-          current_branch = excluded.current_branch,
-          head_commit = excluded.head_commit,
-          dirty = excluded.dirty,
-          untracked_count = excluded.untracked_count,
-          includes_uncommitted_changes = excluded.includes_uncommitted_changes,
-          snapshot_ref = excluded.snapshot_ref,
-          snapshot_commit = excluded.snapshot_commit,
-          last_indexed_at = excluded.last_indexed_at,
-          last_indexed_commit = excluded.last_indexed_commit,
-          last_indexed_worktree_fingerprint = excluded.last_indexed_worktree_fingerprint,
-          index_scope_fingerprint = excluded.index_scope_fingerprint
-        """,
-        (
-            repo_id,
-            role,
-            repo_path.name,
-            source_mode,
-            str(host_path) if host_path is not None else None,
-            str(repo_path),
-            int(writable),
-            _git_output(repo_path, "rev-parse", "--abbrev-ref", "HEAD"),
-            head_commit,
-            int(dirty),
-            untracked_count,
-            int(effective_includes_uncommitted_changes),
-            snapshot_ref,
-            snapshot_commit,
-            now,
-            head_commit,
-            indexed_worktree_fingerprint,
-            scope_fingerprint,
-        ),
-    )
 
-    indexed_docs = 0
-    indexed_chunks = 0
-    warning_count = 0
-    skipped_docs = 0
-    collected_warnings: list[str] = []
-    for file_path in _iter_indexable_files(
-        repo_path,
-        state_dir=state_dir,
-        include_globs=include_globs,
-        exclude_globs=exclude_globs,
-        # Keep oversized candidates in the indexing loop so they produce skip
-        # counters and warning events; direct file context passes max_file_bytes
-        # to _is_indexable_file as a hard leak-prevention gate.
-        max_file_bytes=None,
-    ):
-        relative_path = file_path.relative_to(repo_path).as_posix()
-        try:
-            stat = file_path.stat()
-        except OSError:
-            skipped_docs += 1
-            continue
-        if max_file_bytes is not None and stat.st_size > max_file_bytes:
-            skipped_docs += 1
-            warning_count += 1
-            warning_msg = (
-                f"Skipped file larger than max_file_bytes ({stat.st_size} > {max_file_bytes})"
+        tracked_paths = None
+        if source_mode == "remote":
+            tracked = subprocess.run(
+                ["git", "-C", str(repo_path), "ls-files", "-z"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=60,
             )
-            collected_warnings.append(f"[{relative_path}] {warning_msg}")
-            _insert_index_event(
-                conn,
-                event_type="file_skipped",
-                repo_id=repo_id,
-                path=relative_path,
-                status="warning",
-                message=warning_msg,
-                created_at=now,
-            )
-            continue
-        try:
-            text = file_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            skipped_docs += 1
-            continue
-        parsed = parse_document(relative_path, text, repo_id=repo_id, repo_role=role)
-        _insert_document(conn, parsed, mtime=stat.st_mtime)
-        indexed_docs += 1
-        indexed_chunks += len(parsed.chunks)
-        warning_count += len(parsed.warnings)
-        for w in parsed.warnings:
-            collected_warnings.append(f"[{w.path}] {w.message}")
+            tracked_paths = set(tracked.stdout.split("\0"))
+        indexed_docs = 0
+        indexed_chunks = 0
+        warning_count = 0
+        skipped_docs = 0
+        collected_warnings: list[str] = []
+        for file_path in _iter_indexable_files(
+            repo_path,
+            state_dir=state_dir,
+            include_globs=include_globs,
+            exclude_globs=exclude_globs,
+            # Keep oversized candidates in the indexing loop so they produce skip
+            # counters and warning events; direct file context passes max_file_bytes
+            # to _is_indexable_file as a hard leak-prevention gate.
+            max_file_bytes=None,
+        ):
+            relative_path = file_path.relative_to(repo_path).as_posix()
+            if tracked_paths is not None and relative_path not in tracked_paths:
+                continue
+            try:
+                stat = file_path.stat()
+            except OSError:
+                skipped_docs += 1
+                continue
+            if max_file_bytes is not None and stat.st_size > max_file_bytes:
+                skipped_docs += 1
+                warning_count += 1
+                warning_msg = (
+                    f"Skipped file larger than max_file_bytes ({stat.st_size} > {max_file_bytes})"
+                )
+                collected_warnings.append(f"[{relative_path}] {warning_msg}")
+                _insert_index_event(
+                    conn,
+                    event_type="file_skipped",
+                    repo_id=repo_id,
+                    path=relative_path,
+                    status="warning",
+                    message=warning_msg,
+                    created_at=now,
+                )
+                continue
+            try:
+                text = file_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                skipped_docs += 1
+                continue
+            parsed = parse_document(relative_path, text, repo_id=repo_id, repo_role=role)
+            _insert_document(conn, parsed, mtime=stat.st_mtime)
+            indexed_docs += 1
+            indexed_chunks += len(parsed.chunks)
+            warning_count += len(parsed.warnings)
+            for w in parsed.warnings:
+                collected_warnings.append(f"[{w.path}] {w.message}")
 
-    conn.commit()
-    conn.close()
+        conn.commit()
+    finally:
+        conn.close()
     return IndexSummary(
         db_path=db_path,
         repo_id=repo_id,
@@ -646,6 +684,7 @@ def index_repo(
     )
 
 
+@_serialized_index
 def index_document(
     repo_path: Path,
     relative_path: str | Path,
@@ -1347,7 +1386,8 @@ def _is_indexable_file(
     except ValueError:
         pass
     else:
-        return False
+        if resolved_root.parent != resolved_state_dir / "repositories":
+            return False
     relative = relative_path.as_posix()
     if ".git" in relative_path.parts or STATE_DIR_NAME in relative_path.parts:
         return False

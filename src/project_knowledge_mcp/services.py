@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import fcntl
+import hashlib
+import json
 import os
 import re
 import shutil
@@ -10,6 +13,8 @@ import time
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from fnmatch import fnmatch
+from functools import wraps
+from inspect import signature
 from pathlib import Path
 from typing import Any, Literal
 
@@ -32,14 +37,277 @@ from project_knowledge_mcp.index import (
     index_document,
     index_repo,
     index_scope_fingerprint,
+    project_lock,
     worktree_fingerprint,
 )
+
+
+_sync_results: dict[tuple[str, str], dict[str, Any]] = {}
+
+
+def _project_lock(config):
+    return project_lock(config.storage.state_dir)
+
+
+def _sync_git(path: Path, *args: str) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), *args],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Git synchronization timed out") from exc
+    if result.returncode:
+        # Git stderr can contain credentials from remote URLs.
+        raise RuntimeError(f"Git {args[0]} failed (exit {result.returncode})")
+    return result.stdout.strip()
+
+
+def _required_graph_ready(config, repo) -> bool:
+    if repo.role != "work" or not config.code_context.required_for_code_repos:
+        return True
+    if not config.code_context.codegraph.enabled:
+        return False
+    provider = CodeGraphProvider(config)
+    try:
+        status = provider._status_for_repo(repo)
+        return provider.canonical_status_ready(status, repo)
+    except RuntimeError:
+        return False
+
+
+def _refresh_graph(config, repo):
+    if repo.role != "work" or not config.code_context.required_for_code_repos:
+        return
+    if not config.code_context.codegraph.enabled:
+        raise RuntimeError("Required CodeGraph is disabled")
+    provider = CodeGraphProvider(config)
+    status = provider._status_for_repo(repo)
+    provider._run("sync" if status.get("initialized") is True else "init", str(repo.path))
+    if not _required_graph_ready(config, repo):
+        raise RuntimeError("Required CodeGraph is not aligned after refresh")
+
+
+def _serialized(function):
+    parameters = signature(function)
+
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        try:
+            config = load_project_config(
+                parameters.bind(*args, **kwargs).arguments.get("config_path")
+            )
+        except Exception:
+            return function(*args, **kwargs)
+        with _project_lock(config):
+            guarded = function.__name__ in {
+                "search_ops_from_config",
+                "search_code_from_config",
+                "get_code_context_from_config",
+                "_recent_indexed_changes_from_config",
+            }
+            statuses = []
+            if guarded and any(repo.source_mode == "remote" for repo in config.repos):
+                roles = {"ops"} if function.__name__ == "search_ops_from_config" else {"work"}
+                if function.__name__ == "search_code_from_config" and kwargs.get("repo_id") is None:
+                    roles.add("ops")
+                if function.__name__ == "_recent_indexed_changes_from_config":
+                    roles = None
+                statuses = [
+                    status
+                    for status in check_project_staleness_from_config(
+                        config_path=config.config_path
+                    ).get("repos", [])
+                    if status["source_mode"] == "remote"
+                    and (roles is None or status["role"] in roles)
+                    and (kwargs.get("repo_id") is None or kwargs["repo_id"] == status["repo_id"])
+                ]
+                if any(not status.get("retrieval_available") for status in statuses):
+                    return {
+                        "results": [],
+                        "retrieval_state": "unavailable",
+                        "match_state": "indeterminate",
+                        "freshness_state": "unknown",
+                        "warnings": [
+                            warning for status in statuses for warning in status["warnings"]
+                        ],
+                        "error": {
+                            "code": "SYNC_UNAVAILABLE",
+                            "message": "No safe aligned canonical index is available",
+                            "recoverable": True,
+                        },
+                        "markdown": "Canonical retrieval is unavailable until synchronization succeeds.",
+                    }
+            packet = function(*args, **kwargs)
+            if statuses:
+                _decorate_retrieval_freshness(packet, statuses)
+            return packet
+
+    return wrapped
+
+
+def _decorate_retrieval_freshness(packet, statuses):
+    stale = any(status["reindex_needed"] for status in statuses)
+    packet["freshness_state"] = "stale" if stale else "current"
+    packet["retrieval_state"] = "partial" if stale else "complete"
+    packet["match_state"] = (
+        "with_results"
+        if packet.get("results")
+        else "indeterminate"
+        if stale or packet.get("error")
+        else "no_match"
+    )
+    packet["staleness"] = statuses
+    packet.setdefault("warnings", []).extend(
+        warning for status in statuses for warning in status["warnings"]
+    )
+    if stale:
+        warning = "Stale retrieval is incomplete; absence cannot be inferred."
+        packet.setdefault("warnings", []).append(warning)
+        markdown = packet.get("markdown", "")
+        if not packet.get("results"):
+            markdown = markdown.replace("No results.", warning)
+        packet["markdown"] = f"{markdown}\n\n{warning}" if warning not in markdown else markdown
+
+
+def sync_project(
+    config: ProjectKnowledgeConfig, repo_id: str | None = None, *, skip_if_busy: bool = False
+) -> dict[str, Any]:
+    lock = _project_lock(config)
+    if not lock.acquire(blocking=not skip_if_busy):
+        return {"status": "skipped", "repos": []}
+    try:
+        for repo in _select_repos(config, repo_id=repo_id):
+            if repo.source_mode != "remote":
+                continue
+            key = (str(config.storage.state_dir), repo.id)
+            file_lock = _CaptureLock(
+                _capture_lock_path(config, repo.id, "origin", repo.canonical_branch)
+            )
+            error = file_lock.acquire()
+            if error:
+                _sync_results[key] = {"error": error, "fetched": False}
+                continue
+            previous = _load_indexed_repo_metadata(config.storage.state_dir).get(repo.id, {})
+            previous_commit = previous.get("last_indexed_commit")
+            backup = None
+            advanced = False
+            owned = False
+            try:
+                expected = config.storage.state_dir / "repositories" / repo.id
+                if repo.path != expected or repo.path.resolve() != expected:
+                    raise RuntimeError("Managed repository path is not the expected direct root")
+                owner = repo.path / ".git" / "pkmcp-owner.json"
+                identity = {
+                    "project": config.project.id,
+                    "repo": repo.id,
+                    "remote_sha256": hashlib.sha256(repo.remote_url.encode("utf-8")).hexdigest(),
+                }
+                if not repo.path.exists():
+                    repo.path.parent.mkdir(parents=True, exist_ok=True)
+                    with tempfile.TemporaryDirectory(
+                        dir=repo.path.parent, prefix=".clone-"
+                    ) as temporary:
+                        clone = Path(temporary) / "checkout"
+                        _sync_git(
+                            repo.path.parent,
+                            "clone",
+                            "--no-tags",
+                            "--branch",
+                            repo.canonical_branch,
+                            "--",
+                            repo.remote_url,
+                            str(clone),
+                        )
+                        (clone / ".git" / "pkmcp-owner.json").write_text(json.dumps(identity))
+                        clone.rename(repo.path)
+                if (repo.path / ".git").is_symlink() or not (repo.path / ".git").is_dir():
+                    raise RuntimeError("Managed repository Git directory is not owned")
+                if not owner.is_file() or json.loads(owner.read_text()) != identity:
+                    raise RuntimeError("Managed repository ownership does not match configuration")
+                if _sync_git(repo.path, "remote", "get-url", "origin") != repo.remote_url:
+                    raise RuntimeError("Managed repository origin does not match configuration")
+                owned = True
+                _sync_git(
+                    repo.path,
+                    "fetch",
+                    "--no-tags",
+                    "origin",
+                    f"+refs/heads/{repo.canonical_branch}:refs/remotes/origin/{repo.canonical_branch}",
+                )
+                commit = _sync_git(
+                    repo.path, "rev-parse", f"refs/remotes/origin/{repo.canonical_branch}"
+                )
+                db_path = config.storage.state_dir / INDEX_DB_NAME
+                if previous_commit and db_path.exists():
+                    backup = sqlite3.connect(":memory:")
+                    with sqlite3.connect(db_path) as database:
+                        database.backup(backup)
+                advanced = True
+                _sync_git(repo.path, "reset", "--hard", commit)
+                _sync_git(repo.path, "checkout", "-B", repo.canonical_branch, commit)
+                _sync_git(
+                    repo.path, "branch", "--set-upstream-to", f"origin/{repo.canonical_branch}"
+                )
+                _sync_git(repo.path, "clean", "-ffdx")
+                indexed = _load_indexed_repo_metadata(config.storage.state_dir).get(repo.id)
+                status = _repo_staleness_status(
+                    repo,
+                    indexed,
+                    state_dir=config.storage.state_dir,
+                    max_file_bytes=config.indexing.max_file_bytes,
+                )
+                graph_required = repo.role == "work" and config.code_context.required_for_code_repos
+                if graph_required and (
+                    status["reindex_needed"] or not _required_graph_ready(config, repo)
+                ):
+                    _refresh_graph(config, repo)
+                if status["reindex_needed"]:
+                    result = index_project_from_config(
+                        config_path=config.config_path, repo_id=repo.id
+                    )
+                    if result.get("status") == "error":
+                        raise RuntimeError("SQLite indexing failed")
+                _sync_results[key] = {
+                    "error": None,
+                    "fetched": True,
+                    "commit": commit,
+                    "safe": True,
+                    "source": (repo.remote_url, repo.canonical_branch),
+                }
+            except Exception as exc:
+                safe = False
+                error = str(exc)
+                if advanced and previous_commit and backup is not None:
+                    try:
+                        _sync_git(repo.path, "reset", "--hard", previous_commit)
+                        _sync_git(repo.path, "clean", "-ffdx")
+                        _refresh_graph(config, repo)
+                        with sqlite3.connect(config.storage.state_dir / INDEX_DB_NAME) as database:
+                            backup.backup(database)
+                        safe = True
+                    except Exception as restore_error:
+                        error += f"; restoration failed: {restore_error}"
+                elif not advanced:
+                    safe = owned and bool(previous_commit)
+                _sync_results[key] = {"error": error, "fetched": False, "safe": safe}
+            finally:
+                if backup is not None:
+                    backup.close()
+                file_lock.release()
+        return check_project_staleness_from_config(config_path=config.config_path)
+    finally:
+        lock.release()
 
 
 def validate_config_service(config_path: Path | str | None = None) -> dict[str, Any]:
     return validate_project_config(config_path)
 
 
+@_serialized
 def index_project_from_config(
     *,
     config_path: Path | str | None = None,
@@ -143,6 +411,7 @@ BUILTIN_BLOCKED_DIRECT_WRITE_GLOBS = [
 ]
 
 
+@_serialized
 def add_project_note_from_config(
     title: str,
     body: str,
@@ -197,6 +466,7 @@ def add_project_note_from_config(
     )
 
 
+@_serialized
 def create_draft_artifact_from_config(
     kind: str,
     title: str,
@@ -273,6 +543,7 @@ def create_draft_artifact_from_config(
     }
 
 
+@_serialized
 def propose_authority_change_from_config(
     title: str,
     rationale: str,
@@ -464,6 +735,7 @@ def propose_authority_change_from_config(
     return result
 
 
+@_serialized
 def search_ops_from_config(
     *,
     query: str,
@@ -582,6 +854,7 @@ def search_ops_from_config(
     }
 
 
+@_serialized
 def search_decisions_from_config(
     *,
     query: str,
@@ -605,6 +878,7 @@ def search_decisions_from_config(
     return result
 
 
+@_serialized
 def search_open_questions_from_config(
     *,
     query: str,
@@ -638,6 +912,7 @@ ProjectStateView = Literal["doctrine", "doctrine_and_discussion"]
 _PROJECT_STATE_VIEWS = {"doctrine", "doctrine_and_discussion"}
 
 
+@_serialized
 def get_project_state_from_config(
     *,
     topic: str,
@@ -755,7 +1030,7 @@ def get_project_state_from_config(
                 section_id=name,
                 label=label,
                 authority_class=authority_class,
-                stale=work_stale if name == "implementation_evidence" else ops_stale,
+                stale=(work_stale or ops_stale) if name == "implementation_evidence" else ops_stale,
             )
 
     errors = _packet_errors(
@@ -931,6 +1206,7 @@ def _project_state_known_omissions(sections: dict[str, dict[str, Any]]) -> list[
     return omissions
 
 
+@_serialized
 def check_project_staleness_from_config(
     *,
     config_path: Path | str | None = None,
@@ -959,6 +1235,42 @@ def check_project_staleness_from_config(
         )
         for repo in config.repos
     ]
+    for repo, status in zip(config.repos, repo_statuses, strict=True):
+        if repo.source_mode == "remote":
+            index_aligned = not status["reindex_needed"]
+            sync = _sync_results.get((str(config.storage.state_dir), repo.id), {})
+            status["last_sync_error"] = sync.get("error")
+            if (
+                not sync.get("fetched")
+                or sync.get("commit") != status["head_commit"]
+                or sync.get("source") != (repo.remote_url, repo.canonical_branch)
+                or status["branch"] != repo.canonical_branch
+                or _git_output(repo.path, "remote", "get-url", "origin", warn_on_failure=False)
+                != repo.remote_url
+            ):
+                status["reindex_needed"] = True
+                status["remote_check_status"] = "warning"
+                status["warnings"].append(
+                    sync.get("error")
+                    or "Canonical remote has not been synchronized in this process."
+                )
+            aligned = (
+                index_aligned
+                and bool(status["last_indexed_commit"])
+                and status["head_commit"] == status["last_indexed_commit"]
+                and not status["scope_mismatch"]
+                and not status["metadata_mismatch"]
+                and status["status_check_status"] == "ok"
+                and not status["dirty"]
+                and status["untracked_count"] == 0
+                and _required_graph_ready(config, repo)
+            )
+            status["retrieval_available"] = bool(sync.get("safe")) and aligned
+            if not aligned or status["head_commit"] != status["remote_head_commit"]:
+                status["reindex_needed"] = True
+                status["warnings"].append(
+                    "Canonical checkout, SQLite scope, or required CodeGraph is not current."
+                )
     _persist_repo_statuses(config.storage.state_dir, repo_statuses)
     warnings = [warning for repo in repo_statuses for warning in repo["warnings"]]
     return {
@@ -972,6 +1284,7 @@ def check_project_staleness_from_config(
     }
 
 
+@_serialized
 def get_code_provider_status_from_config(
     *,
     config_path: Path | str | None = None,
@@ -1014,6 +1327,7 @@ def get_code_provider_status_from_config(
     }
 
 
+@_serialized
 def search_code_from_config(
     *,
     query: str,
@@ -1190,6 +1504,7 @@ def _code_result_kind_rank(kind: str) -> int:
     }.get(kind, 5)
 
 
+@_serialized
 def get_code_context_from_config(
     *,
     symbol_or_file: str,
@@ -1277,6 +1592,7 @@ def get_code_context_from_config(
     }
 
 
+@_serialized
 def generate_session_brief_from_config(
     *,
     task: str,
@@ -1311,7 +1627,7 @@ def generate_session_brief_from_config(
             section_id="recent_changes",
             label="Recent indexed changes",
             authority_class="implementation",
-            stale=False,
+            stale=recent_changes.get("freshness_state") == "stale",
         )
     sections = dict(project_state["sections"])
     sections["recent_changes"] = recent_section
@@ -1405,6 +1721,7 @@ def _packet_errors(*named_packets: tuple[str, dict[str, Any]]) -> list[dict[str,
     return errors
 
 
+@_serialized
 def _recent_indexed_changes_from_config(
     *, config_path: Path | str | None, since: str | None, limit: Any
 ) -> dict[str, Any]:
@@ -2249,18 +2566,45 @@ class _CaptureLock:
             except FileExistsError:
                 if time.monotonic() >= deadline:
                     return "Timed out waiting for capture persistence lock."
-                time.sleep(0.05)
+                if self._reclaim_dead_owner():
+                    continue
+                time.sleep(min(0.05, max(0, deadline - time.monotonic())))
             except OSError as exc:
                 return f"Could not acquire capture persistence lock: {exc}"
 
-    def release(self) -> None:
-        if self._fd is not None:
-            os.close(self._fd)
-            self._fd = None
+    def _reclaim_dead_owner(self) -> bool:
         try:
-            self.path.unlink()
+            # Serialize reclaimers on the existing inode. A second reclaimer
+            # must never unlink the new owner's O_EXCL replacement.
+            with self.path.open("rb") as existing:
+                fcntl.flock(existing.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                recorded = existing.read(64)
+                pid = int(recorded)
+                if pid <= 0:
+                    return False
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    if os.path.samestat(os.fstat(existing.fileno()), self.path.stat()):
+                        self.path.unlink()
+                        return True
+                return False
+        except (OSError, ValueError, OverflowError):
+            # Empty/malformed content, permission failures, and live owners
+            # are not evidence of process death. The caller's timeout applies.
+            return False
+
+    def release(self) -> None:
+        if self._fd is None:
+            return
+        try:
+            if os.path.samestat(os.fstat(self._fd), self.path.stat()):
+                self.path.unlink()
         except FileNotFoundError:
             pass
+        finally:
+            os.close(self._fd)
+            self._fd = None
 
 
 def _is_push_rejection(result: dict[str, Any]) -> bool:
@@ -2917,7 +3261,7 @@ def _repo_staleness_status(
         or snapshot_mismatch
         or status_check_status != "ok"
         or (
-            includes_uncommitted_changes
+            (includes_uncommitted_changes or repo.source_mode == "remote")
             and current_worktree_fingerprint != last_indexed_worktree_fingerprint
         )
     )
