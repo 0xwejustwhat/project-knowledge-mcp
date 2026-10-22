@@ -141,6 +141,11 @@ def test_required_codegraph_is_refreshed_and_verified(tmp_path, monkeypatch):
     result = services.sync_project(config)
     assert calls == [("init", str(config.repo_by_id("work").path))]
     assert not result["repos"][1]["reindex_needed"]
+    graph_metadata = config.repo_by_id("work").path / ".codegraph" / ".gitignore"
+    graph_metadata.parent.mkdir()
+    graph_metadata.write_text("codegraph.db\n")
+    assert not services.sync_project(config)["repos"][1]["reindex_needed"]
+    assert graph_metadata.is_file()
     advance(origin, "newcode")
     services.sync_project(config)
     assert calls[-1][0] == "sync"
