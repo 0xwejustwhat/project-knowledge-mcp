@@ -427,6 +427,257 @@ def configure_codegraph_command(config_path: Path, command: Path) -> None:
     )
 
 
+TRUNCATION_NOTICE = (
+    "... (output truncated to budget; the source above is complete and verbatim — treat it as "
+    "already Read. For any area not covered, run another codegraph_explore with the specific "
+    "names — do NOT Read these files.)"
+)
+
+
+@pytest.mark.parametrize("lookup", [False, True], ids=["explore", "node"])
+def test_budget_truncated_codegraph_preserves_complete_source_lines(
+    tmp_path: Path, monkeypatch, lookup
+):
+    from project_knowledge_mcp.code_context import CodeGraphProvider
+
+    config_path, _, _, _ = configured_project(tmp_path)
+    configure_codegraph_command(config_path, write_fake_codegraph(tmp_path))
+    original = CodeGraphProvider._run
+    heading = (
+        "## ExampleService (class)\n\n**Location:** src/example.py:1"
+        if lookup
+        else "#### src/example.py — ExampleService(class)"
+    )
+    output = (
+        heading
+        + "\n\n```python\n1\thostile provider text\n2\tignored\n3\tcut"
+        + "\n\n"
+        + TRUNCATION_NOTICE
+        + "\n"
+    )
+    monkeypatch.setattr(
+        CodeGraphProvider,
+        "_run",
+        lambda self, *args: original(self, *args) if args[0] == "status" else output,
+    )
+    payload = (
+        get_code_context_from_config(
+            symbol_or_file="ExampleService", config_path=config_path, repo_id="app"
+        )
+        if lookup
+        else search_code_from_config(query="lease", config_path=config_path, repo_id="app")
+    )
+    assert payload["active_provider"] == "codegraph"
+    result = payload["results"][0]
+    assert (result["start_line"], result["end_line"]) == (1, 2)
+    assert (
+        result["snippet"]
+        == "class ExampleService:\n    def compile_context(self, topic: str) -> str:"
+    )
+    assert any("app" in warning and "truncated" in warning for warning in payload["warnings"])
+    assert "hostile provider text" not in str(payload)
+    assert "truncated" in payload["markdown"]
+    from project_knowledge_mcp.services import _project_state_section
+
+    section = _project_state_section(
+        payload,
+        section_id="implementation_evidence",
+        label="Implementation",
+        authority_class="implementation",
+        stale=False,
+    )
+    assert section["retrieval_state"] == "partial"
+    assert section["freshness_state"] == "current"
+
+
+@pytest.mark.parametrize("lookup", [False, True], ids=["search", "context"])
+@pytest.mark.parametrize("fallback", [False, True], ids=["no-fallback", "fallback"])
+def test_failed_repo_retains_other_graph_evidence(tmp_path: Path, monkeypatch, lookup, fallback):
+    import shutil
+    import yaml
+    from project_knowledge_mcp.code_context import CodeGraphProvider
+
+    config_path, _, work_repo, _ = configured_project(tmp_path)
+    second = tmp_path / "second"
+    shutil.copytree(work_repo, second)
+    config = yaml.safe_load(config_path.read_text())
+    config["repos"].append({**config["repos"][1], "id": "second", "path": str(second)})
+    config["code_context"]["fallback_on_unhealthy"] = fallback
+    config_path.write_text(yaml.safe_dump(config))
+    # Configure explicitly: the helper assumes the original YAML formatting.
+    config["code_context"]["codegraph"]["command"] = str(write_fake_codegraph(tmp_path))
+    config_path.write_text(yaml.safe_dump(config))
+    index_project_from_config(config_path=config_path)
+    original = CodeGraphProvider._run
+
+    def run(self, *args):
+        if args[0] != "status" and str(work_repo) in args:
+            raise RuntimeError("--token=do-not-return raw failure")
+        return original(self, *args)
+
+    monkeypatch.setattr(CodeGraphProvider, "_run", run)
+    payload = (
+        get_code_context_from_config(
+            symbol_or_file="ExampleService", config_path=config_path, limit=10
+        )
+        if lookup
+        else search_code_from_config(
+            query="compile_context evidence", config_path=config_path, limit=10
+        )
+    )
+    assert any(
+        r["repo_id"] == "second" and r["provider"] == "codegraph" for r in payload["results"]
+    )
+    failed_repo_results = [r for r in payload["results"] if r["repo_id"] == "app"]
+    assert bool(failed_repo_results) is fallback
+    assert all(r["provider"] == "fts5" for r in failed_repo_results)
+    assert any("app" in w and "failed" in w for w in payload["warnings"])
+    assert "do-not-return" not in str(payload)
+    assert "partial" in payload["markdown"]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "1\tfirst\n3\tgap\n4\tcut",
+        "1\tfirst\n1\tduplicate\n2\tcut",
+        "0\tzero\n1\tsecond\n2\tcut",
+        "1\tfirst\nprovider prose\n2\tcut",
+        "3\tlast current line\n4\tbeyond current file\n5\tcut",
+    ],
+    ids=["gap", "duplicate", "zero", "prose", "out-of-range"],
+)
+def test_marked_truncation_rejects_invalid_source_ranges(tmp_path: Path, monkeypatch, source):
+    from project_knowledge_mcp.code_context import CodeGraphProvider
+
+    config_path, _, _, _ = configured_project(tmp_path)
+    configure_codegraph_command(config_path, write_fake_codegraph(tmp_path))
+    index_project_from_config(config_path=config_path)
+    original = CodeGraphProvider._run
+    output = (
+        "#### src/example.py — ExampleService(class)\n\n```python\n"
+        + source
+        + "\n\n"
+        + TRUNCATION_NOTICE
+    )
+    monkeypatch.setattr(
+        CodeGraphProvider,
+        "_run",
+        lambda self, *args: original(self, *args) if args[0] == "status" else output,
+    )
+    payload = search_code_from_config(
+        query="compile_context evidence", config_path=config_path, repo_id="app"
+    )
+    assert not any(r["provider"] == "codegraph" for r in payload["results"])
+    assert any("failed for repo app" in w for w in payload["warnings"])
+
+
+def test_truncated_last_section_preserves_prior_graph_result(tmp_path: Path, monkeypatch):
+    from project_knowledge_mcp.code_context import CodeGraphProvider
+
+    config_path, _, _, _ = configured_project(tmp_path)
+    configure_codegraph_command(config_path, write_fake_codegraph(tmp_path))
+    config_path.write_text(
+        config_path.read_text().replace(
+            "fallback_on_unhealthy: true", "fallback_on_unhealthy: false"
+        )
+    )
+    original = CodeGraphProvider._run
+    output = (
+        "#### src/example.py — ExampleService(class)\n\n```python\n1\tcomplete\n```\n\n"
+        "#### tests/test_example.py — test_compile_context_returns_evidence(function)\n\n"
+        "```python\n1\tcut\n\n" + TRUNCATION_NOTICE
+    )
+    monkeypatch.setattr(
+        CodeGraphProvider,
+        "_run",
+        lambda self, *args: original(self, *args) if args[0] == "status" else output,
+    )
+    payload = search_code_from_config(query="lease", config_path=config_path)
+    assert any(r["provider"] == "codegraph" for r in payload["results"])
+    assert payload["retrieval_state"] == "partial"
+
+
+def test_missing_fts_preserves_global_limit_and_partial_state(tmp_path: Path):
+    import shutil
+    import yaml
+
+    config_path, _, work_repo, _ = configured_project(tmp_path)
+    second = tmp_path / "second"
+    shutil.copytree(work_repo, second)
+    config = yaml.safe_load(config_path.read_text())
+    config["repos"].append({**config["repos"][1], "id": "second", "path": str(second)})
+    config["code_context"]["codegraph"]["command"] = str(write_fake_codegraph(tmp_path))
+    config_path.write_text(yaml.safe_dump(config))
+    payload = search_code_from_config(query="ExampleService", config_path=config_path, limit=1)
+    assert len(payload["results"]) == 1
+    assert payload["retrieval_state"] == "partial"
+    assert "SQLite FTS5" in str(payload["warnings"])
+
+
+def test_truncated_node_uses_only_the_numbered_source_range(tmp_path: Path, monkeypatch):
+    from project_knowledge_mcp.code_context import CodeGraphProvider
+
+    config_path, _, _, _ = configured_project(tmp_path)
+    configure_codegraph_command(config_path, write_fake_codegraph(tmp_path))
+    original = CodeGraphProvider._run
+    output = (
+        "## ExampleService (class)\n**Location:** src/example.py:1\n\n```python\n"
+        "2\tcomplete\n3\tcut\n\n" + TRUNCATION_NOTICE
+    )
+    monkeypatch.setattr(
+        CodeGraphProvider,
+        "_run",
+        lambda self, *args: original(self, *args) if args[0] == "status" else output,
+    )
+    payload = get_code_context_from_config(
+        symbol_or_file="ExampleService", config_path=config_path, repo_id="app"
+    )
+    assert (payload["results"][0]["start_line"], payload["results"][0]["end_line"]) == (2, 2)
+    assert payload["results"][0]["snippet"] == "def compile_context(self, topic: str) -> str:"
+
+
+@pytest.mark.parametrize("lookup", [False, True], ids=["search", "context"])
+def test_graph_failure_reason_survives_unavailable_text_index(tmp_path: Path, lookup):
+    config_path, _, _, _ = configured_project(tmp_path)
+    configure_codegraph_command(
+        config_path, write_fake_codegraph(tmp_path, fail_explore=True, unparseable_node=True)
+    )
+    payload = (
+        get_code_context_from_config(
+            symbol_or_file="ExampleService", config_path=config_path, repo_id="app"
+        )
+        if lookup
+        else search_code_from_config(query="lease", config_path=config_path, repo_id="app")
+    )
+    assert payload["error"]["code"] == "INDEX_NOT_READY"
+    assert any("failed for repo app" in warning for warning in payload["warnings"])
+    assert "repo app" in payload["markdown"]
+
+
+def test_codegraph_no_match_does_not_abort_later_repo(tmp_path: Path, monkeypatch):
+    from project_knowledge_mcp.code_context import CodeGraphProvider
+    from project_knowledge_mcp.config import load_project_config
+
+    config_path, _, work_repo, _ = configured_project(tmp_path)
+    config = load_project_config(config_path)
+    app = config.repos[1]
+    config.repos.append(app.model_copy(update={"id": "second"}))
+    provider = CodeGraphProvider(config)
+    outputs = iter(
+        [
+            'No relevant code found for "lease"',
+            "#### src/example.py — ExampleService(class)\n\n```python\n1\tclass ExampleService:\n```",
+        ]
+    )
+    monkeypatch.setattr(provider, "_run", lambda *args: next(outputs))
+
+    results = provider.search_code("lease", repo_id=None, limit=5)
+
+    assert [(result.repo_id, result.path) for result in results] == [("second", "src/example.py")]
+    assert results[0].snippet == (work_repo / "src/example.py").read_text().splitlines()[0]
+
+
 def test_search_code_uses_text_fallback_for_indexed_work_repo(tmp_path: Path):
     config_path, _ops_repo, _work_repo, _state_dir = configured_project(tmp_path)
     indexed = index_project_from_config(config_path=config_path)
@@ -1394,6 +1645,55 @@ def test_code_context_fails_closed_on_corrupt_index_db(tmp_path: Path):
     assert context_payload["results"] == []
     assert context_payload["error"]["code"] == "INDEX_NOT_READY"
     assert "compiled evidence" not in context_payload["markdown"]
+
+
+def test_merge_keeps_graph_evidence_with_higher_scoring_text():
+    from project_knowledge_mcp.code_context import CodeResult
+    from project_knowledge_mcp.services import _merge_code_results
+
+    def result(provider, score):
+        return CodeResult(
+            repo_id="app",
+            path="src/example.py",
+            start_line=1,
+            end_line=3,
+            symbol=None,
+            kind="file" if provider == "codegraph" else "code",
+            snippet="class Example: pass",
+            provider=provider,
+            score=score,
+            related=[],
+        )
+
+    merged = _merge_code_results([result("codegraph", 1.0), result("fts5", 4.5)], 1)
+    assert merged[0].provider == "codegraph"
+
+
+def test_codegraph_exploration_runs_in_selected_repository(tmp_path: Path, monkeypatch):
+    from project_knowledge_mcp.code_context import CodeGraphProvider
+    from project_knowledge_mcp.config import load_project_config
+
+    config_path, _, work_repo, _ = configured_project(tmp_path)
+    provider = CodeGraphProvider(load_project_config(config_path))
+    monkeypatch.setattr(provider, "_command_argv", lambda: ["codegraph"])
+
+    def run(argv, **kwargs):
+        assert kwargs.get("cwd") == str(work_repo)
+        return subprocess.CompletedProcess(argv, 0, 'No relevant code found for "missing"\n', "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert provider.search_code("missing", repo_id="app", limit=3) == []
+
+
+def test_freshness_decoration_preserves_partial_retrieval():
+    from project_knowledge_mcp.services import _decorate_retrieval_freshness
+
+    packet = {"retrieval_state": "partial", "results": [], "markdown": "No results."}
+    _decorate_retrieval_freshness(packet, [{"reindex_needed": False, "warnings": []}])
+    assert packet["freshness_state"] == "current"
+    assert packet["retrieval_state"] == "partial"
+    assert packet["match_state"] == "indeterminate"
+    assert "No results." not in packet["markdown"]
 
 
 def test_code_context_honors_disabled_text_fallback(tmp_path: Path):

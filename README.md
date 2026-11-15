@@ -88,6 +88,8 @@ PKMCP is designed for the **discovery → verify** two-step pattern:
 - Live state — branch status, uncommitted diffs, test results require direct tool access
 - Replacing direct read — PKMCP finds the *where*, direct read confirms the *what*
 
+`get_code_provider_status` reports **index readiness**, not the outcome of the last retrieval. A healthy index does not guarantee a query succeeds; inspect each search/context response's `active_provider`, `retrieval_state`, and repository-specific warnings. Recognized native no-match responses are not failures. Explicitly budget-truncated output can return validated complete numbered source lines, but retrieval remains partial (the potentially cut final line is discarded). A failed repository does not discard graph evidence from other repositories; text fallback remains scoped to selected repositories and respects `fallback_on_unhealthy`. These diagnostics are query-local, not a persistent retrieval-health tracker.
+
 When CodeGraph reports as unhealthy, check `get_code_provider_status` for the `details` block. If `indexed_repos: []` or `missing_index_repos` is non-empty, the binary exists but needs indexing (`codegraph init && codegraph index`). If the binary path in `project.yaml` doesn't exist on disk, the setup write phase was never completed — do **not** patch the path by hand. Instead, run a fresh setup that correctly installs and initializes CodeGraph.
 
 ## Configuration

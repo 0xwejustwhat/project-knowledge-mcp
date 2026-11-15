@@ -162,20 +162,25 @@ def _serialized(function):
 def _decorate_retrieval_freshness(packet, statuses):
     stale = any(status["reindex_needed"] for status in statuses)
     packet["freshness_state"] = "stale" if stale else "current"
-    packet["retrieval_state"] = "partial" if stale else "complete"
+    partial = stale or packet.get("retrieval_state") == "partial"
+    packet["retrieval_state"] = "partial" if partial else "complete"
     packet["match_state"] = (
         "with_results"
         if packet.get("results")
         else "indeterminate"
-        if stale or packet.get("error")
+        if partial or packet.get("error")
         else "no_match"
     )
     packet["staleness"] = statuses
     packet.setdefault("warnings", []).extend(
         warning for status in statuses for warning in status["warnings"]
     )
-    if stale:
-        warning = "Stale retrieval is incomplete; absence cannot be inferred."
+    if partial:
+        warning = (
+            "Stale retrieval is incomplete; absence cannot be inferred."
+            if stale
+            else "Partial retrieval is incomplete; absence cannot be inferred."
+        )
         packet.setdefault("warnings", []).append(warning)
         markdown = packet.get("markdown", "")
         if not packet.get("results"):
@@ -1262,7 +1267,7 @@ def _project_state_section(
     if error:
         retrieval_state = "unavailable"
         match_state = "indeterminate"
-    elif stale:
+    elif stale or packet.get("retrieval_state") == "partial":
         retrieval_state = "partial"
         match_state = "with_results" if results else "indeterminate"
     else:
@@ -1457,8 +1462,11 @@ def search_code_from_config(
     graph_results: list[CodeResult] = []
     if graph_health.codegraph_healthy:
         try:
-            graph_results = graph_provider.search_code(query, repo_id=repo_id, limit=result_limit)
+            graph_results, failed_repos = _retrieve_codegraph_repos(
+                graph_provider, query, repo_id=repo_id, limit=result_limit, lookup=False
+            )
         except RuntimeError:
+            warnings.extend(graph_provider.warnings)
             if not config.code_context.fallback_on_unhealthy:
                 return _provider_unavailable(
                     query,
@@ -1473,6 +1481,7 @@ def search_code_from_config(
             warnings.append("CodeGraph search failed; using text fallback.")
             active_provider = config.code_context.fallback_provider
         else:
+            warnings.extend(graph_provider.warnings)
             try:
                 fts_results = _search_code_fts_results(
                     config=config,
@@ -1480,10 +1489,16 @@ def search_code_from_config(
                     repo_id=repo_id,
                     limit=result_limit,
                     include_ops=repo_id is None,
+                    exclude_repo_ids=(
+                        failed_repos if not config.code_context.fallback_on_unhealthy else set()
+                    ),
                 )
             except (FileNotFoundError, sqlite3.Error, OSError):
-                warnings.append("SQLite FTS5 search is not ready; run index_project first.")
-                merged_results = graph_results
+                graph_provider.warnings.append(
+                    "SQLite FTS5 search is not ready; run index_project first; retrieval is partial."
+                )
+                warnings.append(graph_provider.warnings[-1])
+                merged_results = _merge_code_results(graph_results, result_limit)
                 active_provider = "codegraph"
             except ValueError as exc:
                 return _query_invalid(
@@ -1500,10 +1515,13 @@ def search_code_from_config(
                 "query": query,
                 "project_id": config.project.id,
                 "configured_provider": graph_health.configured_provider,
+                "retrieval_state": "partial" if graph_provider.warnings else "complete",
                 "active_provider": active_provider,
                 "results": payload_results,
                 "warnings": warnings,
-                "markdown": _render_code_markdown("Code Search Results", query, payload_results),
+                "markdown": _render_code_markdown(
+                    "Code Search Results", query, payload_results, warnings
+                ),
             }
     try:
         provider = TextFallbackCodeContextProvider(config)
@@ -1513,8 +1531,9 @@ def search_code_from_config(
             "tool": "search_code",
             "query": query,
             "results": [],
-            "warnings": ["Index is not ready; run index_project first."],
-            "markdown": "## Code Search Results\n\nIndex is not ready; run `index_project` first.",
+            "warnings": [*warnings, "Index is not ready; run index_project first."],
+            "markdown": "## Code Search Results\n\nIndex is not ready; run `index_project` first."
+            + "".join(f"\n\nWarning: {warning}" for warning in warnings),
             "error": {
                 "code": "INDEX_NOT_READY",
                 "message": "Index is not ready; run index_project first.",
@@ -1534,11 +1553,53 @@ def search_code_from_config(
         "query": query,
         "project_id": config.project.id,
         "configured_provider": graph_health.configured_provider,
+        "retrieval_state": "partial" if graph_provider.warnings else "complete",
         "active_provider": active_provider,
         "results": payload_results,
         "warnings": warnings,
-        "markdown": _render_code_markdown("Code Search Results", query, payload_results),
+        "markdown": _render_code_markdown("Code Search Results", query, payload_results, warnings),
     }
+
+
+def _retrieve_codegraph_repos(
+    provider: CodeGraphProvider,
+    query: str,
+    *,
+    repo_id: str | None,
+    limit: int,
+    lookup: bool,
+) -> tuple[list[CodeResult], set[str]]:
+    """Keep failures query-local and scoped; never echo arbitrary provider errors."""
+    results: list[CodeResult] = []
+    failed: set[str] = set()
+    completed = 0
+    provider.warnings.clear()
+    operation = "context lookup" if lookup else "search"
+    for repo in provider.config.repos:
+        if repo.role != "work" or (repo_id is not None and repo.id != repo_id):
+            continue
+        try:
+            retrieve = provider.get_code_context if lookup else provider.search_code
+            results.extend(retrieve(query, repo_id=repo.id, limit=limit))
+            completed += 1
+        except RuntimeError as exc:
+            failed.add(repo.id)
+            reason = (
+                "invalid or unsafe source response"
+                if str(exc).startswith(("CodeGraph explore output", "CodeGraph node output"))
+                else "command execution failed"
+            )
+            policy = (
+                "using scoped text fallback"
+                if provider.config.code_context.fallback_on_unhealthy
+                else "text fallback is disabled"
+            )
+            provider.warnings.append(
+                f"CodeGraph {operation} failed for repo {repo.id}: {reason}; {policy}; retrieval is partial."
+            )
+    if not completed:
+        raise RuntimeError("CodeGraph retrieval failed for every selected repo")
+    return results, failed
 
 
 def _search_code_fts_results(
@@ -1548,10 +1609,15 @@ def _search_code_fts_results(
     repo_id: str | None,
     limit: int,
     include_ops: bool,
+    exclude_repo_ids: set[str] | None = None,
 ) -> list[CodeResult]:
     provider = TextFallbackCodeContextProvider(config)
     per_source_limit = max(limit * 3, 10)
-    work_repos = [repo for repo in config.repos if repo.role == "work"]
+    work_repos = [
+        repo
+        for repo in config.repos
+        if repo.role == "work" and repo.id not in (exclude_repo_ids or set())
+    ]
     if repo_id is not None:
         work_repos = [repo for repo in work_repos if repo.id == repo_id]
     results = provider.search_repos(
@@ -1591,6 +1657,8 @@ def _merge_code_results(results: list[CodeResult], limit: int) -> list[CodeResul
     merged = list(deduped.values())
     merged.sort(
         key=lambda result: (
+            # Provider scores and kinds have different scales; keep primary graph evidence.
+            0 if result.provider == "codegraph" else 1,
             _code_result_kind_rank(result.kind),
             -result.score,
             result.path,
@@ -1633,10 +1701,11 @@ def get_code_context_from_config(
     active_provider = graph_health.active_provider
     if graph_health.codegraph_healthy:
         try:
-            results = graph_provider.get_code_context(
-                symbol_or_file, repo_id=repo_id, limit=result_limit
+            results, failed_repos = _retrieve_codegraph_repos(
+                graph_provider, symbol_or_file, repo_id=repo_id, limit=result_limit, lookup=True
             )
         except RuntimeError:
+            warnings.extend(graph_provider.warnings)
             if not config.code_context.fallback_on_unhealthy:
                 return _provider_unavailable(
                     symbol_or_file,
@@ -1651,6 +1720,20 @@ def get_code_context_from_config(
             warnings.append("CodeGraph context lookup failed; using text fallback.")
             active_provider = config.code_context.fallback_provider
         else:
+            warnings.extend(graph_provider.warnings)
+            active_provider = "codegraph"
+            if failed_repos and config.code_context.fallback_on_unhealthy:
+                for failed_repo in sorted(failed_repos):
+                    try:
+                        fallback = TextFallbackCodeContextProvider(config).get_code_context(
+                            symbol_or_file, repo_id=failed_repo, limit=result_limit
+                        )
+                    except (FileNotFoundError, sqlite3.Error, OSError):
+                        warnings.append(f"Text fallback is not ready for repo {failed_repo}.")
+                    else:
+                        results.extend(fallback)
+                        active_provider = "codegraph+fts5"
+            results = _merge_code_results(results, result_limit)
             payload_results = [result.to_payload() for result in results]
             return {
                 "tool": "get_code_context",
@@ -1658,10 +1741,13 @@ def get_code_context_from_config(
                 "symbol_or_file": symbol_or_file,
                 "project_id": config.project.id,
                 "configured_provider": graph_health.configured_provider,
-                "active_provider": "codegraph",
+                "retrieval_state": "partial" if graph_provider.warnings else "complete",
+                "active_provider": active_provider,
                 "results": payload_results,
                 "warnings": warnings,
-                "markdown": _render_code_markdown("Code Context", symbol_or_file, payload_results),
+                "markdown": _render_code_markdown(
+                    "Code Context", symbol_or_file, payload_results, warnings
+                ),
             }
     try:
         provider = TextFallbackCodeContextProvider(config)
@@ -1672,8 +1758,9 @@ def get_code_context_from_config(
             "query": symbol_or_file,
             "symbol_or_file": symbol_or_file,
             "results": [],
-            "warnings": ["Index is not ready; run index_project first."],
-            "markdown": "## Code Context\n\nIndex is not ready; run `index_project` first.",
+            "warnings": [*warnings, "Index is not ready; run index_project first."],
+            "markdown": "## Code Context\n\nIndex is not ready; run `index_project` first."
+            + "".join(f"\n\nWarning: {warning}" for warning in warnings),
             "error": {
                 "code": "INDEX_NOT_READY",
                 "message": "Index is not ready; run index_project first.",
@@ -1694,10 +1781,13 @@ def get_code_context_from_config(
         "symbol_or_file": symbol_or_file,
         "project_id": config.project.id,
         "configured_provider": graph_health.configured_provider,
+        "retrieval_state": "partial" if graph_provider.warnings else "complete",
         "active_provider": active_provider,
         "results": payload_results,
         "warnings": warnings,
-        "markdown": _render_code_markdown("Code Context", symbol_or_file, payload_results),
+        "markdown": _render_code_markdown(
+            "Code Context", symbol_or_file, payload_results, warnings
+        ),
     }
 
 
@@ -2145,8 +2235,12 @@ def _code_context_preflight(
     return config, result_limit, None
 
 
-def _render_code_markdown(title: str, query: str, results: list[dict[str, Any]]) -> str:
+def _render_code_markdown(
+    title: str, query: str, results: list[dict[str, Any]], warnings: list[str] | None = None
+) -> str:
     lines = [f"## {title}", "", f"Query: `{query}`", ""]
+    if warnings:
+        lines.extend([*(f"Warning: {warning}" for warning in warnings), ""])
     if not results:
         lines.append("No results.")
         return "\n".join(lines)
