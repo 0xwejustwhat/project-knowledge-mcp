@@ -699,6 +699,17 @@ def _parse_codegraph_explore(output: str, *, repo_id: str) -> list[CodeResult]:
         )
         start_line, end_line, snippet, has_fence = _codegraph_snippet(body)
         if not has_fence or not snippet or start_line is None or end_line is None:
+            if (
+                results
+                and index == len(matches) - 1
+                and body.rstrip().endswith(_CODEGRAPH_TRUNCATION_NOTICE)
+                and re.fullmatch(
+                    r"\s*```[A-Za-z0-9_+-]*\n[1-9]\d*\t[^\n]*\n\n",
+                    body.rstrip()[: -len(_CODEGRAPH_TRUNCATION_NOTICE)],
+                )
+            ):
+                # Only a cut first source line remains; keep preceding complete sections.
+                break
             raise RuntimeError("CodeGraph explore output did not include a source snippet")
         results.append(
             CodeResult(

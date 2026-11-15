@@ -572,6 +572,49 @@ def test_marked_truncation_rejects_invalid_source_ranges(tmp_path: Path, monkeyp
     assert any("failed for repo app" in w for w in payload["warnings"])
 
 
+def test_truncated_last_section_preserves_prior_graph_result(tmp_path: Path, monkeypatch):
+    from project_knowledge_mcp.code_context import CodeGraphProvider
+
+    config_path, _, _, _ = configured_project(tmp_path)
+    configure_codegraph_command(config_path, write_fake_codegraph(tmp_path))
+    config_path.write_text(
+        config_path.read_text().replace(
+            "fallback_on_unhealthy: true", "fallback_on_unhealthy: false"
+        )
+    )
+    original = CodeGraphProvider._run
+    output = (
+        "#### src/example.py — ExampleService(class)\n\n```python\n1\tcomplete\n```\n\n"
+        "#### tests/test_example.py — test_compile_context_returns_evidence(function)\n\n"
+        "```python\n1\tcut\n\n" + TRUNCATION_NOTICE
+    )
+    monkeypatch.setattr(
+        CodeGraphProvider,
+        "_run",
+        lambda self, *args: original(self, *args) if args[0] == "status" else output,
+    )
+    payload = search_code_from_config(query="lease", config_path=config_path)
+    assert any(r["provider"] == "codegraph" for r in payload["results"])
+    assert payload["retrieval_state"] == "partial"
+
+
+def test_missing_fts_preserves_global_limit_and_partial_state(tmp_path: Path):
+    import shutil
+    import yaml
+
+    config_path, _, work_repo, _ = configured_project(tmp_path)
+    second = tmp_path / "second"
+    shutil.copytree(work_repo, second)
+    config = yaml.safe_load(config_path.read_text())
+    config["repos"].append({**config["repos"][1], "id": "second", "path": str(second)})
+    config["code_context"]["codegraph"]["command"] = str(write_fake_codegraph(tmp_path))
+    config_path.write_text(yaml.safe_dump(config))
+    payload = search_code_from_config(query="ExampleService", config_path=config_path, limit=1)
+    assert len(payload["results"]) == 1
+    assert payload["retrieval_state"] == "partial"
+    assert "SQLite FTS5" in str(payload["warnings"])
+
+
 def test_truncated_node_uses_only_the_numbered_source_range(tmp_path: Path, monkeypatch):
     from project_knowledge_mcp.code_context import CodeGraphProvider
 

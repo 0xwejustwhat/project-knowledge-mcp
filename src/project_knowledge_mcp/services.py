@@ -1494,8 +1494,11 @@ def search_code_from_config(
                     ),
                 )
             except (FileNotFoundError, sqlite3.Error, OSError):
-                warnings.append("SQLite FTS5 search is not ready; run index_project first.")
-                merged_results = graph_results
+                graph_provider.warnings.append(
+                    "SQLite FTS5 search is not ready; run index_project first; retrieval is partial."
+                )
+                warnings.append(graph_provider.warnings[-1])
+                merged_results = _merge_code_results(graph_results, result_limit)
                 active_provider = "codegraph"
             except ValueError as exc:
                 return _query_invalid(
