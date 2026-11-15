@@ -102,6 +102,8 @@ class CodeGraphProvider:
 
     def __init__(self, config: ProjectKnowledgeConfig):
         self.config = config
+        # Query-local diagnostics only; health() remains an index-readiness probe.
+        self.warnings: list[str] = []
 
     def health(self) -> CodeProviderHealth:
         codegraph = self.config.code_context.codegraph
@@ -192,11 +194,17 @@ class CodeGraphProvider:
         results: list[CodeResult] = []
         for repo in self._selected_work_repos(repo_id):
             output = self._run("explore", "-p", str(repo.path), query)
+            if output.strip() == f'No relevant code found for "{query}"':
+                continue
             parsed = _parse_codegraph_explore(output, repo_id=repo.id)
             sanitized = self._sanitize_results(parsed, repo)
             if not sanitized:
                 raise RuntimeError(
                     "CodeGraph explore output did not include recognized code results"
+                )
+            if output.rstrip().endswith(_CODEGRAPH_TRUNCATION_NOTICE):
+                self.warnings.append(
+                    f"CodeGraph output truncated to budget for repo {repo.id}; retrieval is partial."
                 )
             results.extend(sanitized)
         return results[:limit]
@@ -211,6 +219,10 @@ class CodeGraphProvider:
             sanitized = self._sanitize_results(parsed, repo)
             if not sanitized:
                 raise RuntimeError("CodeGraph node output did not include recognized code results")
+            if output.rstrip().endswith(_CODEGRAPH_TRUNCATION_NOTICE):
+                self.warnings.append(
+                    f"CodeGraph output truncated to budget for repo {repo.id}; retrieval is partial."
+                )
             results.extend(sanitized)
         return results[:limit]
 
@@ -285,10 +297,10 @@ class CodeGraphProvider:
                 or end_line is None
                 or start_line < 1
                 or end_line < start_line
-                or start_line > len(lines)
+                or end_line > len(lines)
             ):
                 return None
-            selected = lines[start_line - 1 : min(end_line, len(lines))]
+            selected = lines[start_line - 1 : end_line]
         else:
             selected = lines[:40]
         snippet = _trim_snippet("\n".join(selected))
@@ -436,6 +448,8 @@ class CodeGraphProvider:
                 text=True,
                 timeout=30,
                 env=_codegraph_env(),
+                # Native explore/node otherwise prepend unrelated-worktree notices.
+                cwd=args[2] if len(args) > 2 and args[1] == "-p" else None,
             )
         except OSError as exc:
             raise RuntimeError("CodeGraph command could not be executed") from exc
@@ -726,8 +740,8 @@ def _parse_codegraph_node(output: str, *, repo_id: str, query: str) -> list[Code
     block_start, block_end, snippet, has_fence = _codegraph_snippet(output)
     if not has_fence or not snippet or block_start is None or block_end is None:
         raise RuntimeError("CodeGraph node output did not include a source snippet")
-    if start_line is None:
-        start_line = block_start
+    # The numbered block, not the symbol declaration, bounds the source we have.
+    start_line = block_start
     end_line = block_end
     return [
         CodeResult(
@@ -761,9 +775,33 @@ def _parse_codegraph_symbols(raw: str) -> list[tuple[str, str]]:
     ]
 
 
+_CODEGRAPH_TRUNCATION_NOTICE = (
+    "... (output truncated to budget; the source above is complete and verbatim — treat it as "
+    "already Read. For any area not covered, run another codegraph_explore with the specific "
+    "names — do NOT Read these files.)"
+)
+
+
 def _codegraph_snippet(text: str) -> tuple[int | None, int | None, str, bool]:
     fence = re.search(r"```[^\n]*\n(?P<code>.*?)\n```", text, re.DOTALL)
     raw = fence.group("code") if fence else ""
+    if fence is None and text.rstrip().endswith(_CODEGRAPH_TRUNCATION_NOTICE):
+        prefix = text.rstrip()[: -len(_CODEGRAPH_TRUNCATION_NOTICE)]
+        opening = re.search(r"^```[A-Za-z0-9_+-]*\n", prefix, re.MULTILINE)
+        if opening is not None:
+            # The provider slices by characters, then appends two newlines and the
+            # notice. The final source line may be cut mid-token: never use it.
+            candidate_lines = prefix[opening.end() :].rstrip("\n").split("\n")[:-1]
+            numbered = [re.fullmatch(r"\s*(\d+)\t(.*)", line) for line in candidate_lines]
+            numbers = [int(match[1]) for match in numbered if match is not None]
+            if (
+                numbered
+                and all(match is not None for match in numbered)
+                and numbers[0] > 0
+                and numbers == list(range(numbers[0], numbers[0] + len(numbers)))
+            ):
+                raw = "\n".join(candidate_lines)
+                fence = opening
     lines: list[str] = []
     line_numbers: list[int] = []
     for raw_line in raw.splitlines():
